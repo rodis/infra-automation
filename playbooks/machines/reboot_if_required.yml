@@ -12,6 +12,16 @@
   hosts: all
   become: true
 
+  # Safe by default, fast when asked for. One host at a time unless the caller states otherwise,
+  # because the caller who did not think about it is exactly the caller who should not get a
+  # simultaneous cluster reboot. A reboot is ~60-75s per host, so serial costs about 3 minutes on
+  # a 4-node cluster and about 7 on a 7-node one — cheap, and only worth skipping deliberately.
+  #
+  # The build path passes reboot_serial: 100% as an extra var, since machines with nothing running
+  # on them can all go at once. Note this must come from extra_vars: play vars are not available
+  # when serial is evaluated.
+  serial: "{{ reboot_serial | default(1) }}"
+
   tasks:
     - name: Check whether a reboot is required
       ansible.builtin.stat:
