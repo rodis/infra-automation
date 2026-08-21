@@ -5,6 +5,7 @@ cares that it is going to be a Kubernetes node.
 
 | playbook | what it does | mutates |
 | :-- | :-- | :-- |
+| `disable_unattended_upgrades.yml` | masks the apt timers and unattended-upgrades, after waiting for any in-flight apt work | yes — masks units, writes apt config |
 | `recover_unreachable.yml` | an instance that does not answer SSH: start it if stopped, then soft reboot, then hard reboot | yes — reboots, and starts stopped instances |
 | `reboot_if_required.yml` | reboots machines that a package upgrade left needing one | yes — reboots |
 | `prepare_for_kubespray.yml` | base packages, hostname consistency, swap off | yes — installs packages, edits fstab |
@@ -18,11 +19,18 @@ so one run covers one tenant — a cluster whose nodes span two tenants needs on
 Intended sequence for a freshly built cluster:
 
 ```
-recover_unreachable  ->  update_machines  ->  reboot_if_required  ->  prepare_for_kubespray  ->  set_hosts_file
+recover_unreachable  ->  disable_unattended_upgrades  ->  update_machines  ->  reboot_if_required
+                     ->  prepare_for_kubespray  ->  set_hosts_file
 ```
 
 Each step is a separate verb so it can be run on its own; the sequence belongs in an AWX workflow
 rather than in a playbook that calls the others.
+
+`disable_unattended_upgrades` comes second, and specifically **before** `update_machines`: quiesce
+the machine's own package automation before doing your own package work. Debian fires
+`apt-daily.timer` at `OnBootSec=15min`, which on a freshly built cluster lands on top of the first
+`dist-upgrade` and makes it crawl while both contend for the dpkg lock. That is not hypothetical —
+it is what happened on west on 2026-08-21.
 
 ## Still in playbooks/miscellaneous
 

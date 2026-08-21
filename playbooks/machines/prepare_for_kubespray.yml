@@ -30,6 +30,7 @@
           - apt-transport-https
         state: present
         update_cache: true
+        lock_timeout: 600
       when: ansible_pkg_mgr == 'apt'
 
     - name: Set the hostname to match the inventory name
