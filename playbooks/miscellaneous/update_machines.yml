@@ -8,8 +8,13 @@
       when: ansible_pkg_mgr == 'apt'
       ansible.builtin.apt:
         update_cache: true
+        # Wait for a background apt (apt-daily fires OnBootSec=15min) instead of failing on the
+        # lock. Belt and braces alongside machines/disable_unattended_upgrades.yml, which should
+        # have run first.
+        lock_timeout: 600
 
     - name: Upgrade packages with apt
       when: ansible_pkg_mgr == 'apt'
       ansible.builtin.apt:
         upgrade: dist
+        lock_timeout: 600

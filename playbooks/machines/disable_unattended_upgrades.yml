@@ -1,0 +1,99 @@
+---
+# Stop a machine patching itself.
+#
+# Debian enables apt-daily.timer, apt-daily-upgrade.timer and unattended-upgrades.service out of
+# the box, and the images used here are no exception. On a Kubernetes node that is a genuine
+# hazard: an unattended upgrade can restart a service, or replace a container runtime or kernel,
+# at a moment nobody chose. It also collides with deliberate package work — apt-daily fires
+# OnBootSec=15min, which on a freshly built cluster lands squarely on top of the first
+# `apt dist-upgrade` and makes it crawl while both contend for the dpkg lock.
+#
+# Run this FIRST, before update_machines: quiesce the machine's own automation before doing your
+# own package work, not after.
+#
+# Masking rather than merely disabling, so that a package upgrade re-enabling its own units does
+# not silently undo this.
+
+- name: Disable unattended package upgrades
+  hosts: all
+  become: true
+
+  vars:
+    quiesce_timeout: 900     # total seconds to wait for in-flight apt work
+    stuck_after: 300         # seconds without dpkg.log progress before calling it stuck
+
+  tasks:
+    # Distinguishing "still working" from "wedged" needs two signals, not one: the lock being
+    # held says nothing on its own, because a large upgrade legitimately holds it for a long time.
+    # Progress is whether /var/log/dpkg.log is still being written to.
+    - name: Wait for any in-flight apt or dpkg work to finish
+      ansible.builtin.shell: |
+        deadline=$(( $(date +%s) + {{ quiesce_timeout }} ))
+        last_mtime=0
+        stagnant_since=$(date +%s)
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+          now=$(date +%s)
+          if [ "$now" -ge "$deadline" ]; then
+            echo "TIMEOUT: dpkg lock still held after {{ quiesce_timeout }}s"
+            exit 2
+          fi
+          m=$(stat -c %Y /var/log/dpkg.log 2>/dev/null || echo 0)
+          if [ "$m" != "$last_mtime" ]; then
+            last_mtime=$m
+            stagnant_since=$now
+          fi
+          if [ $(( now - stagnant_since )) -ge {{ stuck_after }} ]; then
+            echo "STUCK: dpkg lock held with no dpkg.log progress for {{ stuck_after }}s"
+            fuser -v /var/lib/dpkg/lock-frontend 2>&1 | tail -2
+            exit 3
+          fi
+          sleep 5
+        done
+        echo "quiescent"
+      register: quiesce
+      changed_when: false
+      failed_when: quiesce.rc not in [0]
+      args:
+        executable: /bin/bash
+
+    - name: Mask the apt timers
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        masked: true
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+      failed_when: false      # a machine without these units is fine, not an error
+
+    - name: Mask unattended-upgrades
+      ansible.builtin.systemd_service:
+        name: unattended-upgrades.service
+        state: stopped
+        enabled: false
+        masked: true
+      failed_when: false
+
+    # Belt and braces: even if a unit comes back, this tells apt not to act on its own.
+    - name: Turn off periodic apt activity in configuration as well
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        mode: "0644"
+        content: |
+          // Managed by infra-automation: playbooks/machines/disable_unattended_upgrades.yml
+          // A Kubernetes node must not upgrade itself at a moment nobody chose.
+          APT::Periodic::Update-Package-Lists "0";
+          APT::Periodic::Unattended-Upgrade "0";
+
+    - name: Confirm
+      ansible.builtin.shell: |
+        for u in apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+          printf '%s=%s ' "$u" "$(systemctl is-enabled "$u" 2>&1)"
+        done
+      register: final_state
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ final_state.stdout }}"
