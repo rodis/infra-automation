@@ -1,0 +1,67 @@
+---
+# Prepare freshly built machines for a kubespray run.
+#
+# Scope is deliberately narrow: this does only the things kubespray does NOT do for itself.
+# Kubespray already handles kernel modules, sysctls and container runtime setup, and duplicating
+# that here would mean maintaining a second, quietly diverging copy of it.
+#
+# What it does cover:
+#   - the base packages Ansible and kubespray assume are present on a bare Debian image
+#   - hostname consistency, because kubelet registers a node under the machine's hostname and a
+#     mismatch with the inventory name produces a cluster whose node names do not match anything
+#   - swap, which kubelet refuses to start alongside unless explicitly configured
+#
+# /etc/hosts is NOT here: that is already a verb of its own
+# (playbooks/miscellaneous/set_hosts_file_for_kubespray.yml).
+
+- name: Prepare machines for kubespray
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Install the packages a bare image lacks
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-apt
+          - curl
+          - gnupg
+          - ca-certificates
+          - apt-transport-https
+        state: present
+        update_cache: true
+      when: ansible_pkg_mgr == 'apt'
+
+    - name: Set the hostname to match the inventory name
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Look for active swap
+      ansible.builtin.command: swapon --noheadings --show=NAME
+      register: active_swap
+      changed_when: false
+      failed_when: false
+
+    - name: Disable swap for this boot
+      ansible.builtin.command: swapoff -a
+      when: active_swap.stdout | trim | length > 0
+      changed_when: true
+
+    - name: Keep swap off across reboots
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^(\s*[^#\n]\S*\s+\S+\s+swap\s+.*)$'
+        replace: '# \1   # disabled for kubernetes'
+
+    - name: Confirm python3 is usable by Ansible
+      ansible.builtin.command: python3 --version
+      register: python_version
+      changed_when: false
+
+    - name: Summarise readiness
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ready for kubespray —
+          hostname={{ inventory_hostname }},
+          swap={{ 'off' if (active_swap.stdout | trim | length == 0) else 'disabled just now' }},
+          {{ python_version.stdout }}

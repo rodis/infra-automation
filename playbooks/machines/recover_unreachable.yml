@@ -1,0 +1,149 @@
+---
+# Recover an OpenStack instance that does not answer SSH.
+#
+# Supersedes playbooks/miscellaneous/check_machines_are_reachable.yaml, fixing three faults found
+# by running it against deliberately broken machines on 2026-08-21:
+#
+#   1. A stopped instance could not be recovered at all. reboot_soft and reboot_hard both require
+#      vm_state active; against a stopped instance Nova answers
+#      "409 Cannot 'reboot' instance while it is in vm_state stopped" and the play fails.
+#   2. The post-soft-reboot re-verify waited 15 seconds, which no Debian guest completes a reboot
+#      in, so the hard reboot fired on every single recovery and the gentle path was dead code.
+#   3. The old name said "check". This playbook reboots machines; the name should say so.
+#
+# Requires BOTH credentials on the job template: an OpenStack cloud credential (for the API calls)
+# and the machine credential. The cloud credential binds the tenant, so one run covers one tenant.
+
+- name: Recover unreachable instances
+  hosts: all
+  gather_facts: false
+  connection: local
+
+  vars:
+    probe_timeout: 15        # a liveness probe, deliberately short
+    boot_timeout: 240        # a real boot wait, deliberately generous
+    soft_reboot_attempts: 2
+
+  tasks:
+    - name: Probe SSH
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: "{{ probe_timeout }}"
+        state: started
+      register: initial_probe
+      ignore_errors: true
+
+    - name: Report hosts that are already reachable
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} answers SSH; nothing to do."
+      when: initial_probe is not failed
+
+    - name: Recover
+      when: initial_probe is failed
+      block:
+
+        - name: Read the instance's state from OpenStack
+          openstack.cloud.server_info:
+            name: "{{ inventory_hostname }}"
+          register: instance_info
+
+        - name: Stop if OpenStack has no such instance
+          ansible.builtin.fail:
+            msg: >-
+              {{ inventory_hostname }} is unreachable and OpenStack has no instance by that name.
+              A reboot has nothing to act on: this needs Terraform, not recovery.
+          when: instance_info.servers | length == 0
+
+        - name: Record the power state
+          ansible.builtin.set_fact:
+            vm_state: "{{ instance_info.servers[0].vm_state | default('unknown') }}"
+            recovered: false
+
+        # --- STOPPED: start it. A stopped instance cannot be rebooted. ---
+        - name: Start the instance when it is stopped
+          openstack.cloud.server_action:
+            server: "{{ inventory_hostname }}"
+            action: start
+          when: vm_state in ['stopped', 'shutoff']
+
+        - name: Wait for SSH after starting
+          ansible.builtin.wait_for:
+            host: "{{ ansible_host }}"
+            port: 22
+            timeout: "{{ boot_timeout }}"
+            state: started
+          register: post_start_probe
+          ignore_errors: true
+          when: vm_state in ['stopped', 'shutoff']
+
+        - name: Note whether starting was enough
+          ansible.builtin.set_fact:
+            recovered: true
+          when:
+            - post_start_probe is defined
+            - post_start_probe is not skipped
+            - post_start_probe is not failed
+
+        # --- SOFT REBOOT: the gentle path, given a real chance to work. ---
+        - name: Soft reboot
+          openstack.cloud.server_action:
+            server: "{{ inventory_hostname }}"
+            action: reboot_soft
+          register: soft_reboot
+          until: soft_reboot is succeeded
+          retries: "{{ soft_reboot_attempts - 1 }}"
+          delay: 30
+          when: not recovered
+
+        - name: Wait for SSH after the soft reboot
+          ansible.builtin.wait_for:
+            host: "{{ ansible_host }}"
+            port: 22
+            timeout: "{{ boot_timeout }}"
+            state: started
+          register: post_soft_probe
+          ignore_errors: true
+          when: not recovered
+
+        - name: Note whether the soft reboot was enough
+          ansible.builtin.set_fact:
+            recovered: true
+          when:
+            - post_soft_probe is defined
+            - post_soft_probe is not skipped
+            - post_soft_probe is not failed
+
+        # --- HARD REBOOT: last resort, only once the soft path has genuinely had its chance. ---
+        - name: Hard reboot
+          openstack.cloud.server_action:
+            server: "{{ inventory_hostname }}"
+            action: reboot_hard
+          when: not recovered
+
+        - name: Wait for SSH after the hard reboot
+          ansible.builtin.wait_for:
+            host: "{{ ansible_host }}"
+            port: 22
+            timeout: "{{ boot_timeout }}"
+            state: started
+          register: post_hard_probe
+          ignore_errors: true
+          when: not recovered
+
+        - name: Note whether the hard reboot was enough
+          ansible.builtin.set_fact:
+            recovered: true
+          when:
+            - post_hard_probe is defined
+            - post_hard_probe is not skipped
+            - post_hard_probe is not failed
+
+        - name: Fail loudly when the instance is still dark
+          ansible.builtin.fail:
+            msg: >-
+              CRITICAL: {{ inventory_hostname }} is still unreachable after start/soft/hard
+              recovery. The instance was {{ vm_state }} in OpenStack, so this is not a power
+              problem. A reboot cannot fix it and repeating one will not either: diagnose before
+              acting again.
+          when: not recovered
