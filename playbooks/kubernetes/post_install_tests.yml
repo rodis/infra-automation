@@ -61,6 +61,13 @@
     # node, and the pod-to-pod curl proves nothing about the overlay. Set false to leave control
     # planes alone, and the cross-node assertion below will skip itself rather than fail.
     postcheck_tolerate_control_plane: true
+    # Rendered inline into the manifest as JSON rather than wrapped in a {% raw %}{% if %}{% endraw %} block. A
+    # block tag inside an indented YAML scalar renders badly: trim_blocks removes the newline after
+    # the tag while the leading indentation stays, so the following line is glued on at double
+    # indentation and kubectl rejects the manifest. An empty list is valid for `tolerations:`.
+    postcheck_tolerations: >-
+      {{ [{'key': 'node-role.kubernetes.io/control-plane', 'operator': 'Exists', 'effect': 'NoSchedule'}]
+         if postcheck_tolerate_control_plane else [] }}
     # Optional. When set, the API server's version must match exactly.
     postcheck_expect_version: ""
     # Held as a variable so it can be passed as a single argv element. Inline in a cmd string it
@@ -234,12 +241,7 @@
                     labels:
                       app: postcheck-agnhost
                   spec:
-                    {% if postcheck_tolerate_control_plane %}
-                    tolerations:
-                      - key: node-role.kubernetes.io/control-plane
-                        operator: Exists
-                        effect: NoSchedule
-                    {% endif %}
+                    tolerations: {{ postcheck_tolerations | to_json }}
                     affinity:
                       podAntiAffinity:
                         preferredDuringSchedulingIgnoredDuringExecution:
