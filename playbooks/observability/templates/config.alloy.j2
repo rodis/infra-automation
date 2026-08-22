@@ -1,0 +1,64 @@
+// Managed by playbooks/observability/install_alloy.yml — edits here are overwritten.
+//
+// Host metrics only. PostgreSQL metrics are deliberately absent: they need a dedicated read-only
+// pg_monitor role rather than the application's DB_USER, which is a database change of its own.
+
+prometheus.exporter.unix "host" {
+  // Trimmed on purpose. Grafana Cloud free allows 10,000 active series and the default collector
+  // set runs 500-1000 per host, so the whole estate would sit near the cap before anything
+  // interesting is added. These cover the questions actually being asked of this host: is it up,
+  // is it stalling, is it out of disk or memory.
+  set_collectors = [
+    "cpu",
+    "diskstats",
+    "filesystem",
+    "loadavg",
+    "meminfo",
+    "netdev",
+    "stat",      // includes CPU steal — the counter that mattered when guests were locking up
+    "time",      // clock drift, which Mimir cares about
+    "uname",
+  ]
+
+  // Pseudo-filesystems produce a series per mount and answer nothing.
+  filesystem {
+    fs_types_exclude = "^(autofs|binfmt_misc|cgroup.?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|mqueue|nsfs|overlay|proc|procfs|pstore|securityfs|selinuxfs|squashfs|sysfs|tracefs)$"
+    mount_points_exclude = "^/(dev|proc|sys|run/credentials/.+|var/lib/docker/.+|var/lib/containers/storage/.+)($|/)"
+  }
+}
+
+prometheus.scrape "host" {
+  targets    = prometheus.exporter.unix.host.targets
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+
+  scrape_interval = "{{ alloy_scrape_interval }}"
+
+  // Without this every series is labelled instance="127.0.0.1:12345", which is useless the moment
+  // there is more than one host. The inventory name is what the objectives and the ledgers use.
+  job_name = "integrations/node_exporter"
+}
+
+prometheus.remote_write "grafana_cloud" {
+  endpoint {
+    url = "{{ alloy_remote_write_url }}"
+
+    basic_auth {
+      username = "{{ alloy_remote_write_user }}"
+      password = "{{ alloy_remote_write_token }}"
+    }
+
+    // Mimir rejects out-of-order samples outright rather than dropping them quietly, so a backlog
+    // after an outage can wedge the queue. Keep the buffer modest and let old samples go: for
+    // "is this host alive", recent truth beats complete history.
+    queue_config {
+      capacity          = 2500
+      max_shards        = 4
+      max_samples_per_send = 500
+    }
+
+    write_relabel_config {
+      target_label = "instance"
+      replacement  = "{{ inventory_hostname }}"
+    }
+  }
+}
