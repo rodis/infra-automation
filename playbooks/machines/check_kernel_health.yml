@@ -1,0 +1,180 @@
+---
+# Read-only kernel health check: soft lockups, taint, CPU steal.
+#
+# WHY THIS EXISTS
+#
+# An objective diagnosing a dark or NotReady host reads its cloud-side state — vm_state, security
+# groups, addresses — and compares it against healthy peers. That is the right first move and it
+# has a blind spot: a guest whose vCPU is being stalled by the hypervisor looks IDENTICAL to a
+# healthy one from the cloud API. ACTIVE, one port, same security groups, no fault. The escalation
+# ladder then routes it to rung 1 — "the fault is inside the guest, which is what a reboot is
+# for" — and a reboot cannot reach a fault that is not in the guest.
+#
+# That happened on 2026-08-22. k8s-west-master-1 flapped NotReady and back twice in eleven minutes
+# with five soft lockups, its own kubelet stuck 21s, while its cloud-side state was
+# indistinguishable from its healthy peer's. Nothing in the diagnose step could see it.
+#
+# WHAT IT READS, and why each one is here
+#
+#   - kernel taint bit 14 (0x4000, 'L'): set once a soft lockup has occurred, and it PERSISTS. The
+#     dmesg ring buffer wraps, so on a long-lived host the lockup lines may be gone while the taint
+#     bit remains. Read both: dmesg gives you when and what, taint gives you whether it ever
+#     happened at all.
+#   - soft lockup / RCU stall / hung task lines, with timestamps, so the pattern over time is
+#     visible rather than just a count
+#   - CPU steal since boot. The obvious reading of a stalled guest is "the hypervisor is
+#     oversubscribed", and steal is how that would show. On 2026-08-22 steal was ~0.06% on hosts
+#     that were locking up hard, so the numbers did NOT support the obvious reading. Recording it
+#     is what makes that statement possible instead of assumed.
+#
+# It is a READ. Nothing here changes anything, so it needs no authority and no policy grant, and it
+# is safe against production at any time.
+#
+# WHAT IT CANNOT TELL YOU
+#
+# Whether the stalls are still happening. It reads history since boot. A freshly rebuilt machine is
+# clean because it is new, not because it is well — on 2026-08-22 the first lockup on one host came
+# 1h17m after boot and another went 3h40m before its first. Read the uptime alongside the verdict,
+# which is why this reports it.
+
+- name: Check kernel health
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    # Default TRUE on purpose. A check that always exits zero pushes the reader into parsing
+    # stdout, and grading a job on its exit status when that status cannot fail is exactly how a
+    # broken thing gets recorded as healthy. Pass false when a caller wants the data without the
+    # verdict — a diagnose step choosing a rung, for instance.
+    kernel_health_fail_on_lockups: true
+    # Steal above this is worth saying out loud. It does not fail the run on its own: steal is a
+    # symptom of a busy hypervisor, which is a different (and more ordinary) problem than a guest
+    # whose CPU stops being scheduled at all.
+    kernel_health_steal_warn_percent: 5.0
+
+  tasks:
+
+    - name: Read the kernel taint mask
+      ansible.builtin.command: cat /proc/sys/kernel/tainted
+      changed_when: false
+      register: kernel_health_taint_raw
+
+    - name: Read stall and lockup lines from the kernel ring buffer
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          dmesg -T 2>/dev/null
+          | grep -iE 'soft lockup|rcu_sched|rcu stall|hung task|watchdog: BUG|oom-kill'
+          | tail -20 || true
+        executable: /bin/bash
+      changed_when: false
+      register: kernel_health_dmesg
+
+    - name: Read CPU steal since boot and uptime
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          awk '/^cpu /{t=$2+$3+$4+$5+$6+$7+$8+$9; printf "%.3f", (t>0 ? 100*$9/t : 0)}' /proc/stat;
+          printf ' ';
+          awk '{printf "%d", $1}' /proc/uptime
+        executable: /bin/bash
+      changed_when: false
+      register: kernel_health_cpu
+
+    - name: Assemble this host's readings
+      ansible.builtin.set_fact:
+        kernel_health_taint: "{{ kernel_health_taint_raw.stdout | trim }}"
+        kernel_health_events: "{{ kernel_health_dmesg.stdout_lines | default([]) }}"
+        kernel_health_lockup_count: "{{ kernel_health_dmesg.stdout_lines | default([]) | select('search', 'soft lockup') | list | length }}"
+        kernel_health_steal_percent: "{{ kernel_health_cpu.stdout.split() | first }}"
+        kernel_health_uptime_hours: "{{ ((kernel_health_cpu.stdout.split() | last | int) / 3600) | round(2) }}"
+
+    # A single verdict STRING per host, rather than an int or a bool. Both of those have to survive
+    # a round trip through Jinja before being compared across hosts, and that is where quiet type
+    # surprises live. 'stalled' or 'clean' compares the same way everywhere.
+    #
+    # Bit 14 (16384) of the taint mask is TAINT_SOFTLOCKUP. It is included because it OUTLIVES the
+    # ring buffer: on a long-running host the dmesg lines can be gone while the bit remains, so a
+    # count of zero is not by itself evidence of a host that never stalled.
+    - name: Decide this host's verdict
+      ansible.builtin.set_fact:
+        kernel_health_verdict: >-
+          {{ 'stalled'
+             if (kernel_health_lockup_count | int) > 0
+                or (((kernel_health_taint | int) // 16384) % 2) == 1
+             else 'clean' }}
+
+    - name: Report this host
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ kernel_health_verdict | upper }} —
+          {{ kernel_health_lockup_count }} soft lockup(s) in the ring buffer,
+          taint={{ kernel_health_taint }}{{ ' (SOFTLOCKUP bit set)' if (((kernel_health_taint | int) // 16384) % 2) == 1 else '' }},
+          steal={{ kernel_health_steal_percent }}%,
+          up {{ kernel_health_uptime_hours }}h
+
+    - name: Show the stall events on affected hosts
+      ansible.builtin.debug:
+        var: kernel_health_events
+      when: kernel_health_events | length > 0
+
+    - name: Note unusually high CPU steal
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: steal is {{ kernel_health_steal_percent }}%, above the
+          {{ kernel_health_steal_warn_percent }}% mark — the hypervisor is busy. That is a
+          DIFFERENT problem from a vCPU that stops being scheduled at all: stalls have been seen
+          here with steal near zero, so the two do not have to travel together.
+      when: kernel_health_steal_percent | float > kernel_health_steal_warn_percent | float
+
+    # The cross-host view is the point of the whole check. One host stalling is bad luck; several
+    # stalling the same way is a statement about the platform, and that is rule 3's
+    # independent-versus-systematic call made on evidence instead of impression.
+    - name: Report the cross-host picture
+      run_once: true
+      delegate_to: localhost
+      become: false
+      vars:
+        affected: >-
+          {{ ansible_play_hosts | map('extract', hostvars)
+             | selectattr('kernel_health_verdict', 'defined')
+             | selectattr('kernel_health_verdict', 'equalto', 'stalled')
+             | map(attribute='inventory_hostname') | list }}
+        total: "{{ ansible_play_hosts | length }}"
+        threshold: "{{ [2, ((ansible_play_hosts | length) * 0.2) | round(0, 'ceil') | int] | max }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ affected | length }} of {{ total }} host(s) show kernel stalls
+          (systemic threshold for this size: {{ threshold }}).
+          {{ 'No stalls anywhere.' if affected | length == 0
+             else (('AT OR ABOVE the threshold — this looks like the platform rather than the machines. '
+                    ~ 'Rebuilding is the shredder here, because the same fault returns on the replacements. '
+                    ~ 'Gather the events and escalate.')
+                   if (affected | length) >= (threshold | int)
+                   else ('Below the threshold — consistent with one unlucky machine. Still NOT a rung 1: '
+                         ~ 'a stalled vCPU is not a wedged guest and a reboot does not reach it.')) }}
+          Affected: {{ affected | join(', ') if affected | length > 0 else 'none' }}
+
+    - name: Fail if any host has stalled
+      run_once: true
+      delegate_to: localhost
+      become: false
+      vars:
+        affected: >-
+          {{ ansible_play_hosts | map('extract', hostvars)
+             | selectattr('kernel_health_verdict', 'defined')
+             | selectattr('kernel_health_verdict', 'equalto', 'stalled')
+             | map(attribute='inventory_hostname') | list }}
+      ansible.builtin.assert:
+        that:
+          - affected | length == 0
+        fail_msg: >-
+          Kernel stalls on {{ affected | join(', ') }}. This is NOT a reboot case: a soft lockup in
+          the idle task means the vCPU was not scheduled, which is the hypervisor stalling the
+          guest. Record the events above and escalate — no rung of the ladder addresses it.
+        success_msg: >-
+          No kernel stalls on any of {{ ansible_play_hosts | length }} host(s). Read that next to
+          the uptimes above: a freshly built machine is clean because it is new, not because it is
+          well.
+      when: kernel_health_fail_on_lockups | bool
