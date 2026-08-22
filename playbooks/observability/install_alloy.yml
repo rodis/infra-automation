@@ -173,32 +173,51 @@
       failed_when: false
       register: alloy_active
 
-    - name: Look for remote_write errors in the journal
+    # Ask Alloy what it actually shipped, rather than grepping its logs. The first version of this
+    # searched the journal for /error/ and matched `level=info msg="node exited without error"` — a
+    # SUCCESS message containing the word. It failed a run in which everything had worked, which is
+    # the same class of mistake as reading a check's failure as the thing being checked.
+    #
+    # These two counters are the ground truth: samples handed to remote_write, and samples the
+    # endpoint rejected.
+    - name: Read Alloy's own shipping counters
       ansible.builtin.shell:
         cmd: >-
           set -o pipefail;
-          journalctl -u alloy --since "-2 min" --no-pager 2>/dev/null
-          | grep -iE 'error|refused|401|403|400|out of order' | tail -10 || true
+          curl -s --max-time 10 localhost:12345/metrics
+          | awk '/^prometheus_remote_storage_samples_total/ {s=$NF}
+                 /^prometheus_remote_storage_samples_failed_total/ {f=$NF}
+                 END {printf "%d %d", s+0, f+0}'
         executable: /bin/bash
       changed_when: false
-      register: alloy_errors
+      failed_when: false
+      register: alloy_counters
+      # The first scrape has to happen before there is anything to count.
+      retries: 6
+      delay: 15
+      until: (alloy_counters.stdout.split() | first | default(0) | int) > 0
 
     - name: Report
       ansible.builtin.debug:
         msg: >-
           {{ inventory_hostname }}: alloy {{ alloy_active.stdout }},
-          {{ 'no write errors in the last 2 minutes' if alloy_errors.stdout | length == 0
-             else 'ERRORS: ' ~ alloy_errors.stdout_lines | join(' | ') }}
+          {{ alloy_counters.stdout.split() | first | default('0') }} samples sent,
+          {{ alloy_counters.stdout.split() | last | default('?') }} rejected
 
-    - name: Fail if Alloy is not running or is reporting write errors
+    - name: Check Alloy is running and its samples are being accepted
       ansible.builtin.assert:
         that:
           - alloy_active.stdout == 'active'
-          - alloy_errors.stdout | length == 0
+          - (alloy_counters.stdout.split() | first | default(0) | int) > 0
+          - (alloy_counters.stdout.split() | last | default(1) | int) == 0
         fail_msg: >-
-          Alloy is not shipping cleanly on {{ inventory_hostname }}. A 401 or 403 means the token or
-          instance id is wrong; a 400 mentioning out-of-order samples means the clock is off; a
-          connection refusal means the endpoint URL is wrong. Details above.
+          Alloy is not shipping cleanly on {{ inventory_hostname }} — service is
+          '{{ alloy_active.stdout }}', {{ alloy_counters.stdout | default('no counters') }}
+          (samples sent / rejected). Rejections mean the endpoint refused them: a 401 or 403 is the
+          token or instance id, a 400 mentioning out-of-order samples is the clock. Zero sent with
+          the service active means nothing is being scraped — check the exporter block.
+        success_msg: >-
+          {{ inventory_hostname }} is shipping metrics and none are being rejected.
 
   handlers:
     - name: Restart alloy
