@@ -123,11 +123,26 @@
         src: config.alloy.j2
         dest: /etc/alloy/config.alloy
         owner: root
-        group: root
-        # 0640 and root:root — the file contains the remote_write token. Alloy runs as its own user
-        # and reads it before dropping privileges via systemd.
+        group: alloy
+        # root:alloy 0640 — the file holds the remote_write token, so it must not be world
+        # readable, but the unit is `User=alloy` and reads the config as that user from the start.
+        # This was root:root on the first attempt, on the mistaken belief that Alloy started as
+        # root and dropped privileges. It does not, and the service crash-looped on
+        # "reading config path: permission denied" until systemd gave up.
         mode: "0640"
       notify: Restart alloy
+
+    - name: Clear any previous failed state before starting
+      ansible.builtin.systemd:
+        name: alloy
+        state: stopped
+      failed_when: false
+      changed_when: false
+
+    - name: Reset the systemd start-rate limiter
+      ansible.builtin.command: systemctl reset-failed alloy
+      failed_when: false
+      changed_when: false
 
     - name: Start and enable Alloy
       ansible.builtin.systemd:
@@ -152,6 +167,10 @@
     - name: Read Alloy's own view of its health
       ansible.builtin.command: systemctl is-active alloy
       changed_when: false
+      # `systemctl is-active` exits non-zero exactly when the answer is interesting, and `command`
+      # treats that as a task failure — so the first run aborted here instead of printing the
+      # journal that said why. A check that cannot report a bad result is not a check.
+      failed_when: false
       register: alloy_active
 
     - name: Look for remote_write errors in the journal
