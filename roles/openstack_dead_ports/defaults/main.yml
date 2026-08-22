@@ -1,0 +1,14 @@
+---
+# Behaviour of the role itself. Prefixed, because these are this role's business and a caller that
+# happens to have its own `dry_run` should not silently arm a port deletion.
+openstack_dead_ports_dry_run: true
+openstack_dead_ports_reachability_timeout: 240
+# Wait for the instance to answer SSH again after a deletion. Turn off when including this role
+# from a play that will do its own waiting, or against instances that never expose SSH.
+openstack_dead_ports_wait_for_ssh: true
+
+# The interlock. NOT prefixed, deliberately: `authorizing_objective` and `granted_actions` are a
+# repo-wide convention shared by every destructive verb, so that one caller granting one action to
+# several roles passes one set of variables rather than one set per role. Defaults refuse.
+authorizing_objective: ""
+granted_actions: []

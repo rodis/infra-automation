@@ -1,0 +1,120 @@
+---
+# Find — and optionally remove — Neutron ports that never came up.
+#
+# Nova sometimes attaches a port that stays DOWN, then attaches a second one that works. The
+# instance is left carrying both, the dead address is listed FIRST, and everything that takes "the
+# first IPv4" therefore talks to nothing. The AWX OpenStack inventory composes ansible_host exactly
+# that way, so the machine becomes unmanageable while being perfectly healthy: inside the guest
+# there is one address on one interface, correctly configured.
+#
+# Observed on 2 of 4 instances in one build on 2026-08-22, 1 of 4 in the next, and 0 of 4 in the
+# one after. Intermittent, which is the argument for checking every build rather than reasoning
+# about it once.
+#
+# Runs once per host in the calling play, keyed on inventory_hostname. Every OpenStack call is
+# delegated to localhost, so the role behaves the same whether the calling play connects to the
+# guests over SSH or runs local — which is what makes it safe to include from a build playbook.
+
+- name: Refuse to delete anything without an authorising objective
+  ansible.builtin.assert:
+    that:
+      - authorizing_objective | length > 0
+      # The required action is written literally, NOT taken from a variable. It used to live in
+      # `required_actions`, which extra_vars could override — so a caller could pass
+      # required_actions=[] and satisfy the interlock while granting nothing. Hardcoding the
+      # string is the difference between a check and a formality.
+      - "'openstack.port.delete' in (granted_actions | default([]))"
+    fail_msg: >-
+      This deletes Neutron ports and will not do so on its own. Set authorizing_objective, and
+      include 'openstack.port.delete' in granted_actions — taken from that objective's may_destroy
+      list. Run with openstack_dead_ports_dry_run=true to inspect without authority.
+    success_msg: "authorised by {{ authorizing_objective }} for openstack.port.delete"
+  run_once: true
+  when: not (openstack_dead_ports_dry_run | bool)
+
+- name: Read the instance
+  openstack.cloud.server_info:
+    name: "{{ inventory_hostname }}"
+  delegate_to: localhost
+  register: openstack_dead_ports_server
+
+- name: Note hosts OpenStack does not know about
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: no such instance — nothing to inspect."
+  when: openstack_dead_ports_server.servers | length == 0
+
+- name: Inspect ports
+  when: openstack_dead_ports_server.servers | length > 0
+  block:
+
+    - name: List the instance's ports
+      openstack.cloud.port_info:
+        filters:
+          device_id: "{{ openstack_dead_ports_server.servers[0].id }}"
+      delegate_to: localhost
+      register: openstack_dead_ports_port_info
+
+    - name: Sort them into live and dead
+      ansible.builtin.set_fact:
+        openstack_dead_ports_live: "{{ openstack_dead_ports_port_info.ports | selectattr('status', 'equalto', 'ACTIVE') | list }}"
+        openstack_dead_ports_dead: "{{ openstack_dead_ports_port_info.ports | rejectattr('status', 'equalto', 'ACTIVE') | list }}"
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ openstack_dead_ports_live | length }} live,
+          {{ openstack_dead_ports_dead | length }} dead
+          {{ '— DEAD: ' ~ (openstack_dead_ports_dead | map(attribute='id') | join(', '))
+             if openstack_dead_ports_dead | length > 0 else '— healthy' }}
+
+    # Removing the last port would strand the instance with no network at all. That is a different
+    # and much worse failure than the one being fixed.
+    - name: Never leave an instance with no live port
+      ansible.builtin.assert:
+        that:
+          - openstack_dead_ports_live | length > 0
+        fail_msg: >-
+          {{ inventory_hostname }} has {{ openstack_dead_ports_dead | length }} dead port(s) and NO
+          live port. Refusing to delete: this is not the duplicate-port fault, and removing what is
+          left would strand the instance. Diagnose before acting.
+      when:
+        - openstack_dead_ports_dead | length > 0
+        - not (openstack_dead_ports_dry_run | bool)
+
+    - name: Delete the dead ports
+      openstack.cloud.port:
+        name: "{{ item.id }}"
+        state: absent
+      delegate_to: localhost
+      loop: "{{ openstack_dead_ports_dead }}"
+      loop_control:
+        label: "{{ item.id }} ({{ item.status }})"
+      when:
+        - openstack_dead_ports_dead | length > 0
+        - openstack_dead_ports_live | length > 0
+        - not (openstack_dead_ports_dry_run | bool)
+      register: openstack_dead_ports_deletions
+
+    # The port disappears before Neutron has converged from the control node's direction. Returning
+    # success at that moment hands back a machine that looks fixed and is not yet reachable — which
+    # is exactly how the next playbook in the chain fails.
+    - name: Wait for the instance to answer again
+      ansible.builtin.wait_for:
+        host: "{{ openstack_dead_ports_live[0].fixed_ips[0].ip_address }}"
+        port: 22
+        timeout: "{{ openstack_dead_ports_reachability_timeout }}"
+        state: started
+      delegate_to: localhost
+      when:
+        - openstack_dead_ports_wait_for_ssh | bool
+        - openstack_dead_ports_deletions is defined
+        - openstack_dead_ports_deletions is changed
+
+    - name: Confirm
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: removed {{ openstack_dead_ports_dead | length }} dead port(s);
+          reachable on {{ openstack_dead_ports_live[0].fixed_ips[0].ip_address }}
+      when:
+        - openstack_dead_ports_deletions is defined
+        - openstack_dead_ports_deletions is changed
