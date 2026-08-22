@@ -311,7 +311,9 @@
             that:
               - postcheck_pod_ips | length == 2
               - postcheck_pod_ips | reject('match', '^\\d') | list | length == 0
-            fail_msg: "expected 2 test pods with addresses, got {{ postcheck_test_pods.stdout_lines }}"
+            fail_msg: >-
+              expected 2 test pods with addresses, got names={{ postcheck_pod_names }}
+              ips={{ postcheck_pod_ips }} nodes={{ postcheck_pod_nodes }}
 
         # python3 rather than ansible.utils.in_network: the collection is not guaranteed in every
         # execution environment, and python3 is guaranteed on any host kubespray has touched.
