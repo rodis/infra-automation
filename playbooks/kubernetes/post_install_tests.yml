@@ -63,6 +63,11 @@
     postcheck_tolerate_control_plane: true
     # Optional. When set, the API server's version must match exactly.
     postcheck_expect_version: ""
+    # Held as a variable so it can be passed as a single argv element. Inline in a cmd string it
+    # would be shlex-split into fragments at every space.
+    postcheck_subnet_program: >-
+      import ipaddress,sys; net=ipaddress.ip_network(sys.argv[1]);
+      sys.exit(0 if all(ipaddress.ip_address(a) in net for a in sys.argv[2:]) else 1)
 
   tasks:
 
@@ -96,11 +101,20 @@
 
         # custom-columns rather than -o json + json_query: jmespath is not guaranteed to be present
         # in every execution environment, and a check that cannot run is worse than no check.
+        # argv, not cmd. The `command` module runs shlex over a cmd string, which STRIPS the
+        # double quotes out of the JSONPath filter and leaves kubectl with @.type==Ready — "error:
+        # unrecognized identifier Ready". argv passes each element through untouched.
         - name: Read node readiness
           ansible.builtin.command:
-            cmd: >-
-              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }} get nodes --no-headers
-              -o custom-columns=NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status
+            argv:
+              - "{{ postcheck_kubectl }}"
+              - --kubeconfig
+              - "{{ postcheck_kubeconfig }}"
+              - get
+              - nodes
+              - --no-headers
+              - -o
+              - 'custom-columns=NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status'
           changed_when: false
           register: postcheck_nodes
           retries: 30
@@ -121,9 +135,16 @@
 
         - name: Read pod state cluster-wide
           ansible.builtin.command:
-            cmd: >-
-              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }} get pods -A --no-headers
-              -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,READY:.status.conditions[?(@.type=="Ready")].status
+            argv:
+              - "{{ postcheck_kubectl }}"
+              - --kubeconfig
+              - "{{ postcheck_kubeconfig }}"
+              - get
+              - pods
+              - -A
+              - --no-headers
+              - -o
+              - 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,READY:.status.conditions[?(@.type=="Ready")].status'
           changed_when: false
           register: postcheck_pods
           retries: 30
@@ -294,10 +315,9 @@
         # execution environment, and python3 is guaranteed on any host kubespray has touched.
         - name: Check the test pods hold addresses inside the cluster pod subnet
           ansible.builtin.command:
-            cmd: >-
-              python3 -c "import ipaddress,sys; net=ipaddress.ip_network(sys.argv[1]);
-              sys.exit(0 if all(ipaddress.ip_address(a) in net for a in sys.argv[2:]) else 1)"
-              {{ postcheck_pod_subnet.stdout | trim }} {{ postcheck_pod_ips | join(' ') }}
+            argv: >-
+              {{ ['python3', '-c', postcheck_subnet_program, postcheck_pod_subnet.stdout | trim]
+                 + postcheck_pod_ips }}
           changed_when: false
 
         # THE point of the exercise. Two pods on the same node talk over a local bridge and prove
