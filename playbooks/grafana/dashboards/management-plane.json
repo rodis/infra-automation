@@ -1,0 +1,165 @@
+{
+  "uid": "mgmt-plane",
+  "title": "Management plane",
+  "description": "south: the hosts every other objective depends on. AWX runs here, and so does the PostgreSQL it stores everything in — if this is unhealthy, nothing else can be repaired.",
+  "tags": ["managed-by-git", "south", "infra"],
+  "timezone": "utc",
+  "editable": false,
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "label": "host",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+        "query": "label_values(up, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Hosts reporting",
+      "description": "Counts hosts currently scraped. This is the first thing to read: a host that stops reporting produces ABSENCE of data, which looks the same as a broken collector. Compare against the expected count rather than trusting the number alone.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [{ "refId": "A", "expr": "count(up == 1)", "legendFormat": "up" }],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "auto" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "green", "value": 4 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Per host",
+      "description": "up, uptime and kernel. A host missing from this table entirely is more interesting than one showing 0.",
+      "gridPos": { "h": 5, "w": 18, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [
+        { "refId": "A", "expr": "up", "format": "table", "instant": true },
+        { "refId": "B", "expr": "time() - node_boot_time_seconds", "format": "table", "instant": true },
+        { "refId": "C", "expr": "node_uname_info", "format": "table", "instant": true }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "job": true, "__name__": true, "domainname": true, "machine": true, "nodename": true },
+            "renameByName": { "Value #A": "up", "Value #B": "uptime (s)", "release": "kernel", "sysname": "os" }
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "CPU steal",
+      "description": "The counter that mattered. On 2026-08-22 two west guests soft-locked while steal sat near zero, so steal is NOT a reliable proxy for a stalled vCPU — but sustained steal is a different and more ordinary problem (a busy hypervisor) and is worth seeing. Read a flat zero here as 'not this failure mode', never as 'the host is fine'.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (rate(node_cpu_seconds_total{mode=\"steal\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Load average (1m)",
+      "description": "A stalled vCPU shows up here as load climbing with no matching CPU usage, because runnable tasks pile up while nothing executes.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [
+        { "refId": "A", "expr": "node_load1{instance=~\"$instance\"}", "legendFormat": "{{instance}}" }
+      ],
+      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 10 } }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Root filesystem free",
+      "description": "A full disk on the PostgreSQL VM degrades AWX in ways that look like AWX being broken — which is the misattribution this whole dashboard exists to prevent.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_filesystem_avail_bytes{mountpoint=\"/\", instance=~\"$instance\"} / node_filesystem_size_bytes{mountpoint=\"/\", instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.1 },
+              { "color": "green", "value": 0.25 }
+            ]
+          },
+          "custom": { "fillOpacity": 10, "thresholdsStyle": { "mode": "dashed" } }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Memory available",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_memory_MemAvailable_bytes{instance=~\"$instance\"} / node_memory_MemTotal_bytes{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "text",
+      "title": "What this dashboard cannot tell you",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 21 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Soft lockups are not here.** node_exporter has no metric for them; the kernel taint bit and the dmesg lines are only visible on the host, which is what AWX template `[67] General: Machines: Check kernel health` reads. A stalled vCPU shows up here indirectly — as a gap in `up`, or load without CPU — and the confirmation is `[67]`.\n\n**Absence of data is not health.** If a host disappears from these panels the collector may have died, the host may be gone, or Grafana may be rejecting writes. Grafana cannot distinguish those, which is why the dead-man's switch is a separate service.\n\n**Retention is 14 days.** For anything older, the run ledgers in `infra-objectives/state/` are the record.\n\n**PostgreSQL's own metrics are absent** until a read-only `pg_monitor` role exists. Disk and memory on that host are proxies, not database health."
+      }
+    }
+  ]
+}

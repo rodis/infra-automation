@@ -1,0 +1,166 @@
+---
+# Apply Grafana dashboards and alert rules from this repository.
+#
+# Dashboards and alert rules are CODE here, not UI state. Three reasons, in increasing order of
+# importance:
+#
+#   - they survive a stack, an account, or a person
+#   - a change gets a plan and a confirm like everything else
+#   - and the agent that reads metrics must not be able to edit the rules that define health. An
+#     agent that can move a threshold can grade itself against its own definition. Its Grafana
+#     token is Viewer; the Editor token used here belongs to Spacelift, not to `agent-ops`.
+#
+# Runs against the Grafana API only — no hosts, no SSH, no inventory. `connection: local`.
+#
+# The API is idempotent for both objects: dashboards are posted with overwrite, and rule groups are
+# PUT as a whole group, so this converges rather than accumulating duplicates. Deleting a rule from
+# the JSON therefore removes it from Grafana, which is the property that makes this the source of
+# truth rather than an additive script.
+
+- name: Apply Grafana dashboards and alert rules
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    grafana_url: "{{ lookup('env', 'GRAFANA_API_URL') | regex_replace('/$', '') }}"
+    grafana_token: "{{ lookup('env', 'GRAFANA_API_TOKEN') }}"
+    grafana_folder_title: "Infrastructure"
+    grafana_folder_uid: "infra"
+    grafana_rule_group: "management-plane"
+    # Pinned so a misconfigured endpoint cannot quietly write into the wrong Grafana. See the
+    # boundary rule in infra-objectives/CLAUDE.md — a company Grafana or a second personal stack
+    # would answer just as happily.
+    grafana_expected_org_id: 1
+
+  tasks:
+
+    - name: Check the API settings were supplied
+      ansible.builtin.assert:
+        that:
+          - grafana_url | length > 0
+          - grafana_token | length > 0
+        fail_msg: >-
+          GRAFANA_API_URL and GRAFANA_API_TOKEN must be set. They come from the Spacelift context
+          holding the EDITOR service account token — note this is a different credential from the
+          read-only one in agent-ops, and a different KIND from a Cloud Access Policy token, which
+          cannot write dashboards at all.
+
+    # Refuse before writing rather than discover afterwards. Same guard as the Spacelift space and
+    # context checks: assert the identity, do not assume the endpoint is the one you meant.
+    - name: Identify the Grafana we are about to write to
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/org"
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        return_content: true
+      register: grafana_org
+      changed_when: false
+
+    - name: Refuse if this is not the expected organisation
+      ansible.builtin.assert:
+        that:
+          - grafana_org.json.id == grafana_expected_org_id
+        fail_msg: >-
+          Refusing to write. Expected org id {{ grafana_expected_org_id }}, got
+          {{ grafana_org.json.id }} ({{ grafana_org.json.name }}) at {{ grafana_url }}.
+        success_msg: "writing to org {{ grafana_org.json.id }} ({{ grafana_org.json.name }})"
+
+    - name: Ensure the folder exists
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/folders"
+        method: POST
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        body_format: json
+        body: { uid: "{{ grafana_folder_uid }}", title: "{{ grafana_folder_title }}" }
+        status_code: [200, 409]
+      register: grafana_folder
+      changed_when: grafana_folder.status == 200
+
+    - name: Find the dashboards in this repository
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}/dashboards"
+        patterns: "*.json"
+      register: grafana_dashboard_files
+
+    - name: Apply each dashboard
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/dashboards/db"
+        method: POST
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        body_format: json
+        body:
+          dashboard: "{{ lookup('file', item.path) | from_json }}"
+          folderUid: "{{ grafana_folder_uid }}"
+          # The repository is the source of truth, so a UI edit is overwritten rather than
+          # protected. That is the intent: anything worth keeping belongs in git.
+          overwrite: true
+          message: "applied from infra-automation"
+        status_code: [200]
+      loop: "{{ grafana_dashboard_files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: grafana_dashboards_applied
+      changed_when: true
+
+    - name: Load the alert rule definitions
+      ansible.builtin.set_fact:
+        grafana_alerts: "{{ lookup('file', playbook_dir ~ '/alerts/management-plane.json') | from_json }}"
+
+    # PUT of a whole rule group, not POST per rule: the group becomes exactly what the file says,
+    # so removing a rule here removes it in Grafana. A per-rule POST would only ever add, and the
+    # file would slowly stop describing reality.
+    - name: Apply the alert rule group
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/{{ grafana_rule_group }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+          X-Disable-Provenance: "true"
+        body_format: json
+        body:
+          title: "{{ grafana_rule_group }}"
+          interval: "{{ grafana_alerts.interval | default('1m') }}"
+          rules: "{{ grafana_alerts.rules }}"
+        status_code: [200, 202]
+      register: grafana_rules_applied
+      changed_when: true
+
+    # Applying is not the same as evaluating. A rule that cannot run reports nothing, and nothing
+    # is indistinguishable from healthy — the exact trap this alerting is meant to close. So read
+    # the rules back and require they are in a state that can actually fire.
+    - name: Read the rules back
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/prometheus/grafana/api/v1/rules"
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        return_content: true
+      register: grafana_rules_state
+      changed_when: false
+      retries: 6
+      delay: 10
+      until: >-
+        grafana_rules_state.json.data.groups
+        | map(attribute='rules') | flatten
+        | selectattr('name', 'in', grafana_alerts.rules | map(attribute='title') | list)
+        | list | length == (grafana_alerts.rules | length)
+
+    - name: Report what is now watching
+      ansible.builtin.debug:
+        msg: >-
+          {{ grafana_dashboard_files.files | length }} dashboard(s) applied;
+          {{ grafana_alerts.rules | length }} alert rule(s) in group '{{ grafana_rule_group }}',
+          health:
+          {{ grafana_rules_state.json.data.groups | map(attribute='rules') | flatten
+             | selectattr('name', 'in', grafana_alerts.rules | map(attribute='title') | list)
+             | map(attribute='health') | list | join(', ') }}
+
+    - name: Check every rule is healthy, not merely present
+      ansible.builtin.assert:
+        that:
+          - >-
+            grafana_rules_state.json.data.groups | map(attribute='rules') | flatten
+            | selectattr('name', 'in', grafana_alerts.rules | map(attribute='title') | list)
+            | rejectattr('health', 'equalto', 'ok') | list | length == 0
+        fail_msg: >-
+          One or more rules are present but not healthy — an erroring rule fires nothing and looks
+          exactly like a quiet estate. Check the datasource uid and the expressions.
+        success_msg: "all rules present and evaluating"

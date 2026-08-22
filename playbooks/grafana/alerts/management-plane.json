@@ -1,0 +1,132 @@
+{
+  "_comment": [
+    "Alert rules for south, the management plane. Applied to Grafana's unified alerting via",
+    "/api/v1/provisioning/folder/{uid}/rule-groups/{group} by ../apply.yml.",
+    "",
+    "Four rules, and the list is deliberately short. Every one of them corresponds to something",
+    "that actually had to be discovered by hand on 2026-08-22; an alert nobody would act on is",
+    "worse than no alert, because it teaches people to ignore the channel.",
+    "",
+    "NoDataState is 'Alerting' on purpose throughout. Absence of data is the failure mode this",
+    "estate is most exposed to — a dead collector, a dead host and a rejected write all look",
+    "identical from here, and treating silence as health is how a broken thing gets recorded as",
+    "fine. It will occasionally page for a Grafana-side problem. That is the right trade."
+  ],
+  "interval": "1m",
+  "rules": [
+    {
+      "title": "Host not reporting",
+      "condition": "C",
+      "for": "5m",
+      "noDataState": "Alerting",
+      "execErrState": "Alerting",
+      "labels": { "severity": "critical", "estate": "south" },
+      "annotations": {
+        "summary": "{{ $labels.instance }} has not reported for 5 minutes",
+        "description": "Either the host is down, the collector has stopped, or writes are being rejected. These are indistinguishable from here — check the host directly before concluding anything, and remember that AWX runs on this plane, so an objective that tries to diagnose it may itself be affected.",
+        "runbook": "ssh to the host; systemctl is-active alloy; then AWX [67] General: Machines: Check kernel health"
+      },
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": { "from": 300, "to": 0 },
+          "datasourceUid": "grafanacloud-prom",
+          "model": { "refId": "A", "expr": "up", "instant": true }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": { "refId": "C", "type": "threshold", "expression": "A", "conditions": [{ "evaluator": { "type": "lt", "params": [1] } }] }
+        }
+      ]
+    },
+    {
+      "title": "Root filesystem filling",
+      "condition": "C",
+      "for": "15m",
+      "noDataState": "Alerting",
+      "execErrState": "Alerting",
+      "labels": { "severity": "warning", "estate": "south" },
+      "annotations": {
+        "summary": "{{ $labels.instance }} has under 10% free on /",
+        "description": "On the PostgreSQL VM this matters more than it looks: AWX stores everything in that database, and a full disk degrades AWX in ways that present as AWX being broken rather than as a disk problem."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": { "from": 600, "to": 0 },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "instant": true,
+            "expr": "node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"}"
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": { "refId": "C", "type": "threshold", "expression": "A", "conditions": [{ "evaluator": { "type": "lt", "params": [0.10] } }] }
+        }
+      ]
+    },
+    {
+      "title": "Memory nearly exhausted",
+      "condition": "C",
+      "for": "15m",
+      "noDataState": "Alerting",
+      "execErrState": "Alerting",
+      "labels": { "severity": "warning", "estate": "south" },
+      "annotations": {
+        "summary": "{{ $labels.instance }} has under 10% memory available",
+        "description": "MemAvailable rather than free: free memory is meaningless on a host with a healthy page cache, and alerting on it produces noise that gets the channel muted."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": { "from": 600, "to": 0 },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "instant": true,
+            "expr": "node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes"
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": { "refId": "C", "type": "threshold", "expression": "A", "conditions": [{ "evaluator": { "type": "lt", "params": [0.10] } }] }
+        }
+      ]
+    },
+    {
+      "title": "Sustained CPU steal",
+      "condition": "C",
+      "for": "10m",
+      "noDataState": "OK",
+      "execErrState": "Alerting",
+      "labels": { "severity": "warning", "estate": "south" },
+      "annotations": {
+        "summary": "{{ $labels.instance }} is losing over 5% of CPU to steal",
+        "description": "The hypervisor is oversubscribed. NOTE: this is NOT the soft-lockup fault seen on west on 2026-08-22 — steal was near zero on hosts that were locking up hard, so a quiet version of this alert rules nothing out. Soft lockups are only visible on the host, via AWX [67] Check kernel health.",
+        "runbook": "AWX [67] General: Machines: Check kernel health"
+      },
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": { "from": 600, "to": 0 },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "instant": true,
+            "expr": "sum by (instance) (rate(node_cpu_seconds_total{mode=\"steal\"}[5m]))"
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": { "refId": "C", "type": "threshold", "expression": "A", "conditions": [{ "evaluator": { "type": "gt", "params": [0.05] } }] }
+        }
+      ]
+    }
+  ]
+}
