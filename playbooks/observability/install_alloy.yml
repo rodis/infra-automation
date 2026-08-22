@@ -1,227 +1,28 @@
 ---
-# Install Grafana Alloy on a VM and ship host metrics to Grafana Cloud.
+# Install Grafana Alloy and ship host metrics to Grafana Cloud.
 #
-# WHY THIS IS ITS OWN PLAYBOOK, AND NOT PART OF playbooks/postgresql/
+# Thin on purpose. The work lives in roles/alloy so that ONE definition serves every host in the
+# estate, while the differences between hosts stay where they already are: in the Spacelift space.
 #
-# Adding these tasks to the PostgreSQL playbook would mean every monitoring change re-runs
-# geerlingguy.postgresql against a live database. That role can restart PostgreSQL, and PostgreSQL
-# is what AWX stores everything in — so a change to a metrics scrape interval could bounce the
-# control plane. Monitoring must not be able to restart the thing it monitors.
+# south is two OS families, and that is why it is two spaces rather than one:
 #
-# WHY ALLOY RATHER THAN node_exporter + prometheus
+#   PostgreSQL space        Debian    `postgresql` context      ANSIBLE_REMOTE_USER=debian
+#   Kubernetes: Infra space Ubuntu    `kubernetes-infra` context ANSIBLE_REMOTE_USER=ubuntu
 #
-# Alloy has `prometheus.exporter.unix` built in — the node_exporter collectors, in-process — and
-# can remote_write directly. One binary, one config, one service, no local Prometheus to run out of
-# disk. When PostgreSQL metrics are added later it is `prometheus.exporter.postgres` in the same
-# file, not another package.
+# So this playbook is run by a stack in EACH space. Each inherits its own remote user, its own
+# inventory, and its own `--limit`, and neither needs to know the other exists. Putting an OS
+# conditional in the playbook instead would move that difference out of the place that already
+# models it correctly.
 #
-# WHAT THIS DELIBERATELY DOES NOT DO YET
-#
-#   - PostgreSQL metrics. Those need a dedicated read-only monitoring role in the database
-#     (pg_monitor), not the application's own DB_USER. That is a database change and belongs in its
-#     own reviewed step.
-#   - Logs. 50GB of free Loki is available, but shipping logs from a management-plane host is a
-#     separate decision about what ends up in a third party's storage.
-#
-# CREDENTIALS come from the Spacelift `Observability` context as environment variables, the same
-# mechanism playbooks/postgresql already uses for DB_PASSWORD. Only the token is secret; the
-# endpoint is public and the "user" is a numeric instance id used as a basic-auth username.
-#
-# SERIES BUDGET: Grafana Cloud free allows 10,000 active series and a default `unix` exporter emits
-# roughly 500-1000 per host. The collector list below is trimmed deliberately — see the comment on
-# `set_collectors`. Adding collectors is cheap to do and expensive to notice.
+# `hosts: all` is deliberate: the space's context already narrows the inventory. Overriding
+# alloy_hosts is for running it by hand against something specific.
 
 - name: Ship host metrics to Grafana Cloud
-  hosts: "{{ alloy_hosts | default('postgresql') }}"
+  hosts: "{{ alloy_hosts | default('all') }}"
   become: true
 
-  vars:
-    alloy_remote_write_url: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_URL') }}"
-    alloy_remote_write_user: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_USER') }}"
-    alloy_remote_write_token: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_TOKEN') }}"
-    alloy_scrape_interval: 60s
-
-  tasks:
-
-    # Fail loudly and early rather than installing a collector that silently ships nowhere. A
-    # misnamed context variable is the likeliest failure here, and an Alloy that starts, runs, and
-    # writes to an empty URL looks healthy from every angle except the one that matters.
-    - name: Check the remote_write settings were supplied
-      ansible.builtin.assert:
-        that:
-          - alloy_remote_write_url | length > 0
-          - alloy_remote_write_user | length > 0
-          - alloy_remote_write_token | length > 0
-        fail_msg: >-
-          GRAFANA_REMOTE_WRITE_URL, _USER and _TOKEN must all be set. They come from the Spacelift
-          `Observability` context — check the variable NAMES if the context is attached but this
-          still fails.
-        success_msg: "remote_write settings present"
-      run_once: true
-
-    # Mimir rejects out-of-order samples, so a host whose clock has drifted does not degrade
-    # gracefully — it gets 400s from every write. Cheaper to guarantee time sync than to debug it
-    # later from the receiving end.
-    - name: Ensure the clock is disciplined
-      ansible.builtin.package:
-        name: systemd-timesyncd
-        state: present
-
-    - name: Start and enable time synchronisation
-      ansible.builtin.systemd:
-        name: systemd-timesyncd
-        state: started
-        enabled: true
-
-    - name: Install the prerequisites for Grafana's apt repository
-      ansible.builtin.apt:
-        name:
-          - apt-transport-https
-          - gpg
-        state: present
-        update_cache: true
-        cache_valid_time: 3600
-
-    # /etc/apt/keyrings is not present on every Debian release that might be under us.
-    - name: Ensure the keyring directory exists
-      ansible.builtin.file:
-        path: /etc/apt/keyrings
-        state: directory
-        mode: "0755"
-
-    - name: Add Grafana's signing key
-      ansible.builtin.get_url:
-        url: https://apt.grafana.com/gpg.key
-        dest: /etc/apt/keyrings/grafana.asc
-        mode: "0644"
-
-    # Written directly rather than with ansible.builtin.apt_repository, which is deprecated and
-    # removed in ansible-core 2.25. Its replacement, deb822_repository, needs 2.15+ — and the
-    # version of Ansible in the Spacelift runner is not something this playbook should have an
-    # opinion about. A source file is a source file on every version.
-    - name: Add the Grafana apt repository
-      ansible.builtin.copy:
-        dest: /etc/apt/sources.list.d/grafana.list
-        content: "deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main\n"
-        owner: root
-        group: root
-        mode: "0644"
-      register: alloy_repo
-
-    - name: Refresh the package lists if the repository changed
-      ansible.builtin.apt:
-        update_cache: true
-      when: alloy_repo is changed
-
-    - name: Install Alloy
-      ansible.builtin.apt:
-        name: alloy
-        state: present
-
-    - name: Write the Alloy configuration
-      ansible.builtin.template:
-        src: config.alloy.j2
-        dest: /etc/alloy/config.alloy
-        owner: root
-        group: alloy
-        # root:alloy 0640 — the file holds the remote_write token, so it must not be world
-        # readable, but the unit is `User=alloy` and reads the config as that user from the start.
-        # This was root:root on the first attempt, on the mistaken belief that Alloy started as
-        # root and dropped privileges. It does not, and the service crash-looped on
-        # "reading config path: permission denied" until systemd gave up.
-        mode: "0640"
-      notify: Restart alloy
-
-    - name: Clear any previous failed state before starting
-      ansible.builtin.systemd:
-        name: alloy
-        state: stopped
-      failed_when: false
-      changed_when: false
-
-    - name: Reset the systemd start-rate limiter
-      ansible.builtin.command: systemctl reset-failed alloy
-      failed_when: false
-      changed_when: false
-
-    - name: Start and enable Alloy
-      ansible.builtin.systemd:
-        name: alloy
-        state: started
-        enabled: true
-        daemon_reload: true
-
-    - name: Flush handlers so the verification below tests the new config
-      ansible.builtin.meta: flush_handlers
-
-    # A running service is not a shipping service. Alloy starts happily with a config that writes
-    # to an endpoint refusing every sample, so check what it says about itself rather than whether
-    # systemd is content.
-    - name: Give Alloy a moment to attempt its first write
-      ansible.builtin.wait_for:
-        timeout: 20
-      delegate_to: localhost
-      become: false
-      run_once: true
-
-    - name: Read Alloy's own view of its health
-      ansible.builtin.command: systemctl is-active alloy
-      changed_when: false
-      # `systemctl is-active` exits non-zero exactly when the answer is interesting, and `command`
-      # treats that as a task failure — so the first run aborted here instead of printing the
-      # journal that said why. A check that cannot report a bad result is not a check.
-      failed_when: false
-      register: alloy_active
-
-    # Ask Alloy what it actually shipped, rather than grepping its logs. The first version of this
-    # searched the journal for /error/ and matched `level=info msg="node exited without error"` — a
-    # SUCCESS message containing the word. It failed a run in which everything had worked, which is
-    # the same class of mistake as reading a check's failure as the thing being checked.
-    #
-    # These two counters are the ground truth: samples handed to remote_write, and samples the
-    # endpoint rejected.
-    - name: Read Alloy's own shipping counters
-      ansible.builtin.shell:
-        cmd: >-
-          set -o pipefail;
-          curl -s --max-time 10 localhost:12345/metrics
-          | awk '/^prometheus_remote_storage_samples_total/ {s=$NF}
-                 /^prometheus_remote_storage_samples_failed_total/ {f=$NF}
-                 END {printf "%d %d", s+0, f+0}'
-        executable: /bin/bash
-      changed_when: false
-      failed_when: false
-      register: alloy_counters
-      # The first scrape has to happen before there is anything to count.
-      retries: 6
-      delay: 15
-      until: (alloy_counters.stdout.split() | first | default(0) | int) > 0
-
-    - name: Report
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}: alloy {{ alloy_active.stdout }},
-          {{ alloy_counters.stdout.split() | first | default('0') }} samples sent,
-          {{ alloy_counters.stdout.split() | last | default('?') }} rejected
-
-    - name: Check Alloy is running and its samples are being accepted
-      ansible.builtin.assert:
-        that:
-          - alloy_active.stdout == 'active'
-          - (alloy_counters.stdout.split() | first | default(0) | int) > 0
-          - (alloy_counters.stdout.split() | last | default(1) | int) == 0
-        fail_msg: >-
-          Alloy is not shipping cleanly on {{ inventory_hostname }} — service is
-          '{{ alloy_active.stdout }}', {{ alloy_counters.stdout | default('no counters') }}
-          (samples sent / rejected). Rejections mean the endpoint refused them: a 401 or 403 is the
-          token or instance id, a 400 mentioning out-of-order samples is the clock. Zero sent with
-          the service active means nothing is being scraped — check the exporter block.
-        success_msg: >-
-          {{ inventory_hostname }} is shipping metrics and none are being rejected.
-
-  handlers:
-    - name: Restart alloy
-      ansible.builtin.systemd:
-        name: alloy
-        state: restarted
-        daemon_reload: true
+  roles:
+    # By relative path rather than by name: this repo has no root ansible.cfg for AWX or Spacelift
+    # to load, and adding one would newly apply the ssh settings in playbooks/ansible.cfg — a
+    # behaviour change with no business riding along with a refactor.
+    - role: ../../roles/alloy

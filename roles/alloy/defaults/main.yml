@@ -1,0 +1,8 @@
+---
+# Where to ship. Supplied by the Spacelift `Observability` context as environment variables; only
+# the token is secret. See the role README.
+alloy_remote_write_url: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_URL') }}"
+alloy_remote_write_user: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_USER') }}"
+alloy_remote_write_token: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_TOKEN') }}"
+
+alloy_scrape_interval: 60s
