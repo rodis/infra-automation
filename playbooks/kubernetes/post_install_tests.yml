@@ -1,0 +1,371 @@
+---
+# Post-install verification for a kubespray-built cluster.
+#
+# This exists because an installer's exit status is not evidence that a cluster works. Kubespray
+# can complete successfully against a cluster that installed almost nothing — a play matching an
+# empty host pattern is silent — and it can complete against a cluster whose pods are still
+# pulling images, which looks identical to a healthy one for the first few seconds. What settles
+# the question is the state of the running cluster, so that is what this checks.
+#
+# WHY NOT kubespray's own tests/testcases/
+#
+# Kubespray ships a good suite and this borrows its shape, particularly the agnhost pod-to-pod
+# curl. It is not reused directly for three reasons:
+#
+#   - it lives in a different AWX project (the kubespray checkout), and a playbook in this repo
+#     cannot import tasks across that boundary
+#   - 030_check-network.yml creates a namespace called `test` and never deletes it, so a second
+#     run fails at `kubectl create namespace`. That is fine for CI, which runs against a cluster
+#     it is about to throw away, and wrong for something run after every deploy
+#   - tests.yml unconditionally imports 040_check-network-adv.yml, which needs netchecker deployed
+#     at install time. It is not deployed here, so the suite as shipped would fail on it — and 040
+#     is the only one of them that tests DNS at all
+#
+# WHAT IT CHECKS, and why each one earns its place
+#
+#   1. the API server answers, and reports the version we expect
+#   2. every node is Ready
+#   3. no pod anywhere is outside Running/Succeeded, and every Running pod is Ready
+#   4. two test pods get addresses inside the cluster's real pod subnet, read from the cluster
+#      rather than assumed
+#   5. those pods land on DIFFERENT nodes, and can reach each other — the check that actually
+#      exercises the CNI, since same-node pod traffic never touches the overlay
+#   6. from inside a pod, `curl https://kubernetes.default.svc.cluster.local` returns 200. One
+#      command, three proofs: CoreDNS resolved the name, kube-proxy routed the ClusterIP, and the
+#      API server answered. DNS working "as a pod sees it" is the only sense of DNS that matters
+#
+# WHAT IT DELIBERATELY DOES NOT CHECK
+#
+#   - conformance. That is a different job with a different runtime; use hydrophone with a
+#     [sig-network] focus when the question is standards compliance rather than "does it work"
+#   - anything about deployed applications. Argo CD, Aware and the rest are a later stage
+#
+# BLAST RADIUS: it creates one namespace, runs two short-lived pods in it, and deletes the
+# namespace again in an `always` block — including when an assertion fails. It touches nothing
+# else, and it is safe to run repeatedly: the namespace is applied rather than created, so a
+# leftover from an interrupted run does not wedge the next one.
+
+- name: Verify a freshly installed Kubernetes cluster
+  hosts: kube_control_plane[0]
+  gather_facts: false
+  become: true
+
+  vars:
+    postcheck_namespace: kube-postcheck
+    postcheck_image: registry.k8s.io/e2e-test-images/agnhost:2.40
+    postcheck_kubeconfig: /etc/kubernetes/admin.conf
+    postcheck_kubectl: /usr/local/bin/kubectl
+    postcheck_rollout_timeout: 180s
+    # Test pods tolerate the control-plane taint so they can spread across every node. Without
+    # this, a cluster whose only schedulable node is a single worker puts both pods on that one
+    # node, and the pod-to-pod curl proves nothing about the overlay. Set false to leave control
+    # planes alone, and the cross-node assertion below will skip itself rather than fail.
+    postcheck_tolerate_control_plane: true
+    # Optional. When set, the API server's version must match exactly.
+    postcheck_expect_version: ""
+
+  tasks:
+
+    - name: Establish the facts about the cluster
+      block:
+
+        - name: Ask the API server for its version
+          ansible.builtin.command:
+            cmd: "{{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }} version -o json"
+          changed_when: false
+          register: postcheck_version
+          retries: 12
+          delay: 5
+          until: postcheck_version.rc == 0
+
+        - name: Report the server version
+          ansible.builtin.debug:
+            msg: >-
+              API server reports
+              {{ (postcheck_version.stdout | from_json).serverVersion.gitVersion }}
+
+        - name: Check the server version is the expected one
+          ansible.builtin.assert:
+            that:
+              - (postcheck_version.stdout | from_json).serverVersion.gitVersion == postcheck_expect_version
+            fail_msg: >-
+              API server is
+              {{ (postcheck_version.stdout | from_json).serverVersion.gitVersion }},
+              expected {{ postcheck_expect_version }}
+          when: postcheck_expect_version | length > 0
+
+        # custom-columns rather than -o json + json_query: jmespath is not guaranteed to be present
+        # in every execution environment, and a check that cannot run is worse than no check.
+        - name: Read node readiness
+          ansible.builtin.command:
+            cmd: >-
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }} get nodes --no-headers
+              -o custom-columns=NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status
+          changed_when: false
+          register: postcheck_nodes
+          retries: 30
+          delay: 10
+          until:
+            - postcheck_nodes.rc == 0
+            - postcheck_nodes.stdout_lines | reject('search', '\\s+True\\s*$') | list | length == 0
+
+        - name: Check every node is Ready
+          ansible.builtin.assert:
+            that:
+              - postcheck_nodes.stdout_lines | length > 0
+              - postcheck_nodes.stdout_lines | reject('search', '\\s+True\\s*$') | list | length == 0
+            fail_msg: >-
+              not every node is Ready:
+              {{ postcheck_nodes.stdout_lines | reject('search', '\\s+True\\s*$') | list | join('; ') }}
+            success_msg: "{{ postcheck_nodes.stdout_lines | length }} node(s), all Ready"
+
+        - name: Read pod state cluster-wide
+          ansible.builtin.command:
+            cmd: >-
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }} get pods -A --no-headers
+              -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,READY:.status.conditions[?(@.type=="Ready")].status
+          changed_when: false
+          register: postcheck_pods
+          retries: 30
+          delay: 10
+          until:
+            - postcheck_pods.rc == 0
+            - postcheck_pods.stdout_lines | select('search', '\\s(Pending|Failed|Unknown)\\s') | list | length == 0
+            - >-
+              postcheck_pods.stdout_lines | select('search', '\\sRunning\\s')
+              | reject('search', '\\s+True\\s*$') | list | length == 0
+
+        # A Succeeded pod is legitimately not Ready, so readiness is asserted only of Running pods.
+        # Pending is called out separately because "not yet" is the state a cluster mid-pull sits
+        # in, and reporting it as success is the specific failure this playbook exists to prevent.
+        - name: Check no pod is Pending, Failed or Unknown
+          ansible.builtin.assert:
+            that:
+              - postcheck_pods.stdout_lines | select('search', '\\s(Pending|Failed|Unknown)\\s') | list | length == 0
+            fail_msg: >-
+              pods not in Running/Succeeded:
+              {{ postcheck_pods.stdout_lines | select('search', '\\s(Pending|Failed|Unknown)\\s') | list | join('; ') }}
+
+        - name: Check every Running pod is Ready
+          ansible.builtin.assert:
+            that:
+              - >-
+                postcheck_pods.stdout_lines | select('search', '\\sRunning\\s')
+                | reject('search', '\\s+True\\s*$') | list | length == 0
+            fail_msg: >-
+              Running but not Ready:
+              {{ postcheck_pods.stdout_lines | select('search', '\\sRunning\\s')
+                 | reject('search', '\\s+True\\s*$') | list | join('; ') }}
+
+        # Read the pod CIDR from the cluster instead of assuming kubespray's default. A hardcoded
+        # subnet here would pass on a cluster it does not describe, which is worse than not
+        # checking at all.
+        - name: Read the pod subnet from kubeadm-config
+          ansible.builtin.shell:
+            cmd: >-
+              set -o pipefail;
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }}
+              -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}'
+              | grep -E '^\s+podSubnet:' | awk '{print $2}'
+            executable: /bin/bash
+          changed_when: false
+          register: postcheck_pod_subnet
+
+        - name: Check a pod subnet was found
+          ansible.builtin.assert:
+            that:
+              - postcheck_pod_subnet.stdout | trim | length > 0
+            fail_msg: "could not read podSubnet from the kubeadm-config ConfigMap"
+            success_msg: "pod subnet is {{ postcheck_pod_subnet.stdout | trim }}"
+
+    - name: Exercise pod networking and in-cluster DNS
+      block:
+
+        # Applied rather than created, so a namespace left behind by an interrupted run does not
+        # wedge this one. See the blast-radius note in the header.
+        - name: Ensure the test namespace exists
+          ansible.builtin.shell:
+            cmd: >-
+              set -o pipefail;
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }}
+              create namespace {{ postcheck_namespace }} --dry-run=client -o yaml
+              | {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }} apply -f -
+            executable: /bin/bash
+          changed_when: false
+
+        - name: Deploy two agnhost pods
+          ansible.builtin.command:
+            cmd: >-
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }}
+              apply --namespace {{ postcheck_namespace }} -f -
+            stdin: |
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: postcheck-agnhost
+              spec:
+                replicas: 2
+                selector:
+                  matchLabels:
+                    app: postcheck-agnhost
+                template:
+                  metadata:
+                    labels:
+                      app: postcheck-agnhost
+                  spec:
+                    {% if postcheck_tolerate_control_plane %}
+                    tolerations:
+                      - key: node-role.kubernetes.io/control-plane
+                        operator: Exists
+                        effect: NoSchedule
+                    {% endif %}
+                    affinity:
+                      podAntiAffinity:
+                        preferredDuringSchedulingIgnoredDuringExecution:
+                          - weight: 100
+                            podAffinityTerm:
+                              topologyKey: kubernetes.io/hostname
+                              labelSelector:
+                                matchLabels:
+                                  app: postcheck-agnhost
+                    containers:
+                      - name: agnhost
+                        image: {{ postcheck_image }}
+                        command: ['/agnhost', 'netexec', '--http-port=8080']
+                        securityContext:
+                          allowPrivilegeEscalation: false
+                          capabilities:
+                            drop: ['ALL']
+                          runAsUser: 1000
+                          runAsNonRoot: true
+                          seccompProfile:
+                            type: RuntimeDefault
+          changed_when: false
+
+        - name: Wait for the deployment to roll out
+          ansible.builtin.command:
+            cmd: >-
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }}
+              rollout status deployment --namespace {{ postcheck_namespace }}
+              postcheck-agnhost --timeout={{ postcheck_rollout_timeout }}
+          changed_when: false
+
+        # Three jsonpath queries rather than one custom-columns table parsed with filters. Splitting
+        # a table depends on which filters a given ansible-core exposes; `.split()` is a plain
+        # Python string method and behaves the same everywhere.
+        - name: Read the test pods' names
+          ansible.builtin.command:
+            cmd: >-
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }}
+              get pods --namespace {{ postcheck_namespace }} -o jsonpath={.items[*].metadata.name}
+          changed_when: false
+          register: postcheck_names_raw
+
+        - name: Read the test pods' addresses
+          ansible.builtin.command:
+            cmd: >-
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }}
+              get pods --namespace {{ postcheck_namespace }} -o jsonpath={.items[*].status.podIP}
+          changed_when: false
+          register: postcheck_ips_raw
+
+        - name: Read the nodes the test pods landed on
+          ansible.builtin.command:
+            cmd: >-
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }}
+              get pods --namespace {{ postcheck_namespace }} -o jsonpath={.items[*].spec.nodeName}
+          changed_when: false
+          register: postcheck_nodes_raw
+
+        - name: Collect their names, addresses and nodes
+          ansible.builtin.set_fact:
+            postcheck_pod_names: "{{ postcheck_names_raw.stdout.split() }}"
+            postcheck_pod_ips: "{{ postcheck_ips_raw.stdout.split() }}"
+            postcheck_pod_nodes: "{{ postcheck_nodes_raw.stdout.split() }}"
+
+        - name: Check both test pods are present with addresses
+          ansible.builtin.assert:
+            that:
+              - postcheck_pod_ips | length == 2
+              - postcheck_pod_ips | reject('match', '^\\d') | list | length == 0
+            fail_msg: "expected 2 test pods with addresses, got {{ postcheck_test_pods.stdout_lines }}"
+
+        # python3 rather than ansible.utils.in_network: the collection is not guaranteed in every
+        # execution environment, and python3 is guaranteed on any host kubespray has touched.
+        - name: Check the test pods hold addresses inside the cluster pod subnet
+          ansible.builtin.command:
+            cmd: >-
+              python3 -c "import ipaddress,sys; net=ipaddress.ip_network(sys.argv[1]);
+              sys.exit(0 if all(ipaddress.ip_address(a) in net for a in sys.argv[2:]) else 1)"
+              {{ postcheck_pod_subnet.stdout | trim }} {{ postcheck_pod_ips | join(' ') }}
+          changed_when: false
+
+        # THE point of the exercise. Two pods on the same node talk over a local bridge and prove
+        # nothing about the overlay; the CNI is only really tested when the traffic crosses hosts.
+        # Skipped rather than failed on a single-node cluster, where it is not answerable.
+        - name: Check the test pods landed on different nodes
+          ansible.builtin.assert:
+            that:
+              - postcheck_pod_nodes | unique | length == 2
+            fail_msg: >-
+              both test pods were scheduled onto {{ postcheck_pod_nodes | first }}, so pod-to-pod
+              traffic never crossed the overlay and the CNI was not exercised
+            success_msg: "test pods are on {{ postcheck_pod_nodes | join(' and ') }}"
+          when: postcheck_nodes.stdout_lines | length > 1
+
+        - name: Curl every test pod from every other one
+          ansible.builtin.command:
+            cmd: >-
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }}
+              -n {{ postcheck_namespace }} exec {{ item[0] }} --
+              curl -s --max-time 10 --fail http://{{ item[1] }}:8080/hostname
+          changed_when: false
+          loop: "{{ postcheck_pod_names | product(postcheck_pod_ips) | list }}"
+          loop_control:
+            label: "{{ item[0] }} -> {{ item[1] }}"
+
+        # One command, three proofs: CoreDNS resolved the name, kube-proxy routed the ClusterIP,
+        # and the API server answered. This is DNS as a workload actually experiences it, which is
+        # the only sense in which "DNS works" is a useful statement.
+        - name: Resolve and reach the kubernetes service from inside a pod
+          ansible.builtin.command:
+            cmd: >-
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }}
+              -n {{ postcheck_namespace }} exec {{ postcheck_pod_names | first }} --
+              curl -sk -o /dev/null -w '%{http_code}' --max-time 10
+              https://kubernetes.default.svc.cluster.local:443/version
+          changed_when: false
+          register: postcheck_dns
+
+        - name: Check the in-cluster service answered
+          ansible.builtin.assert:
+            that:
+              - postcheck_dns.stdout | trim == '200'
+            fail_msg: >-
+              curl to https://kubernetes.default.svc.cluster.local returned
+              '{{ postcheck_dns.stdout | trim }}' — DNS resolution, ClusterIP routing or the API
+              server itself is broken as seen from inside a pod
+            success_msg: "in-cluster DNS and ClusterIP routing are working"
+
+      always:
+
+        # Runs even when an assertion above failed, so a red run does not leave a namespace behind
+        # for the next one to trip over. Cleanup failure is reported but does not mask the real
+        # failure, which is the one worth reading.
+        - name: Remove the test namespace
+          ansible.builtin.command:
+            cmd: >-
+              {{ postcheck_kubectl }} --kubeconfig {{ postcheck_kubeconfig }}
+              delete namespace {{ postcheck_namespace }} --ignore-not-found --wait=true --timeout=120s
+          changed_when: false
+          register: postcheck_cleanup
+          failed_when: false
+
+        - name: Report a cleanup that did not succeed
+          ansible.builtin.debug:
+            msg: >-
+              WARNING: could not remove namespace {{ postcheck_namespace }}
+              (rc={{ postcheck_cleanup.rc }}): {{ postcheck_cleanup.stderr | default('') }}.
+              The next run applies the namespace rather than creating it, so this will not block
+              it, but the leftover is worth looking at.
+          when: postcheck_cleanup.rc != 0
