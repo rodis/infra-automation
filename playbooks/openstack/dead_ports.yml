@@ -1,0 +1,136 @@
+---
+# Find — and optionally remove — Neutron ports that never came up.
+#
+# Nova sometimes attaches a port that stays DOWN, then attaches a second one that works. The
+# instance is left carrying both, the dead address is listed FIRST, and everything that takes
+# "the first IPv4" therefore talks to nothing. The AWX OpenStack inventory composes ansible_host
+# exactly that way, so the machine becomes unmanageable while being perfectly healthy: inside the
+# guest there is one address on one interface, correctly configured.
+#
+# Seen on 2 of 4 instances in a single build on 2026-08-22. Rebuilding fixes it, but that destroys
+# a working machine to solve a problem that removing one port solves.
+#
+# TWO MODES, ONE DEFINITION. dry_run (the default) reports; dry_run: false deletes. The check and
+# the fix encode the same knowledge, and splitting them into separate playbooks would guarantee
+# they drift — the checker reporting a fault the fixer no longer handles the same way.
+#
+#   Report:  dry_run=true                      (a read; runs standalone, needs no authority)
+#   Fix:     dry_run=false
+#            authorizing_objective=cluster-build
+#            granted_actions=['openstack.port.delete']
+#
+# Requires an OpenStack cloud credential on the job template. It reads and writes Neutron, not the
+# guest, so it works on an instance nobody can log into.
+
+- name: Find and optionally remove dead Neutron ports
+  hosts: all
+  gather_facts: false
+  connection: local
+
+  vars:
+    dry_run: true
+    # What this playbook needs permission to do. The caller must grant it explicitly.
+    required_actions:
+      - openstack.port.delete
+    granted_actions: []
+    authorizing_objective: ""
+    reachability_timeout: 240
+
+  tasks:
+    # An interlock against accident, not against intent: anyone who can launch the template can
+    # also type these variables. Its value is that a hand-launch without thinking fails loudly,
+    # and that the authorising objective is recorded in AWX's job history beside the deletion.
+    - name: Refuse to delete anything without an authorising objective
+      ansible.builtin.assert:
+        that:
+          - authorizing_objective | length > 0
+          - required_actions | difference(granted_actions) | length == 0
+        fail_msg: >-
+          This playbook deletes Neutron ports and will not do so on its own. It needs
+          authorizing_objective set, and granted_actions to include
+          {{ required_actions | join(', ') }} — taken from that objective's may_destroy list.
+          Run with dry_run=true to inspect without authority.
+        success_msg: "authorised by {{ authorizing_objective }} for {{ required_actions | join(', ') }}"
+      run_once: true
+      when: not (dry_run | bool)
+
+    - name: Read the instance
+      openstack.cloud.server_info:
+        name: "{{ inventory_hostname }}"
+      register: server
+
+    - name: Note hosts OpenStack does not know about
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: no such instance — nothing to inspect."
+      when: server.servers | length == 0
+
+    - name: Inspect ports
+      when: server.servers | length > 0
+      block:
+
+        - name: List the instance's ports
+          openstack.cloud.port_info:
+            filters:
+              device_id: "{{ server.servers[0].id }}"
+          register: port_info
+
+        - name: Sort them into live and dead
+          ansible.builtin.set_fact:
+            live_ports: "{{ port_info.ports | selectattr('status', 'equalto', 'ACTIVE') | list }}"
+            dead_ports: "{{ port_info.ports | rejectattr('status', 'equalto', 'ACTIVE') | list }}"
+
+        - name: Report
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: {{ live_ports | length }} live,
+              {{ dead_ports | length }} dead
+              {{ '— DEAD: ' ~ (dead_ports | map(attribute='id') | join(', ')) if dead_ports | length > 0 else '— healthy' }}
+
+        # Removing the last port would strand the instance with no network at all. That is a
+        # different and much worse failure than the one being fixed.
+        - name: Never leave an instance with no live port
+          ansible.builtin.assert:
+            that:
+              - live_ports | length > 0
+            fail_msg: >-
+              {{ inventory_hostname }} has {{ dead_ports | length }} dead port(s) and NO live port.
+              Refusing to delete: this is not the duplicate-port fault, and removing what is left
+              would strand the instance. Diagnose before acting.
+          when:
+            - dead_ports | length > 0
+            - not (dry_run | bool)
+
+        - name: Delete the dead ports
+          openstack.cloud.port:
+            name: "{{ item.id }}"
+            state: absent
+          loop: "{{ dead_ports }}"
+          loop_control:
+            label: "{{ item.id }} ({{ item.status }})"
+          when:
+            - dead_ports | length > 0
+            - live_ports | length > 0
+            - not (dry_run | bool)
+          register: deletions
+
+        # Today's lesson: the port disappears before Neutron has converged from the control node's
+        # direction. Returning success at that moment hands back a machine that looks fixed and is
+        # not yet reachable — which is exactly how the next playbook in the chain fails.
+        - name: Wait for the instance to answer again from here
+          ansible.builtin.wait_for:
+            host: "{{ live_ports[0].fixed_ips[0].ip_address }}"
+            port: 22
+            timeout: "{{ reachability_timeout }}"
+            state: started
+          when:
+            - deletions is defined
+            - deletions is changed
+
+        - name: Confirm
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: removed {{ dead_ports | length }} dead port(s);
+              reachable on {{ live_ports[0].fixed_ips[0].ip_address }}
+          when:
+            - deletions is defined
+            - deletions is changed
