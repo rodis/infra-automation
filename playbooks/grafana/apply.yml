@@ -21,6 +21,10 @@
   hosts: localhost
   connection: local
   gather_facts: false
+  # The account-wide `ansible` context sets ANSIBLE_BECOME=True for playbooks that configure real
+  # hosts. This one runs inside the Spacelift runner and only makes HTTP calls, and that container
+  # has no sudo — so without this it fails with "sudo: not found" before reaching Grafana.
+  become: false
 
   vars:
     grafana_url: "{{ lookup('env', 'GRAFANA_API_URL') | regex_replace('/$', '') }}"
