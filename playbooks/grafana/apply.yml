@@ -149,6 +149,28 @@
     # so removing a rule here removes it in Grafana. A per-rule POST would only ever add, and the
     # file would slowly stop describing reality.
       when: grafana_apply_alerts | bool
+    # Delete the group before writing it. Replacing an EXISTING group in place is what the
+    # opaque 400 was actually about: bisected on 2026-08-23, all four rules went into a FRESH group
+    # cleanly (200 at 1, 2, 3 and 4 rules) while the identical payload into the existing group was
+    # rejected, and Grafana says only "bad request data" either way.
+    #
+    # An earlier commit blamed the rules' uids for this and removed them. That was wrong -- the
+    # uid-less payload failed too. They are restored, because with delete-then-write the uids are
+    # ours to keep, and stable uids are what make deep links and silences survive a redeploy.
+    #
+    # This also makes the operation say what it means: the file is the whole truth for this group,
+    # so the group becomes exactly the file rather than being reconciled towards it.
+    - name: Remove the existing rule group first
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/{{ grafana_rule_group }}"
+        method: DELETE
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        status_code: [200, 202, 204, 404]
+      changed_when: false
+      when:
+        - grafana_apply_alerts | bool
+        - not ansible_check_mode
+
     - name: Apply the alert rule group
       # PUT of a whole rule group, not POST per rule: the group becomes exactly what the file says,
       # so removing a rule here removes it in Grafana. A per-rule POST would only ever add.
@@ -157,13 +179,6 @@
       # Editor service account does not hold — the first attempt got a 403 naming exactly that.
       # Omitting it is also the behaviour we want: Grafana marks these rules provisioned and makes
       # them read-only in the UI, which is correct when this repository is the source of truth.
-      #
-      # The rules in alerts/ carry NO uid, deliberately. Grafana owns rule uids, and PUTting a
-      # rule with an explicit uid that does not yet exist INTO AN EXISTING GROUP is rejected with
-      # the same opaque 400. Proven by bisect on 2026-08-23: all four rules with uids went into a
-      # fresh group fine (200 at 1, 2, 3 and 4 rules), and the identical payload into the existing
-      # group failed — while the same rule with its uid stripped succeeded. Identity here belongs
-      # to Grafana; this repository owns the rules by title and group.
       #
       # Body shape taken from Grafana's own OpenAPI spec (/public/api-merged.json, definition
       # `AlertRuleGroup`) rather than guessed. Five deploys of guessing produced five identical
