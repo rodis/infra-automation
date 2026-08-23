@@ -149,67 +149,32 @@
     # so removing a rule here removes it in Grafana. A per-rule POST would only ever add, and the
     # file would slowly stop describing reality.
       when: grafana_apply_alerts | bool
-    # TEMPORARY DIAGNOSTIC (2026-08-23). The group PUT returns a bare 400 naming no field, and
-    # every experiment costs a stack run, so this run extracts as much as one run can: the exact
-    # body being sent, and a single-rule POST which goes through a different handler and may
-    # report better. Remove once the shape is settled.
-    - name: DIAG - the exact group body
-      ansible.builtin.debug:
-        msg: "{{ {'folderUid': grafana_folder_uid, 'title': grafana_rule_group,
-                  'interval': (grafana_alerts.interval | default(60) | int),
-                  'rules_count': (grafana_alerts.rules | length)} | to_json }}"
-      when: grafana_apply_alerts | bool
-
-    - name: DIAG - first rule exactly as it will be sent
-      ansible.builtin.debug:
-        msg: "{{ (grafana_alerts.rules | map('combine', {'orgID': grafana_org.json.id,
-                  'folderUID': grafana_folder_uid, 'ruleGroup': grafana_rule_group})
-                  | list | first) | to_json }}"
-      when: grafana_apply_alerts | bool
-
-    - name: DIAG - single-rule POST, for a better error message
-      ansible.builtin.uri:
-        url: "{{ grafana_url }}/api/v1/provisioning/alert-rules"
-        method: POST
-        headers: { Authorization: "Bearer {{ grafana_token }}" }
-        body_format: json
-        body: "{{ grafana_alerts.rules | map('combine', {'orgID': grafana_org.json.id,
-                  'folderUID': grafana_folder_uid, 'ruleGroup': grafana_rule_group})
-                  | list | first }}"
-        status_code: [200, 201, 202, 400, 403, 422]
-      register: grafana_single
-      changed_when: false
-      when: grafana_apply_alerts | bool
-
-    - name: DIAG - what it said
-      ansible.builtin.debug:
-        msg: "status={{ grafana_single.status | default('?') }} body={{ grafana_single.json | default(grafana_single.content) | default('') | to_json }}"
-      when: grafana_apply_alerts | bool
-
     - name: Apply the alert rule group
+      # PUT of a whole rule group, not POST per rule: the group becomes exactly what the file says,
+      # so removing a rule here removes it in Grafana. A per-rule POST would only ever add.
+      #
+      # No X-Disable-Provenance. Sending it demands alert.provisioning.provenance:write, which an
+      # Editor service account does not hold — the first attempt got a 403 naming exactly that.
+      # Omitting it is also the behaviour we want: Grafana marks these rules provisioned and makes
+      # them read-only in the UI, which is correct when this repository is the source of truth.
+      #
+      # Body shape taken from Grafana's own OpenAPI spec (/public/api-merged.json, definition
+      # `AlertRuleGroup`) rather than guessed. Five deploys of guessing produced five identical
+      # bare 400s naming no field; one read of the spec gave all of it:
+      #
+      #   AlertRuleGroup = folderUid, title, interval (INTEGER SECONDS, not "1m"), rules
+      #
+      # and every rule additionally requires orgID, folderUID and ruleGroup. Those three are
+      # properties of WHERE a rule is being put rather than of what it says, so they are injected
+      # here instead of duplicated into every rule in alerts/. An earlier comment in this file
+      # asserted the group was {folder, name, ...} and NOT {title, ...}; that was exactly
+      # backwards, and was written down as fact after one failing variant.
       ansible.builtin.uri:
         url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/{{ grafana_rule_group }}"
         method: PUT
-        # No X-Disable-Provenance. Sending it demands alert.provisioning.provenance:write, which
-        # an Editor service account does not hold — the first attempt got a 403 naming exactly
-        # that. Omitting it is also the behaviour we want: Grafana then marks these rules as
-        # provisioned and makes them read-only in the UI, which is correct when the file in this
-        # repository is the source of truth. A rule edited in the UI would be silently reverted by
-        # the next run anyway; better that the UI refuses.
         headers:
           Authorization: "Bearer {{ grafana_token }}"
         body_format: json
-        # Shape taken from Grafana's own OpenAPI spec (GET /public/api-merged.json, definition
-        # `AlertRuleGroup`) rather than guessed. Five deploys of guessing produced five identical
-        # bare 400s: Grafana validates strictly and names nothing. An earlier comment here claimed
-        # the group was {folder, name, ...} and NOT {title, ...} -- that was exactly backwards.
-        #
-        #   AlertRuleGroup = folderUid, title, interval (INTEGER SECONDS, not "1m"), rules
-        #
-        # And every rule additionally requires orgID, folderUID and ruleGroup, which the files in
-        # alerts/ deliberately do not carry: they are properties of where the rule is being put,
-        # not of what the rule says, so they are injected here instead of duplicated in every rule.
-        # That was the fourth bug and the reason fixing the wrapper alone would still have failed.
         body:
           folderUid: "{{ grafana_folder_uid }}"
           title: "{{ grafana_rule_group }}"
@@ -223,11 +188,18 @@
         status_code: [200, 202]
       register: grafana_rules_applied
       changed_when: true
+      when: grafana_apply_alerts | bool
 
     # Applying is not the same as evaluating. A rule that cannot run reports nothing, and nothing
-    # is indistinguishable from healthy — the exact trap this alerting is meant to close. So read
-    # the rules back and require they are in a state that can actually fire.
-      when: grafana_apply_alerts | bool
+    # is indistinguishable from healthy — the exact trap this alerting exists to close. So read the
+    # rules back and require they are in a state that can actually fire.
+    #
+    # NOT run in check mode. An earlier version carried `check_mode: false` here, inherited from a
+    # sweep that marked reads so they would survive planning. That is wrong for a VERIFICATION
+    # read: check mode deliberately does not apply the rules, so a forced read-back looks for
+    # something that was never created and fails after six retries — which is how a correct plan
+    # came to report failure. Reads that feed a decision need check_mode: false; reads that verify
+    # a write must not have it.
     - name: Read the rules back
       ansible.builtin.uri:
         url: "{{ grafana_url }}/api/prometheus/grafana/api/v1/rules"
@@ -235,7 +207,6 @@
         return_content: true
       register: grafana_rules_state
       changed_when: false
-      check_mode: false   # a read; the assert below consumes it
       retries: 6
       delay: 10
       until: >-
@@ -243,8 +214,10 @@
         | map(attribute='rules') | flatten
         | selectattr('name', 'in', grafana_alerts.rules | map(attribute='title') | list)
         | list | length == (grafana_alerts.rules | length)
+      when:
+        - grafana_apply_alerts | bool
+        - not ansible_check_mode
 
-      when: grafana_apply_alerts | bool
     - name: Report what is now watching
       ansible.builtin.debug:
         msg: >-
@@ -254,8 +227,10 @@
           {{ grafana_rules_state.json.data.groups | map(attribute='rules') | flatten
              | selectattr('name', 'in', grafana_alerts.rules | map(attribute='title') | list)
              | map(attribute='health') | list | join(', ') }}
+      when:
+        - grafana_apply_alerts | bool
+        - not ansible_check_mode
 
-      when: grafana_apply_alerts | bool
     - name: Check every rule is healthy, not merely present
       ansible.builtin.assert:
         that:
@@ -267,5 +242,6 @@
           One or more rules are present but not healthy — an erroring rule fires nothing and looks
           exactly like a quiet estate. Check the datasource uid and the expressions.
         success_msg: "all rules present and evaluating"
-
-      when: grafana_apply_alerts | bool
+      when:
+        - grafana_apply_alerts | bool
+        - not ansible_check_mode
