@@ -1,5 +1,5 @@
 {
-  "interval": "1m",
+  "interval": 60,
   "rules": [
     {
       "title": "Host not reporting",

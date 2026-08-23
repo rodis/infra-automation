@@ -36,12 +36,15 @@
     # boundary rule in infra-objectives/CLAUDE.md — a company Grafana or a second personal stack
     # would answer just as happily.
     grafana_expected_org_id: 1
-    # Alert rules are gated separately from dashboards. The rule-group PUT is unsolved — Grafana
-    # 13.2 answers a bare 400 "bad request data" with no field named, and five deploys of
-    # schema-guessing taught nothing. Until the accepted shape is known (fastest route: create one
-    # rule in the UI and read it back), applying rules would fail every run and leave the stack RED
-    # while the dashboards it also applies are perfectly fine. A status that means "something in
-    # here failed" is no better than one that means nothing.
+    # Alert rules are gated separately from dashboards so that a failure in one cannot mask the
+    # other. The gate defaults ON; it was held OFF from 2026-08-23 while the rule-group PUT
+    # returned a bare 400 "bad request data" naming no field.
+    #
+    # Resolved the same day, and the method is the reusable part: Grafana serves its own OpenAPI
+    # spec at /public/api-merged.json, readable with the Viewer token. Five deploys of guessing
+    # produced five identical 400s; one read of the spec gave the exact shape. When an API
+    # validates strictly and reports vaguely, go and read what it accepts instead of bisecting it
+    # one deploy at a time.
     grafana_apply_alerts: "{{ (lookup('env', 'GRAFANA_APPLY_ALERTS') | default('true', true)) | bool }}"
 
   tasks:
@@ -159,14 +162,27 @@
         headers:
           Authorization: "Bearer {{ grafana_token }}"
         body_format: json
-        # The group object is {folder, name, interval, rules} — NOT {title, ...}. Sending `title`
-        # produced a bare 400 "bad request data" with no indication of which field was wrong, which
-        # cost several deploys to find. Grafana validates strictly and reports vaguely.
+        # Shape taken from Grafana's own OpenAPI spec (GET /public/api-merged.json, definition
+        # `AlertRuleGroup`) rather than guessed. Five deploys of guessing produced five identical
+        # bare 400s: Grafana validates strictly and names nothing. An earlier comment here claimed
+        # the group was {folder, name, ...} and NOT {title, ...} -- that was exactly backwards.
+        #
+        #   AlertRuleGroup = folderUid, title, interval (INTEGER SECONDS, not "1m"), rules
+        #
+        # And every rule additionally requires orgID, folderUID and ruleGroup, which the files in
+        # alerts/ deliberately do not carry: they are properties of where the rule is being put,
+        # not of what the rule says, so they are injected here instead of duplicated in every rule.
+        # That was the fourth bug and the reason fixing the wrapper alone would still have failed.
         body:
-          folder: "{{ grafana_folder_uid }}"
-          name: "{{ grafana_rule_group }}"
-          interval: "{{ grafana_alerts.interval | default('1m') }}"
-          rules: "{{ grafana_alerts.rules }}"
+          folderUid: "{{ grafana_folder_uid }}"
+          title: "{{ grafana_rule_group }}"
+          interval: "{{ grafana_alerts.interval | default(60) | int }}"
+          rules: >-
+            {{ grafana_alerts.rules | map('combine', {
+                 'orgID': grafana_org.json.id,
+                 'folderUID': grafana_folder_uid,
+                 'ruleGroup': grafana_rule_group
+               }) | list }}
         status_code: [200, 202]
       register: grafana_rules_applied
       changed_when: true
