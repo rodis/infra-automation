@@ -373,7 +373,18 @@ local.file_match "pods" {
 }
 
 loki.source.file "pods" {
-  targets    = local.file_match.pods.targets
+  targets = local.file_match.pods.targets
+
+  // Start at the END of each file. Without this Alloy reads pod logs from the beginning, and on
+  // 2026-08-23 that meant replaying container logs back to 2026-07-10 into a Loki that rejects
+  // anything older than seven days -- HTTP 400 "timestamp too old", whole batches dropped, and the
+  // role's own verification failing on both worker nodes.
+  //
+  // This is the same bound `alloy_journal_max_age` already puts on journald, and the lesson is that
+  // it belongs on EVERY source that reads a file which predates the collector. A log file is
+  // history; a collector starting fresh should not try to ship all of it.
+  tail_from_end = true
+
   forward_to = [loki.process.pods.receiver]
 }
 
