@@ -53,3 +53,31 @@ alloy_probe_kubernetes: true
 alloy_scrape_postgres: true
 alloy_postgres_role: alloy
 alloy_postgres_socket_dir: /var/run/postgresql
+
+# POSTGRESQL LOGS. Separate from the journal on purpose: PostgreSQL here runs with
+# logging_collector=off and log_destination=stderr, which on Debian lands in a FILE
+# (/var/log/postgresql/postgresql-15-main.log) while journald gets only systemd lifecycle lines.
+# So the journal shows "Started postgresql@15-main" and nothing else -- and on 2026-08-23 a Loki
+# search for the connection refusals that were breaking AWX returned nothing while 1,280 of them
+# sat in that file, the earliest at 10:28 UTC, hours before anyone noticed.
+#
+# No permission change is needed: the file is postgres:adm 0640 and the alloy package already puts
+# its user in `adm`.
+alloy_ship_postgres_logs: true
+alloy_postgres_log_glob: /var/log/postgresql/postgresql-*-main.log
+
+# POD LOGS. Scoped by namespace rather than shipped wholesale, because the free tier is 50GB/month
+# and the useful fraction is small. Measured on 2026-08-23 (60s sample, quiet):
+#   kube-system 8.9 MB/day | awx 3.8 | kube-flannel ~0 | nginx-ingress 3.1 | doppler 6.6
+# The selected set is ~13 MB/day, about 400MB/month. cert-manager and nginx-ingress are excluded
+# deliberately (owner's call); add a glob here rather than widening to a catch-all.
+#
+# /var/log/pods is 750 root:root with 640 files, so the alloy user cannot traverse it. Rather than
+# put a service account in group root -- which would grant it every root:root 0640 file on the box
+# -- the role installs `acl` and sets a DEFAULT acl, which kubelet's newly created pod directories
+# inherit.
+alloy_ship_pod_logs: true
+alloy_pod_log_namespaces:
+  - awx
+  - kube-system
+  - kube-flannel

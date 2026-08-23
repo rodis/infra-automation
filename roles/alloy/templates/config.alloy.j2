@@ -307,3 +307,120 @@ prometheus.relabel "postgres_keep" {
   }
 }
 {% endif %}
+{% if alloy_ship_logs and alloy_ship_postgres_logs and alloy_has_postgres | default(false) %}
+
+// ---------------------------------------------------------------------------------------------
+// PostgreSQL's own log. NOT in the journal -- see defaults/main.yml for why, and for the incident
+// that made this necessary.
+// ---------------------------------------------------------------------------------------------
+
+local.file_match "postgresql" {
+  // A glob, because the file is versioned (postgresql-15-main.log) and rotates weekly.
+  path_targets = [{
+    __path__ = "{{ alloy_postgres_log_glob }}",
+    job      = "postgresql",
+    instance = "{{ inventory_hostname }}",
+  }]
+}
+
+loki.source.file "postgresql" {
+  targets    = local.file_match.postgresql.targets
+  forward_to = [loki.process.postgresql.receiver]
+}
+
+loki.process "postgresql" {
+  // PostgreSQL emits multi-line records: a FATAL or ERROR line is routinely followed by an
+  // unindented STATEMENT line carrying the query that caused it. Without this they arrive as
+  // separate entries and the statement is orphaned from its error -- which is precisely the pair
+  // you want when reading back an incident.
+  stage.multiline {
+    firstline = "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"
+    max_lines = 50
+  }
+
+  // Promote severity to a label so `| level="FATAL"` works the same way it does for journald.
+  stage.regex {
+    expression = "^\\S+ \\S+ \\S+ \\[\\d+\\] (?:\\S+ )?(?P<level>[A-Z]+):"
+  }
+  stage.labels {
+    values = { level = "" }
+  }
+
+  forward_to = [loki.write.grafana_cloud.receiver]
+}
+{% endif %}
+{% if alloy_ship_logs and alloy_ship_pod_logs and alloy_has_pod_logs | default(false) %}
+
+// ---------------------------------------------------------------------------------------------
+// Container logs, scoped by namespace.
+//
+// Read from the node's filesystem rather than through the Kubernetes API, so this needs no
+// kubeconfig, no ServiceAccount token on the host, and no inbound access to the cluster. The
+// labels come from the path, which kubelet lays out as
+// /var/log/pods/<namespace>_<pod>_<uid>/<container>/N.log
+//
+// Why this exists: on 2026-08-23 the whole diagnosis of an AWX outage came from `kubectl logs`,
+// which had retained EIGHT MINUTES -- 144 errors saturating the entire window, and no history of
+// when it started. Pod logs on disk rotate and vanish with the pod.
+// ---------------------------------------------------------------------------------------------
+
+local.file_match "pods" {
+  path_targets = [
+{% for ns in alloy_pod_log_namespaces %}
+    {__path__ = "/var/log/pods/{{ ns }}_*/*/*.log"},
+{% endfor %}
+  ]
+}
+
+loki.source.file "pods" {
+  targets    = local.file_match.pods.targets
+  forward_to = [loki.process.pods.receiver]
+}
+
+loki.process "pods" {
+  // containerd writes CRI format: "<rfc3339nano> <stdout|stderr> <F|P> <message>". Without this
+  // every line arrives with that header glued to the front and the real message is unsearchable.
+  stage.cri {}
+  forward_to = [loki.relabel.pods.receiver]
+}
+
+loki.relabel "pods" {
+  forward_to = [loki.write.grafana_cloud.receiver]
+
+  // A pod directory is <namespace>_<pod>_<uid>. Neither a namespace nor a pod name may contain an
+  // underscore (RFC 1123), so splitting on "_" is exact rather than a guess.
+  rule {
+    source_labels = ["filename"]
+    regex         = "/var/log/pods/([^_]+)_([^_]+)_[^/]+/([^/]+)/[^/]+"
+    target_label  = "namespace"
+    replacement   = "$1"
+  }
+  rule {
+    source_labels = ["filename"]
+    regex         = "/var/log/pods/([^_]+)_([^_]+)_[^/]+/([^/]+)/[^/]+"
+    target_label  = "pod"
+    replacement   = "$2"
+  }
+  rule {
+    source_labels = ["filename"]
+    regex         = "/var/log/pods/([^_]+)_([^_]+)_[^/]+/([^/]+)/[^/]+"
+    target_label  = "container"
+    replacement   = "$3"
+  }
+  // Drop `filename`: it carries the pod UID, which changes on every restart and would make each
+  // restart a brand new stream. That is the unbounded-cardinality shape that `session-N.scope`
+  // already caused once in the journald pipeline.
+  rule {
+    action = "labeldrop"
+    regex  = "filename"
+  }
+  rule {
+    target_label = "job"
+    replacement  = "pods"
+  }
+  rule {
+    target_label = "instance"
+    replacement  = "{{ inventory_hostname }}"
+  }
+}
+{% endif %}

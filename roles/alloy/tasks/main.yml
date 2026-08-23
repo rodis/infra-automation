@@ -215,6 +215,51 @@
     changed_when: false
     when: alloy_has_postgres | default(false)
 
+  # Pod logs. Same discovery principle as everything else here: ask the host.
+  - name: Look for a kubelet pod log directory
+    ansible.builtin.stat:
+      path: /var/log/pods
+    register: alloy_pod_log_dir
+    changed_when: false
+    check_mode: false
+    when: alloy_ship_pod_logs | bool
+
+  - name: Record whether this host has pod logs
+    ansible.builtin.set_fact:
+      alloy_has_pod_logs: "{{ alloy_pod_log_dir.stat.isdir | default(false) | bool }}"
+    when: alloy_ship_pod_logs | bool
+
+  - name: Install acl
+    ansible.builtin.apt:
+      name: acl
+      state: present
+      update_cache: true
+      cache_valid_time: 3600
+    when: alloy_has_pod_logs | default(false)
+
+  - name: Read the current ACL on the pod log tree
+    ansible.builtin.command:
+      argv: [getfacl, -p, /var/log/pods]
+    register: alloy_pod_getfacl
+    changed_when: false
+    failed_when: false
+    check_mode: false
+    when: alloy_has_pod_logs | default(false)
+
+  # /var/log/pods is 750 root:root with 640 files, so the alloy user cannot even traverse it. The
+  # alternative -- adding alloy to group root -- would hand a collector read access to every
+  # root:root 0640 file on the machine, which is a far larger grant than "read the container logs".
+  #
+  # The DEFAULT entry is the load-bearing half. kubelet creates a fresh directory per pod, and only
+  # a default ACL is inherited by directories created later; without it this works today and
+  # silently stops covering anything scheduled tomorrow.
+  - name: Grant the collector read access to pod logs
+    ansible.builtin.command:
+      argv: [setfacl, -R, -m, "u:alloy:rX", -m, "d:u:alloy:rX", /var/log/pods]
+    when:
+      - alloy_has_pod_logs | default(false)
+      - "'default:user:alloy:r-x' not in (alloy_pod_getfacl.stdout | default(''))"
+
   - name: Write the candidate Alloy configuration
     ansible.builtin.template:
       src: config.alloy.j2
