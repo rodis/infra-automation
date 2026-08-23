@@ -180,9 +180,19 @@ prometheus.scrape "awx" {
     __address__      = "{{ alloy_awx_url | regex_replace('^https?://', '') | regex_replace('/$', '') }}",
     __scheme__       = "https",
     __metrics_path__ = "/api/v2/metrics",
-    instance         = "awx",
   }]
 
+  // honor_labels, and NO instance label on the target. AWX labels its per-pod series with
+  // `instance` itself — awx_instance_capacity{instance="awx-task-…"} for each of six pods. Setting
+  // instance on the target overwrote the very label that made those six distinct, collapsing them
+  // into one series carrying six different values at the same timestamp. Mimir rejected them:
+  // "Error on ingesting samples with different value but same timestamp", num_dropped=18, which is
+  // exactly 6 pods x 3 capacity metrics.
+  //
+  // Ironic origin: this was caused by the fix for the OPPOSITE problem, where a global relabel was
+  // stamping every series with the scraping host. Both bugs are the same mistake — deciding an
+  // identity label centrally for targets that already have one.
+  honor_labels    = true
   bearer_token    = "{{ alloy_awx_token }}"
   scrape_interval = "{{ alloy_scrape_interval }}"
   job_name        = "awx"
@@ -214,22 +224,13 @@ prometheus.scrape "etcd" {
 {% endif %}
 {% if alloy_has_apiserver | default(false) %}
 
-// The API server's /healthz is reachable anonymously; its /metrics is not. This gives liveness
-// only — up{job="kube-apiserver"} — which is still the difference between "the control plane is
-// answering" and silence. Real API metrics need a bearer token, and that means the in-cluster
-// ServiceAccount from the infra-observability policy, which is not granted.
-prometheus.scrape "kube_apiserver_health" {
-  targets = [{
-    __address__      = "127.0.0.1:6443",
-    __scheme__       = "https",
-    __metrics_path__ = "/healthz",
-    instance         = "{{ inventory_hostname }}",
-  }]
-  tls_config {
-    insecure_skip_verify = true
-  }
-  scrape_interval = "{{ alloy_scrape_interval }}"
-  job_name        = "kube-apiserver"
-  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
-}
+// The API server answered /healthz, but there is deliberately NO scrape for it.
+//
+// /healthz returns the string "ok", not Prometheus exposition format, so prometheus.scrape can
+// never parse it and produces up{job="kube-apiserver"} = 0 forever — a permanent zero that reads
+// exactly like a dead control plane. A metric that is always wrong is worse than a missing one.
+//
+// Liveness of an endpoint that does not speak Prometheus is a job for a blackbox probe
+// (prometheus.exporter.blackbox), and the API server's real /metrics needs a bearer token, which
+// means the in-cluster ServiceAccount from the infra-observability policy. Both are follow-ups.
 {% endif %}
