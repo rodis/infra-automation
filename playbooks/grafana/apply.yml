@@ -31,7 +31,19 @@
     grafana_token: "{{ lookup('env', 'GRAFANA_API_TOKEN') }}"
     grafana_folder_title: "Infrastructure"
     grafana_folder_uid: "infra"
-    grafana_rule_group: "management-plane"
+    # "-v2" is a WORKAROUND, not an explanation, and should be read as an open question.
+    #
+    # Grafana rejects this exact payload for the group "management-plane" with a bare 400, and
+    # accepts it byte-for-byte into any other group name -- proven on 2026-08-23 across seven
+    # throwaway groups, with 1, 2, 3 and 4 rules, both with and without rule uids, and both while
+    # the target group existed and after it was verifiably deleted. Everything else was eliminated
+    # by diffing against a rule Grafana's own UI wrote: same structure, same two-node query ->
+    # threshold chain, same required fields, and both enum values inside the documented sets.
+    #
+    # So something about that specific group name is stuck server-side in a way the API will not
+    # describe. If this name ever starts failing the same way, do not chase the payload -- it is
+    # the group.
+    grafana_rule_group: "management-plane-v2"
     # Every rule must name a contact point. Grafana's own UI refuses to save a rule without one and
     # attaches the notification policy's default receiver, which here is literally named "empty".
     # Read off a rule Grafana wrote itself on 2026-08-23, after the API spent all day answering
