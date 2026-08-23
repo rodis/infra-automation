@@ -149,46 +149,40 @@
     # so removing a rule here removes it in Grafana. A per-rule POST would only ever add, and the
     # file would slowly stop describing reality.
       when: grafana_apply_alerts | bool
-    # TEMPORARY: which rule is rejected? Each alone, into its own throwaway group.
-    - name: BISECT per rule
+    # TEMPORARY: 1 rule works, 4 do not. Where does it break?
+    - name: BISECT cumulative
       ansible.builtin.uri:
-        url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/zzz-probe-{{ idx }}"
+        url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/zzz-cum-{{ item }}"
         method: PUT
         headers: { Authorization: "Bearer {{ grafana_token }}" }
         body_format: json
         body:
           folderUid: "{{ grafana_folder_uid }}"
-          title: "zzz-probe-{{ idx }}"
+          title: "zzz-cum-{{ item }}"
           interval: 60
-          rules: "{{ [item | combine({'orgID': grafana_org.json.id, 'folderUID': grafana_folder_uid, 'ruleGroup': 'zzz-probe-' ~ idx})] }}"
+          rules: "{{ grafana_alerts.rules[0:item | int] | map('combine', {'orgID': grafana_org.json.id, 'folderUID': grafana_folder_uid, 'ruleGroup': 'zzz-cum-' ~ item}) | list }}"
         status_code: [200, 201, 202, 400, 403, 409, 422]
-      register: perrule
+      register: cum
       changed_when: false
-      loop: "{{ grafana_alerts.rules }}"
-      loop_control:
-        label: "{{ item.title }}"
-        index_var: idx
+      loop: [1, 2, 3, 4]
       when:
         - grafana_apply_alerts | bool
         - not ansible_check_mode
 
-    - name: BISECT per rule result
+    - name: BISECT cumulative result
       ansible.builtin.debug:
-        msg: "{{ perrule.results | default([]) | map(attribute='item.title') | zip(perrule.results | default([]) | map(attribute='status')) | list }}"
+        msg: "{{ cum.results | default([]) | map(attribute='item') | zip(cum.results | default([]) | map(attribute='status')) | list }}"
       when:
         - grafana_apply_alerts | bool
         - not ansible_check_mode
 
-    - name: BISECT cleanup
+    - name: BISECT cumulative cleanup
       ansible.builtin.uri:
-        url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/zzz-probe-{{ idx }}"
+        url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/zzz-cum-{{ item }}"
         method: DELETE
         headers: { Authorization: "Bearer {{ grafana_token }}" }
         status_code: [200, 202, 204, 404]
-      loop: "{{ grafana_alerts.rules }}"
-      loop_control:
-        label: "zzz-probe-{{ idx }}"
-        index_var: idx
+      loop: [1, 2, 3, 4]
       changed_when: false
       when:
         - grafana_apply_alerts | bool
