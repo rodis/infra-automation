@@ -227,13 +227,22 @@
         return_content: true
       register: grafana_rules_state
       changed_when: false
-      retries: 6
-      delay: 10
+      # Wait for PRESENT and EVALUATING, not just present. A rule reports health "unknown" until
+      # its first evaluation, and with a 60s group interval that is a couple of minutes after
+      # creation. Waiting only for presence meant the assert below fired against four freshly
+      # created rules and failed a run that had actually succeeded.
+      #
+      # 12 x 15s covers the interval plus scheduler start-up with room to spare.
+      retries: 12
+      delay: 15
       until: >-
-        grafana_rules_state.json.data.groups
-        | map(attribute='rules') | flatten
-        | selectattr('name', 'in', grafana_alerts.rules | map(attribute='title') | list)
-        | list | length == (grafana_alerts.rules | length)
+        (grafana_rules_state.json.data.groups | map(attribute='rules') | flatten
+         | selectattr('name', 'in', grafana_alerts.rules | map(attribute='title') | list)
+         | list | length == (grafana_alerts.rules | length))
+        and
+        (grafana_rules_state.json.data.groups | map(attribute='rules') | flatten
+         | selectattr('name', 'in', grafana_alerts.rules | map(attribute='title') | list)
+         | rejectattr('health', 'equalto', 'ok') | list | length == 0)
       when:
         - grafana_apply_alerts | bool
         - not ansible_check_mode
