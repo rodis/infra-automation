@@ -36,6 +36,13 @@
     # boundary rule in infra-objectives/CLAUDE.md — a company Grafana or a second personal stack
     # would answer just as happily.
     grafana_expected_org_id: 1
+    # Alert rules are gated separately from dashboards. The rule-group PUT is unsolved — Grafana
+    # 13.2 answers a bare 400 "bad request data" with no field named, and five deploys of
+    # schema-guessing taught nothing. Until the accepted shape is known (fastest route: create one
+    # rule in the UI and read it back), applying rules would fail every run and leave the stack RED
+    # while the dashboards it also applies are perfectly fine. A status that means "something in
+    # here failed" is no better than one that means nothing.
+    grafana_apply_alerts: "{{ (lookup('env', 'GRAFANA_APPLY_ALERTS') | default('true', true)) | bool }}"
 
   tasks:
 
@@ -118,6 +125,13 @@
       register: grafana_dashboards_applied
       changed_when: true
 
+    - name: Say plainly that alert rules are being skipped
+      ansible.builtin.debug:
+        msg: >-
+          SKIPPING alert rules — grafana_apply_alerts is false. The dashboards above are applied and
+          current; alerting is NOT. Nothing is watching this estate while nobody is looking.
+      when: not (grafana_apply_alerts | bool)
+
     - name: Load the alert rule definitions
       ansible.builtin.set_fact:
         grafana_alerts: "{{ lookup('file', playbook_dir ~ '/alerts/management-plane.json') | from_json }}"
@@ -125,6 +139,7 @@
     # PUT of a whole rule group, not POST per rule: the group becomes exactly what the file says,
     # so removing a rule here removes it in Grafana. A per-rule POST would only ever add, and the
     # file would slowly stop describing reality.
+      when: grafana_apply_alerts | bool
     - name: Apply the alert rule group
       ansible.builtin.uri:
         url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/{{ grafana_rule_group }}"
@@ -153,6 +168,7 @@
     # Applying is not the same as evaluating. A rule that cannot run reports nothing, and nothing
     # is indistinguishable from healthy — the exact trap this alerting is meant to close. So read
     # the rules back and require they are in a state that can actually fire.
+      when: grafana_apply_alerts | bool
     - name: Read the rules back
       ansible.builtin.uri:
         url: "{{ grafana_url }}/api/prometheus/grafana/api/v1/rules"
@@ -168,6 +184,7 @@
         | selectattr('name', 'in', grafana_alerts.rules | map(attribute='title') | list)
         | list | length == (grafana_alerts.rules | length)
 
+      when: grafana_apply_alerts | bool
     - name: Report what is now watching
       ansible.builtin.debug:
         msg: >-
@@ -178,6 +195,7 @@
              | selectattr('name', 'in', grafana_alerts.rules | map(attribute='title') | list)
              | map(attribute='health') | list | join(', ') }}
 
+      when: grafana_apply_alerts | bool
     - name: Check every rule is healthy, not merely present
       ansible.builtin.assert:
         that:
@@ -189,3 +207,5 @@
           One or more rules are present but not healthy — an erroring rule fires nothing and looks
           exactly like a quiet estate. Check the datasource uid and the expressions.
         success_msg: "all rules present and evaluating"
+
+      when: grafana_apply_alerts | bool
