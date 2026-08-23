@@ -1,7 +1,7 @@
 {
   "uid": "kubernetes-south",
   "title": "Kubernetes (south)",
-  "description": "The cluster AWX runs on. Currently etcd only \u2014 everything else in the Kubernetes control plane requires credentials this collector does not have. Read the note at the bottom before concluding anything from a quiet dashboard.",
+  "description": "The cluster AWX runs on. Cluster object state from kube-state-metrics plus etcd's own metrics. Read the note at the bottom for what is still missing -- notably actual CPU and memory consumption, which needs a bearer token.",
   "tags": [
     "managed-by-git",
     "south",
@@ -17,6 +17,194 @@
   },
   "panels": [
     {
+      "id": 20,
+      "type": "stat",
+      "title": "Nodes Ready",
+      "description": "From kube-state-metrics, which reads the API. A node can be NotReady while every etcd panel below stays green -- that combination is exactly what this dashboard could not show before 2026-08-23.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(kube_node_status_condition{condition=\"Ready\",status=\"true\"} == 1)"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "green",
+                "value": 3
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "Pods not Running",
+      "description": "Pending, Failed or Unknown. Pending usually means unschedulable -- no node with room, or a taint nothing tolerates. Zero is the expected reading.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(kube_pod_status_phase{phase!=\"Running\",phase!=\"Succeeded\"} == 1) or vector(0)"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "Container restarts (24h)",
+      "description": "A crash-looping container is invisible in etcd metrics and invisible in `kubectl get pods` if it recovers between looks. AWX's own web pod has restarted 23 times historically, all of it before 2026-04-30 -- which only became knowable once this existed.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "round(sum(increase(kube_pod_container_status_restarts_total[24h])) or vector(0))"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 23,
+      "type": "stat",
+      "title": "Deployments below desired",
+      "description": "Desired versus available replicas. This is the panel that would have shown AWX degraded while its pods still reported Running.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(kube_deployment_status_replicas_available < kube_deployment_spec_replicas) or vector(0)"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
       "id": 1,
       "type": "stat",
       "title": "etcd reachable",
@@ -25,7 +213,7 @@
         "h": 5,
         "w": 6,
         "x": 0,
-        "y": 0
+        "y": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -84,7 +272,7 @@
         "h": 5,
         "w": 6,
         "x": 6,
-        "y": 0
+        "y": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -143,7 +331,7 @@
         "h": 5,
         "w": 6,
         "x": 12,
-        "y": 0
+        "y": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -191,7 +379,7 @@
         "h": 5,
         "w": 6,
         "x": 18,
-        "y": 0
+        "y": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -240,7 +428,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 5
+        "y": 11
       },
       "datasource": {
         "type": "prometheus",
@@ -294,7 +482,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 5
+        "y": 11
       },
       "datasource": {
         "type": "prometheus",
@@ -335,7 +523,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 13
+        "y": 19
       },
       "datasource": {
         "type": "prometheus",
@@ -373,7 +561,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 13
+        "y": 19
       },
       "datasource": {
         "type": "prometheus",
@@ -397,18 +585,85 @@
       }
     },
     {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Pods by phase",
+      "description": "Watch for a rising Pending line: it means the scheduler cannot place work, which presents to a user as 'nothing is happening' rather than as an error.",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (phase) (kube_pod_status_phase == 1)",
+          "legendFormat": "{{phase}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Container restarts by pod",
+      "description": "Only pods that have actually restarted appear. A single step is a one-off; a staircase is a crash loop.",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total[1h])) > 0",
+          "legendFormat": "{{namespace}}/{{pod}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
       "id": 9,
       "type": "text",
-      "title": "This dashboard is deliberately incomplete \u2014 read this before trusting it",
+      "title": "What this dashboard still cannot tell you",
       "gridPos": {
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 20
+        "y": 33
       },
       "options": {
         "mode": "markdown",
-        "content": "**etcd is the only Kubernetes component here, because it is the only one that exposes metrics without credentials.** Everything below needs a bearer token from an in-cluster ServiceAccount \u2014 the `infra-observability` grant in `CLAUDE.md`, which is designed but **not granted**:\n\n| missing | needs |\n| :-- | :-- |\n| API server latency, request rates, error codes | bearer token |\n| kubelet / cAdvisor \u2014 per-pod CPU, memory, restarts | bearer token |\n| scheduler and controller-manager | bearer token |\n| **pod phases, deployment replicas, node conditions** | `kube-state-metrics`, running **in** the cluster |\n\n**So a green dashboard here does NOT mean the cluster is healthy.** It means etcd is healthy. Pods can be crash-looping, the scheduler can be wedged, and nodes can be `NotReady` with every panel above still green \u2014 because nothing here is looking at them.\n\n**There is deliberately no API server panel.** `/healthz` answers anonymously but returns the string `ok`, not Prometheus format, so scraping it produced `up{job=\"kube-apiserver\"} = 0` forever \u2014 a permanent zero indistinguishable from a dead control plane. It was removed rather than left misleading. Liveness for a non-Prometheus endpoint wants a blackbox probe.\n\nUntil the ServiceAccount exists, node-level health on the **Management plane** dashboard and AWX's own metrics on the **AWX** dashboard cover more of the real risk than this one does."
+        "content": "**kube-state-metrics is deployed** (2026-08-23), so node conditions, pod phases, restart counts and deployment replicas are real above. The `infra-observability` ServiceAccount that unblocked it is **granted and in use** \u2014 read-only, `get/list/watch` on eight resource kinds, no write verb anywhere.\n\nIt is scraped over a NodePort on loopback from the control-plane node only, so **nothing outside the cluster holds a kubeconfig or a token**: the RBAC is consumed by kube-state-metrics itself. The `instance` label is the *cluster*, not the host that scraped it \u2014 these are cluster facts, and labelling them per-host would read as something they are not.\n\n**Still missing, and what each would need:**\n\n| missing | needs |\n| :-- | :-- |\n| API server latency, request rates, error codes | a bearer token on the scraper |\n| kubelet / cAdvisor \u2014 actual CPU and memory *used* per pod | a bearer token on the scraper |\n| scheduler and controller-manager | a bearer token on the scraper |\n\nThat distinction matters: kube-state-metrics reports what the API **says** \u2014 desired replicas, phases, conditions. It does not report **consumption**. A pod at its memory limit looks perfectly healthy here right up until it is OOMKilled, and then appears only as a restart count.\n\n**There is deliberately no API server panel.** `/healthz` answers anonymously but returns the string `ok`, not Prometheus format, so scraping it produced `up{job=\"kube-apiserver\"} = 0` forever \u2014 a permanent zero indistinguishable from a dead control plane."
       }
     }
   ]
