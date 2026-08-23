@@ -133,8 +133,8 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Database connections (of 97)",
-      "description": "AWX's own count of its PostgreSQL connections. Ceiling is 97, not 100: PostgreSQL on k8s-south-postgresql has max_connections=100 with superuser_reserved_connections=3, so AWX can hold 97. Measured 2026-08-23, when AWX sat AT 97 and postgres began refusing with 'remaining connection slots are reserved'. This number is HARDCODED here because nothing exports it; postgres_exporter would make it a ratio and this panel should switch to that when it exists. At the ceiling the symptom is NOT a slow AWX: it is the web UI dropping requests and the metrics endpoint returning zero samples, because neither can get a connection.",
+      "title": "Connection utilisation",
+      "description": "Backends in use as a percentage of the slots AWX may occupy (max_connections minus superuser_reserved_connections). Read from PostgreSQL directly by postgres_exporter, NOT from AWX. That distinction is the point: awx_database_connections_total comes from AWX, so when AWX cannot get a connection the metric goes to 'no data' rather than to red \u2014 it disappears exactly when it matters. This one keeps reporting while AWX is down. Both halves are metrics, so raising max_connections re-scales this automatically instead of leaving the panel grading against a stale number.",
       "gridPos": {
         "h": 5,
         "w": 5,
@@ -148,7 +148,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(awx_database_connections_total)"
+          "expr": "round(100 * sum(pg_stat_database_numbackends) / (sum(pg_settings_max_connections) - sum(pg_settings_superuser_reserved_connections)), 0.1)"
         }
       ],
       "options": {
@@ -158,9 +158,9 @@
       },
       "fieldConfig": {
         "defaults": {
+          "unit": "percent",
           "min": 0,
-          "max": 97,
-          "unit": "none",
+          "max": 100,
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -170,11 +170,11 @@
               },
               {
                 "color": "orange",
-                "value": 78
+                "value": 80
               },
               {
                 "color": "red",
-                "value": 88
+                "value": 90
               }
             ]
           }
@@ -186,7 +186,7 @@
       "id": 10,
       "type": "stat",
       "title": "Connection headroom",
-      "description": "Free slots before AWX starts being refused. This is the number to watch, because the connection COUNT looks unalarming at 94 unless you happen to know the ceiling is 97. Connections are held mostly by wsrelay, which meshes between awx-task pods, so headroom shrinks with the SQUARE of task_replicas (currently 6).",
+      "description": "Free slots before PostgreSQL starts refusing AWX. Derived entirely from metrics \u2014 no ceiling written into this dashboard. Read from PostgreSQL directly by postgres_exporter, NOT from AWX. That distinction is the point: awx_database_connections_total comes from AWX, so when AWX cannot get a connection the metric goes to 'no data' rather than to red \u2014 it disappears exactly when it matters. This one keeps reporting while AWX is down. Connections are held mostly by wsrelay, which meshes between awx-task pods, so headroom shrinks with the SQUARE of task_replicas.",
       "gridPos": {
         "h": 5,
         "w": 5,
@@ -200,7 +200,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "97 - max(awx_database_connections_total)"
+          "expr": "(sum(pg_settings_max_connections) - sum(pg_settings_superuser_reserved_connections)) - sum(pg_stat_database_numbackends)"
         }
       ],
       "options": {
@@ -350,8 +350,8 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "Database connections vs the 97 ceiling",
-      "description": "A climbing FLOOR rather than a spike is the shape that precedes AWX becoming unusable. The flat line is the ceiling. Ceiling is 97, not 100: PostgreSQL on k8s-south-postgresql has max_connections=100 with superuser_reserved_connections=3, so AWX can hold 97. Measured 2026-08-23, when AWX sat AT 97 and postgres began refusing with 'remaining connection slots are reserved'. This number is HARDCODED here because nothing exports it; postgres_exporter would make it a ratio and this panel should switch to that when it exists.",
+      "title": "Connections vs the limit",
+      "description": "A climbing floor rather than a spike is the shape that precedes AWX becoming unusable. The limit line is read from pg_settings, so it moves when the setting moves. Read from PostgreSQL directly by postgres_exporter, NOT from AWX. That distinction is the point: awx_database_connections_total comes from AWX, so when AWX cannot get a connection the metric goes to 'no data' rather than to red \u2014 it disappears exactly when it matters. This one keeps reporting while AWX is down.",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -365,13 +365,18 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(awx_database_connections_total)",
-          "legendFormat": "connections"
+          "expr": "sum(pg_stat_database_numbackends)",
+          "legendFormat": "backends in use"
         },
         {
           "refId": "B",
-          "expr": "vector(97)",
-          "legendFormat": "ceiling (97)"
+          "expr": "(sum(pg_settings_max_connections) - sum(pg_settings_superuser_reserved_connections))",
+          "legendFormat": "usable slots"
+        },
+        {
+          "refId": "C",
+          "expr": "max(awx_database_connections_total)",
+          "legendFormat": "AWX's own count"
         }
       ],
       "fieldConfig": {
@@ -385,7 +390,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "ceiling (97)"
+              "options": "usable slots"
             },
             "properties": [
               {
@@ -407,6 +412,29 @@
                 "value": {
                   "mode": "fixed",
                   "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "AWX's own count"
+            },
+            "properties": [
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
                 }
               }
             ]
@@ -474,7 +502,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "**The connection ceiling is 97 and AWX reached it on 2026-08-23.** `max_connections=100`, `superuser_reserved_connections=3`. At the wall, postgres refuses with *remaining connection slots are reserved for non-replication superuser connections*; AWX's web UI drops requests and `up{job=\"awx\"}` flaps to 0 with `scrape_samples_scraped=0` \u2014 the endpoint answers in 48ms and returns nothing.\n\n**It is not load.** At the ceiling there were 91 idle connections and 1 active. 59 belonged to `wsrelay`, which meshes between `awx-task` pods, so the count scales with the square of `task_replicas` (6 today, in `helm-override-files/awx/awx.yml`).\n\n**A connection pooler does not fix this.** PgBouncer transaction mode \u2014 the only mode that reduces connections \u2014 breaks both LISTEN/NOTIFY (13 backends hold channels) and session-level advisory locks (`pg_advisory_unlock`, seen on 14). The advisory-lock failure is silent: the unlock lands on a different backend and the lock leaks. Session mode is 1:1 and saves nothing. This is protocol-level, so pgcat and Odyssey inherit it.\n\n---\n\n**Nothing about AWX's pods.** These are AWX's own application metrics, reported by AWX about itself. Pod restarts, evictions, image pulls and scheduling failures need `kube-state-metrics`, which must run inside the cluster \u2014 blocked on the `infra-observability` ServiceAccount.\n\n**Nothing about PostgreSQL itself.** `awx_database_connections_total` is AWX's view of its database. Disk, bloat, locks and replication need `postgres_exporter` and a read-only `pg_monitor` role on that VM.\n\n**Nothing when AWX is down.** If AWX cannot serve `/api/v2/metrics`, every panel here goes flat except `up`, which is precisely why the scrape runs from outside the cluster. Cross-check with the **Management plane** dashboard: if the PostgreSQL VM and the Kubernetes nodes are healthy while AWX is not, the fault is in the application layer.\n\n**Nothing about whether a job did the right thing.** AWX reports that jobs ran, not that they were correct \u2014 a job template pointed at an empty inventory reports success. See rule 8 in `CLAUDE.md`."
+        "content": "**PostgreSQL is now measured directly** (`postgres_exporter` via Alloy, peer auth over the unix socket, `pg_monitor` read-only). The connection panels no longer depend on AWX being able to answer, and no ceiling is hardcoded \u2014 `pg_settings_max_connections` is itself a metric, so the panels re-scale when the limit changes.\n\n**On 2026-08-23 AWX sat at 95 of 97 usable connections** and PostgreSQL refused the rest with *remaining connection slots are reserved*. Not load: 91 idle, 1 active. 59 belonged to `wsrelay`, which meshes between `awx-task` pods, so the count grows with the square of `task_replicas` (6, in `helm-override-files/awx/awx.yml`).\n\n**A connection pooler cannot fix it.** PgBouncer transaction mode \u2014 the only mode that reduces connections \u2014 breaks LISTEN/NOTIFY (13 backends hold channels) and session advisory locks (`pg_advisory_unlock`, on 14). The advisory-lock break is silent: the unlock lands on a different backend and the lock leaks. Session mode is 1:1 and saves nothing. Protocol-level, so pgcat and Odyssey inherit it.\n\n---\n\n**Nothing about AWX's pods.** These are AWX's own application metrics, reported by AWX about itself. Pod restarts, evictions, image pulls and scheduling failures need `kube-state-metrics`, which must run inside the cluster \u2014 blocked on the `infra-observability` ServiceAccount.\n\n**Nothing about PostgreSQL itself.** `awx_database_connections_total` is AWX's view of its database. Disk, bloat, locks and replication need `postgres_exporter` and a read-only `pg_monitor` role on that VM.\n\n**Nothing when AWX is down.** If AWX cannot serve `/api/v2/metrics`, every panel here goes flat except `up`, which is precisely why the scrape runs from outside the cluster. Cross-check with the **Management plane** dashboard: if the PostgreSQL VM and the Kubernetes nodes are healthy while AWX is not, the fault is in the application layer.\n\n**Nothing about whether a job did the right thing.** AWX reports that jobs ran, not that they were correct \u2014 a job template pointed at an empty inventory reports success. See rule 8 in `CLAUDE.md`."
       }
     }
   ]
