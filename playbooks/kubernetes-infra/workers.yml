@@ -4,9 +4,15 @@
       shell: kubeadm token create --print-join-command
       register: join_command_raw
 
+    # `default([''])` so this survives check mode. `kubeadm token create` is a WRITE -- it mints a
+    # real token -- so it must stay skipped when planning, which leaves join_command_raw with no
+    # stdout_lines and used to abort the whole plan on an undefined variable. Marking the shell
+    # `check_mode: false` would have fixed the plan by creating a token on every plan run, which is
+    # a side effect no plan should have. The join below is itself a shell task and is skipped in
+    # check mode too, so an empty join_command is never used.
     - name: set join command
       set_fact:
-        join_command: "{{ join_command_raw.stdout_lines[0] }}"
+        join_command: "{{ (join_command_raw.stdout_lines | default(['']))[0] }}"
 
 
 - hosts: kube_node

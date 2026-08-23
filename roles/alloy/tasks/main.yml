@@ -135,6 +135,9 @@
     register: alloy_k8s_probe
     failed_when: false
     changed_when: false
+    # Reads. They must run in check mode, or the set_fact below is undefined and the template
+    # renders without the blocks it is supposed to decide on.
+    check_mode: false
     when: alloy_probe_kubernetes | bool
 
   - name: Record which of them answered
@@ -181,6 +184,7 @@
         - "select 1 from pg_roles where rolname = '{{ alloy_postgres_role }}'"
     register: alloy_pg_role_check
     changed_when: false
+    check_mode: false   # a read; the CREATE below is a write and stays skipped in check mode
     when: alloy_has_postgres | default(false)
 
   - name: Create the read-only monitoring role
@@ -223,6 +227,10 @@
       # root and dropped privileges. It does not, and the service crash-looped on
       # "reading config path: permission denied" until systemd gave up.
       mode: "0640"
+    # Deliberately runs in check mode too. The candidate is NOT the live config, so writing it
+    # changes nothing that matters -- and it lets `alloy validate` below actually run, which turns
+    # a plan into a genuine test that the config parses, rather than a note that a file would change.
+    check_mode: false
 
   # Validate BEFORE the live file is touched. On 2026-08-23 a metric_relabel_config block that is
   # valid Prometheus YAML but not valid Alloy syntax made the config unparseable, Alloy refused to
@@ -234,6 +242,7 @@
     register: alloy_validate
     changed_when: false
     failed_when: alloy_validate.rc != 0
+    check_mode: false
 
   - name: Install the validated configuration
     ansible.builtin.copy:
@@ -250,6 +259,7 @@
       path: /etc/alloy/config.alloy.candidate
       state: absent
     changed_when: false
+    check_mode: false   # clean up the candidate we deliberately wrote above
 
 
   - name: Clear any previous failed state before starting
@@ -292,6 +302,7 @@
     # journal that said why. A check that cannot report a bad result is not a check.
     failed_when: false
     register: alloy_active
+    check_mode: false
 
   # Ask Alloy what it actually shipped, rather than grepping its logs. The first version of this
   # searched the journal for /error/ and matched `level=info msg="node exited without error"` — a
@@ -314,6 +325,7 @@
     changed_when: false
     failed_when: false
     register: alloy_counters
+    check_mode: false
     # The first scrape has to happen before there is anything to count.
     retries: 6
     delay: 15
