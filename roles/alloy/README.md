@@ -46,6 +46,24 @@ Two rules exist purely to keep the log stream sane, and both were added after se
   is a slow-motion outage, not untidiness, and it had already started: `session-5246`,
   `session-5248`, climbing.
 
+Measured after deploying both rules, over a window strictly after the Alloy restart:
+
+| | before | after |
+| :-- | :-- | :-- |
+| `alloy.service` | 865 lines / 30m, the loudest unit on every host | absent — info dropped, warn/error still pass |
+| `session-N.scope` | one new stream per SSH login, unbounded | none; all collapsed to `session.scope` |
+| entries per host per run | 86–100 | 10–25 |
+
+**How to verify this, and how not to.** Loki's `/loki/api/v1/label/{name}/values` **ignores the
+start/end parameters** and returns every value in the 14-day index, so after a fix it still lists
+the old stream names and looks like nothing changed. Ask `count_over_time` instead, which is time
+accurate:
+
+    sum by (unit) (count_over_time({job="journal"}[3m]))
+
+The first measurement of these rules said they had failed. They had not; the query was answering a
+different question from the one asked.
+
 Label cardinality is kept deliberately small — `job`, `instance`, `unit`, `level`. Loki charges on
 stream cardinality rather than volume, and the free tier rejects writes rather than degrading, so
 anything derived from message text or a PID would be a slow-motion outage.
