@@ -182,17 +182,16 @@ prometheus.scrape "awx" {
     __metrics_path__ = "/api/v2/metrics",
   }]
 
-  // honor_labels, and NO instance label on the target. AWX labels its per-pod series with
-  // `instance` itself — awx_instance_capacity{instance="awx-task-…"} for each of six pods. Setting
-  // instance on the target overwrote the very label that made those six distinct, collapsing them
-  // into one series carrying six different values at the same timestamp. Mimir rejected them:
-  // "Error on ingesting samples with different value but same timestamp", num_dropped=18, which is
-  // exactly 6 pods x 3 capacity metrics.
+  // No honor_labels, and no instance label on the target. AWX distinguishes its per-pod series with
+  // `hostname` and `instance_uuid`, NOT with `instance` — checked, rather than inferred:
   //
-  // Ironic origin: this was caused by the fix for the OPPOSITE problem, where a global relabel was
-  // stamping every series with the scraping host. Both bugs are the same mistake — deciding an
-  // identity label centrally for targets that already have one.
-  honor_labels    = true
+  //   awx_instance_capacity{hostname="awx-task-…",instance_uuid="…",node_type="control"}
+  //
+  // honor_labels was added here on the assumption that a target `instance` label was colliding with
+  // AWX's own and collapsing six series into one. That assumption came from num_dropped=18 matching
+  // 6 pods x 3 capacity metrics, and it was wrong — there was never a collision, because the label
+  // names differ. It is removed rather than left in as a harmless-looking extra: a setting kept for
+  // a reason that turned out to be false is a trap for whoever reads it next.
   bearer_token    = "{{ alloy_awx_token }}"
   scrape_interval = "{{ alloy_scrape_interval }}"
   job_name        = "awx"
