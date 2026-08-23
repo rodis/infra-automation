@@ -117,9 +117,14 @@
       ansible.builtin.uri:
         url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/{{ grafana_rule_group }}"
         method: PUT
+        # No X-Disable-Provenance. Sending it demands alert.provisioning.provenance:write, which
+        # an Editor service account does not hold — the first attempt got a 403 naming exactly
+        # that. Omitting it is also the behaviour we want: Grafana then marks these rules as
+        # provisioned and makes them read-only in the UI, which is correct when the file in this
+        # repository is the source of truth. A rule edited in the UI would be silently reverted by
+        # the next run anyway; better that the UI refuses.
         headers:
           Authorization: "Bearer {{ grafana_token }}"
-          X-Disable-Provenance: "true"
         body_format: json
         body:
           title: "{{ grafana_rule_group }}"
