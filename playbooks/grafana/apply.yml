@@ -44,13 +44,6 @@
     # describe. If this name ever starts failing the same way, do not chase the payload -- it is
     # the group.
     grafana_rule_group: "management-plane-v2"
-    # Every rule must name a contact point. Grafana's own UI refuses to save a rule without one and
-    # attaches the notification policy's default receiver, which here is literally named "empty".
-    # Read off a rule Grafana wrote itself on 2026-08-23, after the API spent all day answering
-    # "bad request data" without mentioning it: the spec marks notification_settings OPTIONAL, and
-    # for this stack it is not. A spec can tell you what a field means and still not tell you that
-    # the deployment requires it.
-    grafana_alert_receiver: "empty"
     # Pinned so a misconfigured endpoint cannot quietly write into the wrong Grafana. See the
     # boundary rule in infra-objectives/CLAUDE.md — a company Grafana or a second personal stack
     # would answer just as happily.
@@ -202,8 +195,7 @@
             {{ grafana_alerts.rules | map('combine', {
                  'orgID': grafana_org.json.id,
                  'folderUID': grafana_folder_uid,
-                 'ruleGroup': grafana_rule_group,
-                 'notification_settings': {'receiver': grafana_alert_receiver}
+                 'ruleGroup': grafana_rule_group
                }) | list }}
         status_code: [200, 202]
       register: grafana_rules_applied
