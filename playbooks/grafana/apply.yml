@@ -138,8 +138,12 @@
         headers:
           Authorization: "Bearer {{ grafana_token }}"
         body_format: json
+        # The group object is {folder, name, interval, rules} — NOT {title, ...}. Sending `title`
+        # produced a bare 400 "bad request data" with no indication of which field was wrong, which
+        # cost several deploys to find. Grafana validates strictly and reports vaguely.
         body:
-          title: "{{ grafana_rule_group }}"
+          folder: "{{ grafana_folder_uid }}"
+          name: "{{ grafana_rule_group }}"
           interval: "{{ grafana_alerts.interval | default('1m') }}"
           rules: "{{ grafana_alerts.rules }}"
         status_code: [200, 202]
