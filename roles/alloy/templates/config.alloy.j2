@@ -189,3 +189,47 @@ prometheus.scrape "awx" {
   forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
 }
 {% endif %}
+
+{% if alloy_has_etcd | default(false) %}
+
+// ---------------------------------------------------------------------------------------------
+// etcd (level 2) — only rendered on hosts where 127.0.0.1:2381 actually answered.
+//
+// etcd is the one Kubernetes component that exposes metrics without credentials, and it is also
+// the one whose failure is hardest to diagnose after the fact: a slow or unhealthy etcd presents
+// as the API server being slow, which presents as everything being slow.
+// ---------------------------------------------------------------------------------------------
+
+prometheus.scrape "etcd" {
+  targets = [{
+    __address__      = "127.0.0.1:2381",
+    __scheme__       = "http",
+    __metrics_path__ = "/metrics",
+    instance         = "{{ inventory_hostname }}",
+  }]
+  scrape_interval = "{{ alloy_scrape_interval }}"
+  job_name        = "etcd"
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
+{% endif %}
+{% if alloy_has_apiserver | default(false) %}
+
+// The API server's /healthz is reachable anonymously; its /metrics is not. This gives liveness
+// only — up{job="kube-apiserver"} — which is still the difference between "the control plane is
+// answering" and silence. Real API metrics need a bearer token, and that means the in-cluster
+// ServiceAccount from the infra-observability policy, which is not granted.
+prometheus.scrape "kube_apiserver_health" {
+  targets = [{
+    __address__      = "127.0.0.1:6443",
+    __scheme__       = "https",
+    __metrics_path__ = "/healthz",
+    instance         = "{{ inventory_hostname }}",
+  }]
+  tls_config {
+    insecure_skip_verify = true
+  }
+  scrape_interval = "{{ alloy_scrape_interval }}"
+  job_name        = "kube-apiserver"
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
+{% endif %}

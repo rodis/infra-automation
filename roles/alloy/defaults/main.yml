@@ -26,3 +26,16 @@ alloy_journal_max_age: "12h"
 alloy_scrape_awx: "{{ (lookup('env', 'ALLOY_SCRAPE_AWX') | default('false', true)) | bool }}"
 alloy_awx_url: "{{ lookup('env', 'AWX_METRICS_URL') }}"
 alloy_awx_token: "{{ lookup('env', 'AWX_METRICS_TOKEN') }}"
+
+# KUBERNETES (level 2). Discovered rather than declared: the role probes each host for endpoints
+# that are reachable WITHOUT credentials, and scrapes whatever answers. south is not a kubespray
+# cluster, so assuming kubeadm's defaults would be a guess; asking the host is not.
+#
+# What this can and cannot reach, and why:
+#   etcd  127.0.0.1:2381/metrics   — no auth by default, control-plane only         -> scraped
+#   API   127.0.0.1:6443/healthz   — anonymous access is normally permitted          -> scraped
+#   kubelet   :10250, apiserver /metrics, controller-manager, scheduler              -> need a
+#     bearer token, which means an in-cluster ServiceAccount, which is the
+#     infra-observability grant that is DESIGNED BUT NOT GRANTED. Not attempted here.
+#   kube-state-metrics — object state (pod phases, deployment replicas) — must run IN the cluster.
+alloy_probe_kubernetes: true

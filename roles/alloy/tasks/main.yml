@@ -117,6 +117,39 @@
     when: alloy_ship_logs | bool
     notify: Restart alloy
 
+  # Ask the host what is listening rather than assuming a distribution's defaults. south is not
+  # kubespray, so "kubeadm puts etcd metrics on 2381" is a guess; this turns it into a fact, and
+  # the config below scrapes only what actually answered.
+  - name: Look for unauthenticated Kubernetes endpoints on this host
+    ansible.builtin.uri:
+      url: "{{ item.url }}"
+      method: GET
+      validate_certs: false
+      status_code: [200]
+      timeout: 5
+    loop:
+      - { name: etcd, url: "http://127.0.0.1:2381/metrics" }
+      - { name: apiserver, url: "https://127.0.0.1:6443/healthz" }
+    loop_control:
+      label: "{{ item.name }}"
+    register: alloy_k8s_probe
+    failed_when: false
+    changed_when: false
+    when: alloy_probe_kubernetes | bool
+
+  - name: Record which of them answered
+    ansible.builtin.set_fact:
+      alloy_has_etcd: "{{ (alloy_k8s_probe.results | default([]) | selectattr('item.name', 'equalto', 'etcd') | map(attribute='status') | first | default(0)) == 200 }}"
+      alloy_has_apiserver: "{{ (alloy_k8s_probe.results | default([]) | selectattr('item.name', 'equalto', 'apiserver') | map(attribute='status') | first | default(0)) == 200 }}"
+    when: alloy_probe_kubernetes | bool
+
+  - name: Report what was found
+    ansible.builtin.debug:
+      msg: >-
+        {{ inventory_hostname }}: etcd metrics {{ 'YES' if alloy_has_etcd | default(false) else 'no' }},
+        apiserver healthz {{ 'YES' if alloy_has_apiserver | default(false) else 'no' }}
+    when: alloy_probe_kubernetes | bool
+
   - name: Write the Alloy configuration
     ansible.builtin.template:
       src: config.alloy.j2
