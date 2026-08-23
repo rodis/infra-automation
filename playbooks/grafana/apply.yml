@@ -31,19 +31,12 @@
     grafana_token: "{{ lookup('env', 'GRAFANA_API_TOKEN') }}"
     grafana_folder_title: "Infrastructure"
     grafana_folder_uid: "infra"
-    # "-v2" is a WORKAROUND, not an explanation, and should be read as an open question.
-    #
-    # Grafana rejects this exact payload for the group "management-plane" with a bare 400, and
-    # accepts it byte-for-byte into any other group name -- proven on 2026-08-23 across seven
-    # throwaway groups, with 1, 2, 3 and 4 rules, both with and without rule uids, and both while
-    # the target group existed and after it was verifiably deleted. Everything else was eliminated
-    # by diffing against a rule Grafana's own UI wrote: same structure, same two-node query ->
-    # threshold chain, same required fields, and both enum values inside the documented sets.
-    #
-    # So something about that specific group name is stuck server-side in a way the API will not
-    # describe. If this name ever starts failing the same way, do not chase the payload -- it is
-    # the group.
-    grafana_rule_group: "management-plane-v2"
+    # The group name was never the problem, though I spent a while believing it was. The bare 400
+    # came from `interval` being templated: Ansible sent it as a STRING on the Spacelift runner
+    # where the identical expression produced an int locally, and Grafana rejects a string there
+    # without saying so. It is a literal below, and this reverted from a "-v2" name that had been
+    # adopted as a workaround for a cause that turned out to be imaginary.
+    grafana_rule_group: "management-plane"
     # Pinned so a misconfigured endpoint cannot quietly write into the wrong Grafana. See the
     # boundary rule in infra-objectives/CLAUDE.md — a company Grafana or a second personal stack
     # would answer just as happily.
