@@ -69,16 +69,28 @@
           {{ grafana_org.json.id }} ({{ grafana_org.json.name }}) at {{ grafana_url }}.
         success_msg: "writing to org {{ grafana_org.json.id }} ({{ grafana_org.json.name }})"
 
-    - name: Ensure the folder exists
+    # Look first, then create. Creating-and-tolerating-the-conflict looked simpler, but the
+    # conflict code is a moving target: this Grafana answers 412 "the folder has been changed by
+    # someone else" where the documented behaviour is 409. Accepting a list of codes means
+    # guessing which one a future version returns, and a wrong guess fails a run for a folder that
+    # already exists.
+    - name: Look for the folder
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/folders/{{ grafana_folder_uid }}"
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        status_code: [200, 404]
+      register: grafana_folder_lookup
+      changed_when: false
+
+    - name: Create the folder if it is missing
       ansible.builtin.uri:
         url: "{{ grafana_url }}/api/folders"
         method: POST
         headers: { Authorization: "Bearer {{ grafana_token }}" }
         body_format: json
         body: { uid: "{{ grafana_folder_uid }}", title: "{{ grafana_folder_title }}" }
-        status_code: [200, 409]
-      register: grafana_folder
-      changed_when: grafana_folder.status == 200
+        status_code: [200]
+      when: grafana_folder_lookup.status == 404
 
     - name: Find the dashboards in this repository
       ansible.builtin.find:
