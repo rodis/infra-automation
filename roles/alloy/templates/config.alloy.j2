@@ -338,10 +338,25 @@ loki.process "postgresql" {
     max_lines = 50
   }
 
-  // Promote severity to a label so `| level="FATAL"` works the same way it does for journald.
+  // Capture the line's OWN timestamp as well as its severity.
   stage.regex {
-    expression = "^\\S+ \\S+ \\S+ \\[\\d+\\] (?:\\S+ )?(?P<level>[A-Z]+):"
+    expression = "^(?P<ts>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d+ \\S+) \\[\\d+\\] (?:\\S+ )?(?P<level>[A-Z]+):"
   }
+
+  // Without this, Loki stamps every entry with the moment ALLOY READ IT, not when PostgreSQL wrote
+  // it. Measured 2026-08-23: the first deploy backfilled the whole of that day's log and 1,513
+  // FATAL lines -- including refusals from 10:28 and a restart at 17:39 -- all arrived stamped
+  // 18:40:08. Counting them showed "1513 FATAL in the last hour" on a database that had been
+  // healthy for hours.
+  //
+  // That is worse than losing the lines. An incident timeline that is confidently wrong invites
+  // exactly the misreading this estate exists to prevent, and it survives into the ledgers.
+  stage.timestamp {
+    source = "ts"
+    format = "2006-01-02 15:04:05.000 MST"
+  }
+
+  // Promote severity to a label so `| level="FATAL"` works the same way it does for journald.
   stage.labels {
     values = { level = "" }
   }

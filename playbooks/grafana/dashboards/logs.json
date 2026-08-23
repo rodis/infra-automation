@@ -1,0 +1,292 @@
+{
+  "uid": "logs-south",
+  "title": "Logs (south)",
+  "description": "Every log source the management plane ships: host journals, PostgreSQL's own log, and container logs for a chosen set of namespaces. Built because the AWX outage on 2026-08-23 was diagnosed from a file over SSH and from `kubectl logs`, which retained eight minutes.",
+  "tags": [
+    "managed-by-git",
+    "south",
+    "logs"
+  ],
+  "timezone": "utc",
+  "editable": false,
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "label": "host",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "query": {
+          "label": "instance",
+          "refId": "instance"
+        },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "allValue": ".*",
+        "description": "Falls back to .* so the panels below still work if the label query returns nothing -- an empty variable would silently match no streams and read as a quiet estate."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Lines per source",
+      "description": "A source going flat is as interesting as one spiking. journald is always the loudest; postgresql is normally near-silent, so sustained volume there means something is being logged repeatedly.",
+      "gridPos": {
+        "h": 7,
+        "w": 16,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "grafanacloud-logs"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (job) (count_over_time({job=~\"journal|pods|postgresql\"}[$__interval]))",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Errors in range",
+      "description": "journald error/crit/alert/emerg plus PostgreSQL FATAL/ERROR/PANIC. Not a health score: a quiet estate and a dead collector both read zero. Cross-check against 'Lines per source' being non-zero.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "grafanacloud-logs"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({job=\"journal\", level=~\"error|crit|alert|emerg\"}[$__range])) + sum(count_over_time({job=\"postgresql\", level=~\"FATAL|ERROR|PANIC\"}[$__range]))"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 50
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "logs",
+      "title": "PostgreSQL \u2014 FATAL, ERROR, PANIC",
+      "description": "The panel that would have ended the 2026-08-23 incident in one look. 'remaining connection slots are reserved' appeared here 1,280 times from 10:28 UTC while every dashboard stayed green, because this log goes to a file and nothing was collecting it.",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "grafanacloud-logs"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{job=\"postgresql\", level=~\"FATAL|ERROR|PANIC\"}"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true
+      }
+    },
+    {
+      "id": 4,
+      "type": "logs",
+      "title": "Kernel trouble \u2014 lockups, OOM kills, hung tasks",
+      "description": "The query the 2026-08-22 lockup investigation needed and did not have. dmesg wraps and a reboot erases it; this survives 14 days. A soft lockup here is the evidence that rung 3 of the escalation ladder is the right rung.",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "grafanacloud-logs"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{job=\"journal\", instance=~\"$instance\"} |~ \"(?i)watchdog|soft lockup|hard lockup|oom-kill|out of memory|blocked for more than\""
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true
+      }
+    },
+    {
+      "id": 5,
+      "type": "logs",
+      "title": "AWX containers \u2014 errors and tracebacks",
+      "description": "AWX is the hands: every verb in infra-objectives runs through it. Its pod logs previously lived only in the container's own 8-minute window.",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "grafanacloud-logs"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{job=\"pods\", namespace=\"awx\"} |~ \"(?i)error|traceback|exception|fatal\""
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Container log volume by namespace",
+      "description": "Watch this against the 50GB/month allowance. Namespaces are an allow-list in roles/alloy defaults; cert-manager and nginx-ingress are deliberately excluded.",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "grafanacloud-logs"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace) (count_over_time({job=\"pods\"}[$__interval]))",
+          "legendFormat": "{{namespace}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Journal volume by unit (top talkers)",
+      "description": "Useful for spotting a unit that has started shouting. A sudden new talker is often the first sign of something retrying.",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "grafanacloud-logs"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(8, sum by (unit) (count_over_time({job=\"journal\", instance=~\"$instance\"}[$__interval])))",
+          "legendFormat": "{{unit}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "text",
+      "title": "What is and is not collected",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Collected:** the systemd journal from all four hosts (including `kubelet` and `containerd`); PostgreSQL's own log; container logs for `awx`, `kube-system` and `kube-flannel`.\n\n**Not collected, deliberately:** `cert-manager` and `nginx-ingress` container logs (owner's call), and `doppler-operator-system`. Adding one is an entry in `alloy_pod_log_namespaces`, not a code change \u2014 but check the volume first: the current selection is about 13 MB/day against a 50GB/month allowance.\n\n**Retention is 14 days.** For anything older the run ledgers in `infra-objectives/state/` are the record, and they are the only durable account \u2014 AWX prunes its own job history too.\n\n**Two traps this pipeline already hit, worth knowing when reading it back:**\n\n- **PostgreSQL's log is a file, not journald.** `logging_collector=off` with `log_destination=stderr` lands in `/var/log/postgresql/`. A journald-only collector sees the unit start and stop and nothing else \u2014 so during the 2026-08-23 incident a Loki search for the refusals returned empty while 1,280 of them sat on disk. An empty result was a blind check, not health.\n- **Timestamps are the log's own, not the collection time.** That needed an explicit `stage.timestamp`; without it the first backfill stamped an entire day's history \u2014 refusals from 10:28, a restart at 17:39 \u2014 as all having happened at 18:40:08. An incident timeline that is confidently wrong is worse than a missing one.\n\n**Absence of logs is not evidence of health.** If a source goes flat, check `Lines per source` before concluding anything: a dead collector and a quiet host look identical from here, which is why the dead-man's switch is a separate concern."
+      }
+    }
+  ]
+}
