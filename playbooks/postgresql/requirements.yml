@@ -1,2 +1,11 @@
 roles:
+  # PINNED. This was unpinned, so every run installed whatever was current -- the same class of
+  # problem as an execution environment on a floating tag, but applied to the database AWX stores
+  # everything in.
+  #
+  # 4.0.3 rather than the latest (4.1.0): the stack last ran on 2026-01-03, when 4.0.3 was current
+  # (4.0.4 shipped 2026-03-25). Pinning to what already succeeded keeps this change to ONE variable
+  # -- max_connections -- instead of bundling a role upgrade with it. Bump deliberately, separately,
+  # and read the diff when you do.
   - name: geerlingguy.postgresql
+    version: 4.0.3

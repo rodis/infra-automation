@@ -11,6 +11,24 @@ postgresql_global_config_options:
     value: 'log'
   - option: listen_addresses
     value: '*'
+  # Raised from PostgreSQL's default of 100 on 2026-08-23, after AWX exhausted it and its web UI
+  # began dropping requests. With superuser_reserved_connections at 3, the usable ceiling was 97 and
+  # AWX was sitting at 95 -- 91 of them idle, 1 active, so this is connection HOARDING rather than
+  # load. 59 belonged to wsrelay, which meshes between awx-task pods and therefore grows with the
+  # square of task_replicas (6 today); eight pods would need roughly 140.
+  #
+  # A connection pooler is not an alternative here: PgBouncer transaction mode is the only mode that
+  # reduces connections and it breaks both LISTEN/NOTIFY and session advisory locks, which AWX uses
+  # (13 backends holding channels, pg_advisory_unlock on 14). Session mode is 1:1 and saves nothing.
+  #
+  # 200, not 300: it covers a replica bump with room to spare at a few MB of baseline each, against
+  # 7GB free on an 8GB VM. shared_buffers is deliberately NOT touched in the same change -- the
+  # cache hit ratio measured 100%, so the working set already fits the default 128MB and raising it
+  # would spend RAM on a problem that does not exist.
+  #
+  # CHANGING THIS REQUIRES A POSTGRESQL RESTART, which briefly drops every AWX connection.
+  - option: max_connections
+    value: 200
 postgresql_hba_entries:
   - {type: local, database: all, user: postgres, auth_method: peer}
   - {type: local, database: all, user: all, auth_method: peer}
@@ -27,4 +45,7 @@ postgresql_privs:
     privs: ALL
     type: schema
     objs: public
-postgres_users_no_log: false
+# TRUE. This was false, which disables Ansible's redaction on the task that handles
+# DB_PASSWORD -- so every run printed the AWX database password into the Spacelift log,
+# where it persists in the run history. Debugging a password is not worth publishing one.
+postgres_users_no_log: true
