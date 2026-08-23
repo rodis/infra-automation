@@ -1,0 +1,32 @@
+---
+# kube-state-metrics: object state for the cluster AWX runs on.
+#
+# This is the level-2 gap the Kubernetes dashboard has been describing since it was written. etcd
+# is the only component that exposes metrics without credentials, so pod phases, deployment
+# replicas, node conditions and restart counts were all invisible -- a cluster could have
+# crash-looping pods and NotReady nodes with every existing panel green.
+#
+# It runs IN the cluster and reads through the API, which is why it needed the infra-observability
+# ServiceAccount. Granted by the owner 2026-08-23.
+ksm_version: v2.15.0
+ksm_namespace: monitoring
+ksm_service_account: observability
+ksm_image: "registry.k8s.io/kube-state-metrics/kube-state-metrics:{{ ksm_version }}"
+
+# A fixed NodePort so the collector can scrape it from the host without holding a kubeconfig. See
+# tasks/main.yml for why that indirection is the point rather than a workaround.
+ksm_node_port: 30080
+
+# Deliberately narrower than the grant allows. The policy permits reading anything cluster-wide;
+# this asks for the objects the dashboards actually plot, because a permission that is not used is
+# a permission that cannot be misused. Adding a resource here means adding it to the ClusterRole in
+# the template too -- they are kept adjacent for exactly that reason.
+ksm_resources:
+  - nodes
+  - pods
+  - namespaces
+  - deployments
+  - statefulsets
+  - daemonsets
+  - jobs
+  - persistentvolumeclaims

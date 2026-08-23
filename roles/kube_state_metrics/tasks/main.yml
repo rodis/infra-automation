@@ -1,0 +1,91 @@
+---
+# Runs on every host it is given and does nothing on most of them: the presence of
+# /etc/kubernetes/admin.conf is what identifies a control-plane node. That is deliberate rather
+# than lazy -- south is not a kubespray cluster, so there is no kube_control_plane group to rely
+# on, and asking the host is the same principle the alloy role uses for etcd and PostgreSQL.
+
+- name: Look for a control-plane kubeconfig
+  ansible.builtin.stat:
+    path: /etc/kubernetes/admin.conf
+  register: ksm_admin_conf
+  changed_when: false
+  check_mode: false
+
+- name: Record whether this host can drive the cluster
+  ansible.builtin.set_fact:
+    ksm_is_control_plane: "{{ ksm_admin_conf.stat.exists | default(false) | bool }}"
+
+- name: Install kube-state-metrics
+  when: ksm_is_control_plane | bool
+  block:
+
+    # The manifest is applied FROM the node, using the node's own admin.conf. The agent therefore
+    # never holds a kubeconfig for this cluster and there is no credential to store, rotate or
+    # leak -- the authority stays where it already was.
+    - name: Write the manifest
+      ansible.builtin.template:
+        src: kube-state-metrics.yml.j2
+        dest: /etc/kubernetes/observability-kube-state-metrics.yml
+        owner: root
+        group: root
+        mode: "0600"
+      check_mode: false
+
+    - name: Apply it
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - apply
+          - -f
+          - /etc/kubernetes/observability-kube-state-metrics.yml
+      register: ksm_apply
+      changed_when: "'configured' in ksm_apply.stdout or 'created' in ksm_apply.stdout"
+
+    - name: Report what changed
+      ansible.builtin.debug:
+        msg: "{{ ksm_apply.stdout_lines | default([]) }}"
+
+    # `kubectl apply` returning 0 means the API accepted the objects, not that anything is running.
+    # This is the same distinction as grading an installer on its exit status: wait for the thing.
+    - name: Wait for the deployment to become available
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - -n
+          - "{{ ksm_namespace }}"
+          - rollout
+          - status
+          - deployment/kube-state-metrics
+          - --timeout=120s
+      register: ksm_rollout
+      changed_when: false
+
+    # And finally: does it actually serve metrics on the port the collector will scrape? A running
+    # pod behind a NodePort that answers nothing is the failure this catches.
+    - name: Check the NodePort serves metrics
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ ksm_node_port }}/metrics"
+        return_content: true
+        status_code: [200]
+        timeout: 10
+      register: ksm_probe
+      retries: 6
+      delay: 10
+      until: ksm_probe.status | default(0) == 200
+      changed_when: false
+      check_mode: false
+
+    - name: Assert it is reporting real objects
+      ansible.builtin.assert:
+        that:
+          - "'kube_node_info' in ksm_probe.content"
+          - "'kube_pod_status_phase' in ksm_probe.content"
+        fail_msg: >-
+          kube-state-metrics answered on {{ ksm_node_port }} but is not reporting node or pod
+          objects, which usually means the ServiceAccount cannot list them. Check the
+          ClusterRoleBinding before assuming the cluster is empty.
+        success_msg: >-
+          kube-state-metrics serving {{ ksm_probe.content
+            | regex_findall('(?m)^kube_[a-z_]+') | unique | length }} distinct metric names

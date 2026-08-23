@@ -17,6 +17,15 @@
 # `hosts: all` is deliberate: the space's context already narrows the inventory. Overriding
 # alloy_hosts is for running it by hand against something specific.
 
+# kube-state-metrics first, so that by the time the collector probes for it, it exists. The role
+# no-ops on every host without /etc/kubernetes/admin.conf, which is how it finds the control plane
+# without needing a kube_control_plane group that south does not have.
+- name: Install kube-state-metrics on the control plane
+  hosts: "{{ alloy_hosts | default('all') }}"
+  become: true
+  roles:
+    - role: ../../roles/kube_state_metrics
+
 - name: Ship host metrics to Grafana Cloud
   hosts: "{{ alloy_hosts | default('all') }}"
   become: true

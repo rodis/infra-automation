@@ -1,0 +1,109 @@
+# Managed by rodis/infra-automation, roles/kube_state_metrics. Do not edit in the cluster.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ ksm_namespace }}
+  labels:
+    app.kubernetes.io/managed-by: infra-automation
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ ksm_service_account }}
+  namespace: {{ ksm_namespace }}
+automountServiceAccountToken: true
+---
+# READ ONLY, cluster-wide, and only the resources kube-state-metrics is configured to collect.
+# No create, update, patch, delete or deletecollection anywhere. No secrets, no configmaps.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ ksm_service_account }}-read
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods, namespaces, persistentvolumeclaims]
+    verbs: [get, list, watch]
+  - apiGroups: ["apps"]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: ["batch"]
+    resources: [jobs]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ ksm_service_account }}-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ ksm_service_account }}-read
+subjects:
+  - kind: ServiceAccount
+    name: {{ ksm_service_account }}
+    namespace: {{ ksm_namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: {{ ksm_namespace }}
+  labels:
+    app.kubernetes.io/name: kube-state-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kube-state-metrics
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-state-metrics
+    spec:
+      serviceAccountName: {{ ksm_service_account }}
+      # It only reads the API, so it needs nothing from the node and gets nothing.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kube-state-metrics
+          image: {{ ksm_image }}
+          args:
+            - --resources={{ ksm_resources | join(',') }}
+            - --port=8080
+            - --telemetry-port=8081
+          ports:
+            - containerPort: 8080
+              name: http-metrics
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: {cpu: 10m, memory: 64Mi}
+            limits: {memory: 192Mi}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet: {path: /, port: 8081}
+            initialDelaySeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-state-metrics
+  namespace: {{ ksm_namespace }}
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: kube-state-metrics
+  ports:
+    - name: http-metrics
+      port: 8080
+      targetPort: 8080
+      nodePort: {{ ksm_node_port }}

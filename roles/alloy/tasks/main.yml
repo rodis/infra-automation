@@ -215,6 +215,41 @@
     changed_when: false
     when: alloy_has_postgres | default(false)
 
+  # kube-state-metrics. Two conditions, and both are needed: the port answers on EVERY node
+  # because it is a NodePort, so probing alone would enable this scrape three times over.
+  - name: Am I the control plane?
+    ansible.builtin.stat:
+      path: /etc/kubernetes/admin.conf
+    register: alloy_admin_conf
+    changed_when: false
+    check_mode: false
+    when: alloy_scrape_kube_state_metrics | bool
+
+  - name: Look for kube-state-metrics on the NodePort
+    ansible.builtin.uri:
+      url: "http://127.0.0.1:{{ alloy_ksm_port }}/metrics"
+      status_code: [200]
+      timeout: 5
+    register: alloy_ksm_probe
+    failed_when: false
+    changed_when: false
+    check_mode: false
+    when:
+      - alloy_scrape_kube_state_metrics | bool
+      - alloy_admin_conf.stat.exists | default(false)
+
+  - name: Record whether to scrape it here
+    ansible.builtin.set_fact:
+      alloy_has_ksm: "{{ (alloy_ksm_probe.status | default(0)) == 200 }}"
+    when: alloy_scrape_kube_state_metrics | bool
+
+  - name: Report
+    ansible.builtin.debug:
+      msg: >-
+        {{ inventory_hostname }}: kube-state-metrics
+        {{ 'YES (scraping here)' if alloy_has_ksm | default(false) else 'no' }}
+    when: alloy_scrape_kube_state_metrics | bool
+
   # Pod logs. Same discovery principle as everything else here: ask the host.
   - name: Look for a kubelet pod log directory
     ansible.builtin.stat:

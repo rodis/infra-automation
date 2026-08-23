@@ -81,3 +81,18 @@ alloy_pod_log_namespaces:
   - awx
   - kube-system
   - kube-flannel
+
+# KUBE-STATE-METRICS (level 2). Scraped over the NodePort that roles/kube_state_metrics publishes,
+# so the collector needs no kubeconfig and no ServiceAccount token: the RBAC is consumed by
+# kube-state-metrics itself, inside the cluster, and what leaves is an unauthenticated metrics
+# endpoint on loopback.
+#
+# Scraped from the CONTROL-PLANE node only. A NodePort answers on every node, so probing alone
+# would enable it three times and triple every series under three different instance labels.
+alloy_scrape_kube_state_metrics: true
+alloy_ksm_port: 30080
+
+# kube-state-metrics describes the CLUSTER, not the machine that happened to scrape it. Labelling
+# it with a hostname is the same mistake as stamping AWX's metrics with the name of the box that
+# collected them -- it reads as a per-host fact and is not one.
+alloy_cluster_name: "{{ inventory_hostname | regex_replace('^(k8s-[a-z]+)-.*$', '\\1') }}"

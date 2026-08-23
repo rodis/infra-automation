@@ -435,3 +435,44 @@ loki.relabel "pods" {
   }
 }
 {% endif %}
+{% if alloy_has_ksm | default(false) %}
+
+// ---------------------------------------------------------------------------------------------
+// kube-state-metrics — object state for the cluster.
+//
+// This closes the gap the Kubernetes dashboard has been carrying a warning about: etcd was the
+// only component reachable without credentials, so pod phases, node conditions, deployment
+// replicas and restart counts were all invisible. A cluster could have crash-looping pods and
+// NotReady nodes with every panel green.
+//
+// Scraped over a NodePort on loopback, so nothing here holds a kubeconfig or a ServiceAccount
+// token. The RBAC is consumed by kube-state-metrics inside the cluster; what crosses the boundary
+// is an unauthenticated read-only metrics endpoint.
+// ---------------------------------------------------------------------------------------------
+
+prometheus.scrape "kube_state_metrics" {
+  targets = [{
+    __address__      = "127.0.0.1:{{ alloy_ksm_port }}",
+    __scheme__       = "http",
+    __metrics_path__ = "/metrics",
+    // The CLUSTER, not this host. See alloy_cluster_name in defaults/main.yml.
+    instance         = "{{ alloy_cluster_name }}",
+  }]
+  scrape_interval = "{{ alloy_scrape_interval }}"
+  job_name        = "kube-state-metrics"
+  forward_to      = [prometheus.relabel.ksm_keep.receiver]
+}
+
+// A keep-list, as for etcd. kube-state-metrics is generous by default and its per-object label
+// sets multiply quickly; what survives is what answers "is the cluster healthy" -- readiness,
+// phases, restarts, desired-vs-available -- plus enough capacity to see a node filling up.
+prometheus.relabel "ksm_keep" {
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+
+  rule {
+    source_labels = ["__name__"]
+    regex  = "up|kube_node_info|kube_node_status_condition|kube_node_status_capacity|kube_node_status_allocatable|kube_node_spec_unschedulable|kube_pod_info|kube_pod_status_phase|kube_pod_status_ready|kube_pod_container_status_restarts_total|kube_pod_container_status_waiting_reason|kube_pod_container_status_terminated_reason|kube_deployment_status_replicas.*|kube_deployment_spec_replicas|kube_statefulset_status_replicas.*|kube_daemonset_status_.*|kube_job_status_failed|kube_job_status_succeeded|kube_persistentvolumeclaim_status_phase|kube_namespace_status_phase"
+    action = "keep"
+  }
+}
+{% endif %}
