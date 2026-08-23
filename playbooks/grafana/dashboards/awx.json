@@ -1,0 +1,124 @@
+{
+  "uid": "awx",
+  "title": "AWX",
+  "description": "AWX is the hands: every verb in infra-objectives executes through it. These are AWX's own metrics, scraped from OUTSIDE the cluster it runs in, so an outage shows as up == 0 rather than as missing data.",
+  "tags": ["managed-by-git", "south", "awx"],
+  "timezone": "utc",
+  "editable": false,
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "AWX reachable",
+      "description": "The scrape runs from the PostgreSQL VM, outside the Kubernetes cluster AWX lives in. A 0 here is a measurement; if this panel is empty instead, the collector or Grafana is the problem, not AWX.",
+      "gridPos": { "h": 5, "w": 5, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [{ "refId": "A", "expr": "up{job=\"awx\"}" }],
+      "options": { "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Capacity remaining",
+      "description": "Summed across AWX instances. Jobs queue when this reaches zero — which looks like AWX being slow rather than AWX being full, and is the distinction this panel exists to make.",
+      "gridPos": { "h": 5, "w": 5, "x": 5, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [
+        { "refId": "A", "expr": "sum(awx_instance_remaining_capacity)", "legendFormat": "remaining" },
+        { "refId": "B", "expr": "sum(awx_instance_capacity)", "legendFormat": "total" }
+      ],
+      "options": { "colorMode": "value", "graphMode": "area" },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "orange", "value": 50 }, { "color": "green", "value": 150 }] } }, "overrides": [] }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Database connections",
+      "description": "AWX's own view of PostgreSQL. This is the level-3 metric that answers a level-1 question: it says the database is reachable FROM AWX, which is a different fact from the postgres VM being up — and the two diverge exactly when it matters.",
+      "gridPos": { "h": 5, "w": 5, "x": 10, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [{ "refId": "A", "expr": "awx_database_connections_total" }],
+      "options": { "colorMode": "value", "graphMode": "area" }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Instances",
+      "description": "AWX control pods reporting capacity. south runs six; a drop means pods are gone or not heartbeating.",
+      "gridPos": { "h": 5, "w": 9, "x": 15, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [{ "refId": "A", "expr": "count(awx_instance_capacity)" }],
+      "options": { "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "orange", "value": 1 }, { "color": "green", "value": 6 }] } }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Capacity consumed vs available",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [
+        { "refId": "A", "expr": "sum(awx_instance_consumed_capacity)", "legendFormat": "consumed" },
+        { "refId": "B", "expr": "sum(awx_instance_capacity)", "legendFormat": "total" }
+      ],
+      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 10 } }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Capacity per instance",
+      "description": "Per AWX pod. Pods come and go on redeploy, so gaps here are normal; all of them dropping at once is not.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [{ "refId": "A", "expr": "awx_instance_remaining_capacity", "legendFormat": "{{instance}}" }],
+      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 5 } }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Database connections over time",
+      "description": "A climbing floor here, rather than a spike, is the shape that precedes AWX becoming unusable while every pod still reports healthy.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [{ "refId": "A", "expr": "awx_database_connections_total", "legendFormat": "connections" }],
+      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 10 } }, "overrides": [] }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Inventory of the estate, as AWX sees it",
+      "description": "Counts of the things this repo manages. Useful as a change detector: hosts or job templates moving when nobody deployed anything is worth a look.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "targets": [
+        { "refId": "A", "expr": "awx_hosts_total", "legendFormat": "hosts" },
+        { "refId": "B", "expr": "awx_inventories_total", "legendFormat": "inventories" },
+        { "refId": "C", "expr": "awx_job_templates_total", "legendFormat": "job templates" },
+        { "refId": "D", "expr": "awx_organizations_total", "legendFormat": "organizations" }
+      ],
+      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 0, "lineWidth": 2 } }, "overrides": [] }
+    },
+    {
+      "id": 9,
+      "type": "text",
+      "title": "What this dashboard cannot tell you",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 20 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Nothing about AWX's pods.** These are AWX's own application metrics, reported by AWX about itself. Pod restarts, evictions, image pulls and scheduling failures need `kube-state-metrics`, which must run inside the cluster — blocked on the `infra-observability` ServiceAccount.\n\n**Nothing about PostgreSQL itself.** `awx_database_connections_total` is AWX's view of its database. Disk, bloat, locks and replication need `postgres_exporter` and a read-only `pg_monitor` role on that VM.\n\n**Nothing when AWX is down.** If AWX cannot serve `/api/v2/metrics`, every panel here goes flat except `up`, which is precisely why the scrape runs from outside the cluster. Cross-check with the **Management plane** dashboard: if the PostgreSQL VM and the Kubernetes nodes are healthy while AWX is not, the fault is in the application layer.\n\n**Nothing about whether a job did the right thing.** AWX reports that jobs ran, not that they were correct — a job template pointed at an empty inventory reports success. See rule 8 in `CLAUDE.md`."
+      }
+    }
+  ]
+}
