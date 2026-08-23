@@ -256,3 +256,54 @@ prometheus.relabel "etcd_keep" {
 // (prometheus.exporter.blackbox), and the API server's real /metrics needs a bearer token, which
 // means the in-cluster ServiceAccount from the infra-observability policy. Both are follow-ups.
 {% endif %}
+{% if alloy_has_postgres | default(false) %}
+
+// ---------------------------------------------------------------------------------------------
+// PostgreSQL — only rendered on a host that actually has a local socket.
+//
+// This exists because of a specific failure on 2026-08-23: AWX exhausted PostgreSQL's 100
+// connections and its UI began dropping requests, and NOTHING in this estate could see it. The
+// only connection metric was awx_database_connections_total, which comes FROM AWX — so at the
+// moment AWX could no longer get a connection, the metric that would have explained why went to
+// "no data". A collector that reads the database directly keeps reporting when the application
+// cannot, which is the whole point of measuring a dependency from outside its dependant.
+//
+// pg_settings_max_connections is deliberately kept: it turns headroom into a RATIO instead of a
+// number compared against a ceiling hardcoded in a dashboard. When somebody raises the limit, the
+// alert follows automatically rather than silently continuing to grade against the old value.
+// ---------------------------------------------------------------------------------------------
+
+prometheus.exporter.postgres "pg" {
+  // No password: peer auth over the unix socket. See defaults/main.yml.
+  data_source_names = ["postgresql:///postgres?host={{ alloy_postgres_socket_dir }}&user={{ alloy_postgres_role }}&sslmode=disable"]
+}
+
+discovery.relabel "pg" {
+  targets = prometheus.exporter.postgres.pg.targets
+  rule {
+    target_label = "instance"
+    replacement  = "{{ inventory_hostname }}"
+  }
+}
+
+prometheus.scrape "postgres" {
+  targets         = discovery.relabel.pg.output
+  scrape_interval = "{{ alloy_scrape_interval }}"
+  job_name        = "postgres"
+  forward_to      = [prometheus.relabel.postgres_keep.receiver]
+}
+
+// A keep-list for the same reason etcd has one: postgres_exporter's per-table collectors are a
+// cardinality bomb on a database with AWX's schema, and the free tier is 10,000 active series.
+// What survives is connection headroom, the counters needed to judge cache behaviour before
+// touching shared_buffers, and enough of pg_stat_database to see errors and contention.
+prometheus.relabel "postgres_keep" {
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+
+  rule {
+    source_labels = ["__name__"]
+    regex  = "up|pg_up|pg_settings_max_connections|pg_settings_superuser_reserved_connections|pg_settings_shared_buffers_bytes|pg_settings_work_mem_bytes|pg_settings_effective_cache_size_bytes|pg_stat_database_numbackends|pg_stat_database_(xact_commit|xact_rollback|blks_read|blks_hit|conflicts|deadlocks|temp_files|temp_bytes)|pg_stat_bgwriter_.+|pg_locks_count|pg_database_size_bytes|pg_exporter_last_scrape_error|pg_exporter_scrapes_total"
+    action = "keep"
+  }
+}
+{% endif %}

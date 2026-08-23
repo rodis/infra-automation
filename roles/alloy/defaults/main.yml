@@ -39,3 +39,17 @@ alloy_awx_token: "{{ lookup('env', 'AWX_METRICS_TOKEN') }}"
 #     infra-observability grant that is DESIGNED BUT NOT GRANTED. Not attempted here.
 #   kube-state-metrics — object state (pod phases, deployment replicas) — must run IN the cluster.
 alloy_probe_kubernetes: true
+
+# POSTGRESQL. Discovered rather than declared, like the Kubernetes endpoints above: the role looks
+# for a local PostgreSQL socket and configures the exporter only where one exists, so the same role
+# runs unchanged on the database VM and on the cluster nodes.
+#
+# Authentication is peer over the unix socket, so THERE IS NO PASSWORD ANYWHERE. Debian's pg_hba
+# already carries `local all all peer`, which means a PostgreSQL role whose name matches the OS
+# user Alloy runs as authenticates with no secret: nothing to store in a vault, nothing to rotate,
+# and nothing that can be printed into a run log. `pg_monitor` is PostgreSQL's own built-in
+# read-only monitoring role — it grants the pg_stat_* views and settings, and no ability to read
+# table data or write anything at all.
+alloy_scrape_postgres: true
+alloy_postgres_role: alloy
+alloy_postgres_socket_dir: /var/run/postgresql

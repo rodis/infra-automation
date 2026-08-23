@@ -150,10 +150,71 @@
         apiserver healthz {{ 'YES' if alloy_has_apiserver | default(false) else 'no' }}
     when: alloy_probe_kubernetes | bool
 
-  - name: Write the Alloy configuration
+  # PostgreSQL, found the same way as the endpoints above: by asking the host. A socket present
+  # means a server is running here; its absence means this is a cluster node and the block below
+  # renders to nothing.
+  - name: Look for a local PostgreSQL socket
+    ansible.builtin.stat:
+      path: "{{ alloy_postgres_socket_dir }}/.s.PGSQL.5432"
+    register: alloy_pg_socket
+    changed_when: false
+    when: alloy_scrape_postgres | bool
+
+  - name: Record whether PostgreSQL is here
+    ansible.builtin.set_fact:
+      alloy_has_postgres: "{{ alloy_pg_socket.stat.exists | default(false) | bool }}"
+    when: alloy_scrape_postgres | bool
+
+  - name: Report whether PostgreSQL was found
+    ansible.builtin.debug:
+      msg: "{{ inventory_hostname }}: PostgreSQL {{ 'YES' if alloy_has_postgres | default(false) else 'no' }}"
+    when: alloy_scrape_postgres | bool
+
+  # Look first, then create — the same shape as the Grafana folder, and for the same reason: the
+  # error returned by "create something that exists" is a moving target, while a lookup is not.
+  - name: Does the monitoring role already exist?
+    become_user: postgres
+    ansible.builtin.command:
+      argv:
+        - psql
+        - -tAc
+        - "select 1 from pg_roles where rolname = '{{ alloy_postgres_role }}'"
+    register: alloy_pg_role_check
+    changed_when: false
+    when: alloy_has_postgres | default(false)
+
+  - name: Create the read-only monitoring role
+    become_user: postgres
+    ansible.builtin.command:
+      argv:
+        - psql
+        - -v
+        - ON_ERROR_STOP=1
+        - -c
+        - "CREATE ROLE {{ alloy_postgres_role }} LOGIN"
+    when:
+      - alloy_has_postgres | default(false)
+      - (alloy_pg_role_check.stdout | default('') | trim) != '1'
+
+  # pg_monitor is PostgreSQL's own read-only monitoring role. Granting it is idempotent, so this
+  # runs every time rather than only on creation — which also repairs a role that exists but lost
+  # the grant, a state that would otherwise produce a permanently broken exporter and no clue why.
+  - name: Grant pg_monitor to the monitoring role
+    become_user: postgres
+    ansible.builtin.command:
+      argv:
+        - psql
+        - -v
+        - ON_ERROR_STOP=1
+        - -c
+        - "GRANT pg_monitor TO {{ alloy_postgres_role }}"
+    changed_when: false
+    when: alloy_has_postgres | default(false)
+
+  - name: Write the candidate Alloy configuration
     ansible.builtin.template:
       src: config.alloy.j2
-      dest: /etc/alloy/config.alloy
+      dest: /etc/alloy/config.alloy.candidate
       owner: root
       group: alloy
       # root:alloy 0640 — the file holds the remote_write token, so it must not be world
@@ -162,7 +223,34 @@
       # root and dropped privileges. It does not, and the service crash-looped on
       # "reading config path: permission denied" until systemd gave up.
       mode: "0640"
+
+  # Validate BEFORE the live file is touched. On 2026-08-23 a metric_relabel_config block that is
+  # valid Prometheus YAML but not valid Alloy syntax made the config unparseable, Alloy refused to
+  # start, and the host stopped shipping EVERYTHING — metrics and logs — until it was found. The
+  # candidate file makes a bad config a failed task instead of a dark host.
+  - name: Validate the candidate configuration
+    ansible.builtin.command:
+      argv: [alloy, validate, /etc/alloy/config.alloy.candidate]
+    register: alloy_validate
+    changed_when: false
+    failed_when: alloy_validate.rc != 0
+
+  - name: Install the validated configuration
+    ansible.builtin.copy:
+      src: /etc/alloy/config.alloy.candidate
+      dest: /etc/alloy/config.alloy
+      remote_src: true
+      owner: root
+      group: alloy
+      mode: "0640"
     notify: Restart alloy
+
+  - name: Remove the candidate
+    ansible.builtin.file:
+      path: /etc/alloy/config.alloy.candidate
+      state: absent
+    changed_when: false
+
 
   - name: Clear any previous failed state before starting
     ansible.builtin.systemd:
