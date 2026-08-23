@@ -27,8 +27,20 @@ prometheus.exporter.unix "host" {
   }
 }
 
+// The unix exporter's targets carry __address__ = 127.0.0.1:12345, so without this every series
+// would be labelled instance="127.0.0.1:12345" and be useless the moment there is a second host.
+// Set here rather than on remote_write: a global rule also renames series scraped from something
+// REMOTE, which stamped AWX's metrics with the name of the machine that scraped them.
+discovery.relabel "host" {
+  targets = prometheus.exporter.unix.host.targets
+  rule {
+    target_label = "instance"
+    replacement  = "{{ inventory_hostname }}"
+  }
+}
+
 prometheus.scrape "host" {
-  targets    = prometheus.exporter.unix.host.targets
+  targets    = discovery.relabel.host.output
   forward_to = [prometheus.remote_write.grafana_cloud.receiver]
 
   scrape_interval = "{{ alloy_scrape_interval }}"
@@ -56,10 +68,6 @@ prometheus.remote_write "grafana_cloud" {
       max_samples_per_send = 500
     }
 
-    write_relabel_config {
-      target_label = "instance"
-      replacement  = "{{ inventory_hostname }}"
-    }
   }
 }
 
