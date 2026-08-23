@@ -94,6 +94,40 @@ loki.relabel "journal" {
     source_labels = ["__journal_priority_keyword"]
     target_label  = "level"
   }
+
+  // Alloy is by far the noisiest unit on these hosts — roughly 870 lines per 15 minutes, about
+  // 83k a day, almost all of it the collector narrating its own scrape loop. Dropping its info and
+  // debug lines removes the bulk of the volume and loses nothing anyone would query.
+  //
+  // Its warn/error/crit lines are KEPT deliberately. Those are how we would learn that shipping
+  // has broken, and a collector that stops reporting its own failures is the observability
+  // equivalent of a smoke alarm with the battery out.
+  rule {
+    source_labels = ["__journal__systemd_unit", "__journal_priority_keyword"]
+    separator     = ";"
+    regex         = "alloy\\.service;(info|debug)"
+    action        = "drop"
+  }
+
+  // Collapse transient per-login units into one stream. systemd names each SSH session
+  // `session-<N>.scope` with an ever-increasing N, so left alone `unit` is an UNBOUNDED label and
+  // every login creates a new Loki stream. Loki charges on stream cardinality and the free tier
+  // rejects writes rather than degrading, so this is a slow-motion outage rather than a tidiness
+  // issue. Already visible before this rule: session-5246, session-5248, and climbing.
+  rule {
+    source_labels = ["unit"]
+    regex         = "session-\\d+\\.scope"
+    target_label  = "unit"
+    replacement   = "session.scope"
+  }
+
+  // Same shape: systemd-run and udev spawn transient units with generated names.
+  rule {
+    source_labels = ["unit"]
+    regex         = "(run-r?[0-9a-f]+|systemd-[a-z]+-[0-9]+)\\.(scope|service|mount)"
+    target_label  = "unit"
+    replacement   = "transient"
+  }
 }
 
 loki.source.journal "journal" {

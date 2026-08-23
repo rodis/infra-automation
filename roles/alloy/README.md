@@ -35,6 +35,17 @@ Two details that would otherwise fail silently:
   would ship its entire historical journal and spend a large part of the 50GB allowance on history
   nobody asked for.
 
+Two rules exist purely to keep the log stream sane, and both were added after seeing real data:
+
+- **Alloy's own info/debug lines are dropped.** It was the noisiest unit on every host by a wide
+  margin — ~870 lines per 15 minutes — nearly all of it narrating its own scrape loop. Its
+  warn/error/crit lines are kept, because a collector that stops reporting its own failures is a
+  smoke alarm with the battery out.
+- **Transient unit names are collapsed.** systemd names each SSH login `session-<N>.scope` with an
+  ever-increasing N, so `unit` is an unbounded label and every login makes a new Loki stream. That
+  is a slow-motion outage, not untidiness, and it had already started: `session-5246`,
+  `session-5248`, climbing.
+
 Label cardinality is kept deliberately small — `job`, `instance`, `unit`, `level`. Loki charges on
 stream cardinality rather than volume, and the free tier rejects writes rather than degrading, so
 anything derived from message text or a PID would be a slow-motion outage.
