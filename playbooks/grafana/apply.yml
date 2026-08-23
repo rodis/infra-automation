@@ -149,6 +149,70 @@
     # so removing a rule here removes it in Grafana. A per-rule POST would only ever add, and the
     # file would slowly stop describing reality.
       when: grafana_apply_alerts | bool
+    # TEMPORARY (2026-08-23): bisect the 400 in ONE run instead of one deploy per guess.
+    # Each variant strips something; the first that returns 200 names the culprit.
+    - name: BISECT
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}{{ item.path }}"
+        method: "{{ item.method }}"
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        body_format: json
+        body: "{{ item.body }}"
+        status_code: [200, 201, 202, 400, 403, 409, 422]
+      register: bisect
+      changed_when: false
+      when:
+        - grafana_apply_alerts | bool
+        - not ansible_check_mode
+      loop:
+        - name: "A: minimal group, one trivial rule"
+          method: PUT
+          path: "/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/probe-zzz"
+          body:
+            folderUid: "{{ grafana_folder_uid }}"
+            title: "probe-zzz"
+            interval: 60
+            rules:
+              - title: "probe rule"
+                condition: "A"
+                for: "5m"
+                noDataState: "NoData"
+                execErrState: "Error"
+                orgID: "{{ grafana_org.json.id }}"
+                folderUID: "{{ grafana_folder_uid }}"
+                ruleGroup: "probe-zzz"
+                data:
+                  - refId: "A"
+                    queryType: ""
+                    relativeTimeRange: { from: 600, to: 0 }
+                    datasourceUid: "grafanacloud-prom"
+                    model: { refId: "A", expr: "vector(1)", instant: true }
+        - name: "B: real group but only the FIRST real rule"
+          method: PUT
+          path: "/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/{{ grafana_rule_group }}"
+          body:
+            folderUid: "{{ grafana_folder_uid }}"
+            title: "{{ grafana_rule_group }}"
+            interval: 60
+            rules: "{{ [grafana_alerts.rules[0] | combine({'orgID': grafana_org.json.id, 'folderUID': grafana_folder_uid, 'ruleGroup': grafana_rule_group})] }}"
+        - name: "C: first real rule, uid removed"
+          method: PUT
+          path: "/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/{{ grafana_rule_group }}"
+          body:
+            folderUid: "{{ grafana_folder_uid }}"
+            title: "{{ grafana_rule_group }}"
+            interval: 60
+            rules: "{{ [grafana_alerts.rules[0] | combine({'orgID': grafana_org.json.id, 'folderUID': grafana_folder_uid, 'ruleGroup': grafana_rule_group}) | dict2items | rejectattr('key','equalto','uid') | items2dict] }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: BISECT result
+      ansible.builtin.debug:
+        msg: "{{ bisect.results | default([]) | map(attribute='item.name') | zip(bisect.results | default([]) | map(attribute='status')) | list }}"
+      when:
+        - grafana_apply_alerts | bool
+        - not ansible_check_mode
+
     - name: Apply the alert rule group
       # PUT of a whole rule group, not POST per rule: the group becomes exactly what the file says,
       # so removing a rule here removes it in Grafana. A per-rule POST would only ever add.
