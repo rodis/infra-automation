@@ -220,6 +220,20 @@ prometheus.scrape "etcd" {
   scrape_interval = "{{ alloy_scrape_interval }}"
   job_name        = "etcd"
   forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+
+  // A keep-list, because etcd is by far the most expensive thing on this estate: 1478 active
+  // series from ONE node, of which grpc_server_handled_total alone was 731 — method x code x
+  // service cardinality. Untrimmed, three production control planes would have cost ~4400 series
+  // and put the free tier's 10,000 out of reach before anything useful was added.
+  //
+  // What survives is what the Kubernetes dashboard reads plus what the standard etcd alerts need.
+  // grpc_server_started_total is kept for request rate by method; handled_total is dropped, which
+  // costs per-code error breakdown and is the one real loss here.
+  metric_relabel_config {
+    source_labels = ["__name__"]
+    regex = "up|etcd_server_has_leader|etcd_server_leader_changes_seen_total|etcd_server_proposals_(committed|applied|failed)_total|etcd_server_proposals_pending|etcd_server_health_failures|etcd_mvcc_db_total_size_in_bytes|etcd_mvcc_db_total_size_in_use_in_bytes|etcd_debugging_mvcc_(keys|watcher)_total|etcd_disk_wal_fsync_duration_seconds_(bucket|count|sum)|etcd_disk_backend_commit_duration_seconds_(bucket|count|sum)|etcd_network_peer_round_trip_time_seconds_(bucket|count|sum)|etcd_network_client_grpc_(received|sent)_bytes_total|grpc_server_started_total|process_resident_memory_bytes|process_cpu_seconds_total"
+    action = "keep"
+  }
 }
 {% endif %}
 {% if alloy_has_apiserver | default(false) %}

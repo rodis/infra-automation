@@ -1,27 +1,76 @@
 {
   "uid": "kubernetes-south",
   "title": "Kubernetes (south)",
-  "description": "The cluster AWX runs on. Currently etcd only — everything else in the Kubernetes control plane requires credentials this collector does not have. Read the note at the bottom before concluding anything from a quiet dashboard.",
-  "tags": ["managed-by-git", "south", "kubernetes"],
+  "description": "The cluster AWX runs on. Currently etcd only \u2014 everything else in the Kubernetes control plane requires credentials this collector does not have. Read the note at the bottom before concluding anything from a quiet dashboard.",
+  "tags": [
+    "managed-by-git",
+    "south",
+    "kubernetes"
+  ],
   "timezone": "utc",
   "editable": false,
   "schemaVersion": 39,
   "refresh": "1m",
-  "time": { "from": "now-6h", "to": "now" },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
   "panels": [
     {
       "id": 1,
       "type": "stat",
       "title": "etcd reachable",
       "description": "Scraped from 127.0.0.1:2381 on the control-plane node, which needs no credentials. etcd is the component whose failure is hardest to attribute afterwards: a slow etcd presents as a slow API server, which presents as everything being slow.",
-      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
-      "targets": [{ "refId": "A", "expr": "up{job=\"etcd\"}" }],
-      "options": { "colorMode": "background", "graphMode": "area" },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=\"etcd\"}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area"
+      },
       "fieldConfig": {
         "defaults": {
-          "mappings": [{ "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "UP",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
         },
         "overrides": []
       }
@@ -30,15 +79,57 @@
       "id": 2,
       "type": "stat",
       "title": "Has a leader",
-      "description": "etcd_server_has_leader. A cluster without a leader accepts no writes, which means the Kubernetes API accepts no changes — the whole control plane is read-only until this recovers.",
-      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
-      "targets": [{ "refId": "A", "expr": "etcd_server_has_leader" }],
-      "options": { "colorMode": "background", "graphMode": "none" },
+      "description": "etcd_server_has_leader. A cluster without a leader accepts no writes, which means the Kubernetes API accepts no changes \u2014 the whole control plane is read-only until this recovers.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "etcd_server_has_leader"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      },
       "fieldConfig": {
         "defaults": {
-          "mappings": [{ "type": "value", "options": { "0": { "text": "NO LEADER", "color": "red" }, "1": { "text": "yes", "color": "green" } } }],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "NO LEADER",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "yes",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
         },
         "overrides": []
       }
@@ -47,41 +138,149 @@
       "id": 3,
       "type": "stat",
       "title": "Leader changes (6h)",
-      "description": "Occasional changes are normal. A rising count means the cluster is churning — usually disk latency or a starved CPU, both of which are visible on the Management plane dashboard.",
-      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
-      "targets": [{ "refId": "A", "expr": "increase(etcd_server_leader_changes_seen_total[6h])" }],
-      "options": { "colorMode": "value", "graphMode": "area" },
-      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 4 }] } }, "overrides": [] }
+      "description": "Occasional changes are normal. A rising count means the cluster is churning \u2014 usually disk latency or a starved CPU, both of which are visible on the Management plane dashboard.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(etcd_server_leader_changes_seen_total[6h])"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 4
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 4,
       "type": "stat",
       "title": "DB size",
       "description": "etcd has a hard quota (2GB by default). Crossing it puts the cluster into a read-only alarm state, and the recovery is a compaction and defrag, not a restart.",
-      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
-      "targets": [{ "refId": "A", "expr": "etcd_mvcc_db_total_size_in_bytes" }],
-      "options": { "colorMode": "value", "graphMode": "area" },
-      "fieldConfig": { "defaults": { "unit": "bytes", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1073741824 }, { "color": "red", "value": 1932735283 }] } }, "overrides": [] }
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "etcd_mvcc_db_total_size_in_bytes"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1073741824
+              },
+              {
+                "color": "red",
+                "value": 1932735283
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 5,
       "type": "timeseries",
       "title": "Disk sync latency (p99)",
       "description": "The single best predictor of etcd trouble. WAL fsync above ~10ms sustained means the disk cannot keep up, and everything above it in the stack starts timing out in ways that look like application faults.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
       "targets": [
-        { "refId": "A", "expr": "histogram_quantile(0.99, sum by (le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])))", "legendFormat": "WAL fsync p99" },
-        { "refId": "B", "expr": "histogram_quantile(0.99, sum by (le) (rate(etcd_disk_backend_commit_duration_seconds_bucket[5m])))", "legendFormat": "backend commit p99" }
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])))",
+          "legendFormat": "WAL fsync p99"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(etcd_disk_backend_commit_duration_seconds_bucket[5m])))",
+          "legendFormat": "backend commit p99"
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "s",
           "min": 0,
-          "custom": { "fillOpacity": 10, "thresholdsStyle": { "mode": "line" } },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.01 }] }
+          "custom": {
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
         },
         "overrides": []
       }
@@ -90,48 +289,126 @@
       "id": 6,
       "type": "timeseries",
       "title": "Proposals",
-      "description": "Failed proposals mean writes were rejected — usually a leader election in progress or a quorum problem. Pending climbing means etcd is falling behind.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "description": "Failed proposals mean writes were rejected \u2014 usually a leader election in progress or a quorum problem. Pending climbing means etcd is falling behind.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
       "targets": [
-        { "refId": "A", "expr": "rate(etcd_server_proposals_committed_total[5m])", "legendFormat": "committed/s" },
-        { "refId": "B", "expr": "rate(etcd_server_proposals_failed_total[5m])", "legendFormat": "failed/s" },
-        { "refId": "C", "expr": "etcd_server_proposals_pending", "legendFormat": "pending" }
+        {
+          "refId": "A",
+          "expr": "rate(etcd_server_proposals_committed_total[5m])",
+          "legendFormat": "committed/s"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(etcd_server_proposals_failed_total[5m])",
+          "legendFormat": "failed/s"
+        },
+        {
+          "refId": "C",
+          "expr": "etcd_server_proposals_pending",
+          "legendFormat": "pending"
+        }
       ],
-      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 5 } }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 7,
       "type": "timeseries",
       "title": "Keys and watchers",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 13 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
       "targets": [
-        { "refId": "A", "expr": "etcd_debugging_mvcc_keys_total", "legendFormat": "keys" },
-        { "refId": "B", "expr": "etcd_debugging_mvcc_watcher_total", "legendFormat": "watchers" }
+        {
+          "refId": "A",
+          "expr": "etcd_debugging_mvcc_keys_total",
+          "legendFormat": "keys"
+        },
+        {
+          "refId": "B",
+          "expr": "etcd_debugging_mvcc_watcher_total",
+          "legendFormat": "watchers"
+        }
       ],
-      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 0, "lineWidth": 2 } }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 8,
       "type": "timeseries",
       "title": "gRPC traffic",
-      "description": "Who is talking to etcd and how much. A sudden climb with no deployment behind it usually means a controller stuck in a retry loop.",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 13 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "description": "Request rate by method. Uses grpc_server_started_total rather than handled_total: the latter carries a grpc_code label and cost 731 series from a single etcd, half the whole etcd budget, so it is dropped at scrape time. The loss is per-code error breakdown \u2014 visible instead as failed proposals in the panel above.",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
       "targets": [
-        { "refId": "A", "expr": "sum by (grpc_method) (rate(grpc_server_handled_total[5m]))", "legendFormat": "{{grpc_method}}" }
+        {
+          "refId": "A",
+          "expr": "sum by (grpc_method) (rate(grpc_server_started_total[5m]))",
+          "legendFormat": "{{grpc_method}}"
+        }
       ],
-      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 5 } }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 9,
       "type": "text",
-      "title": "This dashboard is deliberately incomplete — read this before trusting it",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "title": "This dashboard is deliberately incomplete \u2014 read this before trusting it",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
       "options": {
         "mode": "markdown",
-        "content": "**etcd is the only Kubernetes component here, because it is the only one that exposes metrics without credentials.** Everything below needs a bearer token from an in-cluster ServiceAccount — the `infra-observability` grant in `CLAUDE.md`, which is designed but **not granted**:\n\n| missing | needs |\n| :-- | :-- |\n| API server latency, request rates, error codes | bearer token |\n| kubelet / cAdvisor — per-pod CPU, memory, restarts | bearer token |\n| scheduler and controller-manager | bearer token |\n| **pod phases, deployment replicas, node conditions** | `kube-state-metrics`, running **in** the cluster |\n\n**So a green dashboard here does NOT mean the cluster is healthy.** It means etcd is healthy. Pods can be crash-looping, the scheduler can be wedged, and nodes can be `NotReady` with every panel above still green — because nothing here is looking at them.\n\n**There is deliberately no API server panel.** `/healthz` answers anonymously but returns the string `ok`, not Prometheus format, so scraping it produced `up{job=\"kube-apiserver\"} = 0` forever — a permanent zero indistinguishable from a dead control plane. It was removed rather than left misleading. Liveness for a non-Prometheus endpoint wants a blackbox probe.\n\nUntil the ServiceAccount exists, node-level health on the **Management plane** dashboard and AWX's own metrics on the **AWX** dashboard cover more of the real risk than this one does."
+        "content": "**etcd is the only Kubernetes component here, because it is the only one that exposes metrics without credentials.** Everything below needs a bearer token from an in-cluster ServiceAccount \u2014 the `infra-observability` grant in `CLAUDE.md`, which is designed but **not granted**:\n\n| missing | needs |\n| :-- | :-- |\n| API server latency, request rates, error codes | bearer token |\n| kubelet / cAdvisor \u2014 per-pod CPU, memory, restarts | bearer token |\n| scheduler and controller-manager | bearer token |\n| **pod phases, deployment replicas, node conditions** | `kube-state-metrics`, running **in** the cluster |\n\n**So a green dashboard here does NOT mean the cluster is healthy.** It means etcd is healthy. Pods can be crash-looping, the scheduler can be wedged, and nodes can be `NotReady` with every panel above still green \u2014 because nothing here is looking at them.\n\n**There is deliberately no API server panel.** `/healthz` answers anonymously but returns the string `ok`, not Prometheus format, so scraping it produced `up{job=\"kube-apiserver\"} = 0` forever \u2014 a permanent zero indistinguishable from a dead control plane. It was removed rather than left misleading. Liveness for a non-Prometheus endpoint wants a blackbox probe.\n\nUntil the ServiceAccount exists, node-level health on the **Management plane** dashboard and AWX's own metrics on the **AWX** dashboard cover more of the real risk than this one does."
       }
     }
   ]
