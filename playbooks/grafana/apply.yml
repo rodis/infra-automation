@@ -32,6 +32,13 @@
     grafana_folder_title: "Infrastructure"
     grafana_folder_uid: "infra"
     grafana_rule_group: "management-plane"
+    # Every rule must name a contact point. Grafana's own UI refuses to save a rule without one and
+    # attaches the notification policy's default receiver, which here is literally named "empty".
+    # Read off a rule Grafana wrote itself on 2026-08-23, after the API spent all day answering
+    # "bad request data" without mentioning it: the spec marks notification_settings OPTIONAL, and
+    # for this stack it is not. A spec can tell you what a field means and still not tell you that
+    # the deployment requires it.
+    grafana_alert_receiver: "empty"
     # Pinned so a misconfigured endpoint cannot quietly write into the wrong Grafana. See the
     # boundary rule in infra-objectives/CLAUDE.md — a company Grafana or a second personal stack
     # would answer just as happily.
@@ -149,28 +156,6 @@
     # so removing a rule here removes it in Grafana. A per-rule POST would only ever add, and the
     # file would slowly stop describing reality.
       when: grafana_apply_alerts | bool
-    # Delete the group before writing it. Replacing an EXISTING group in place is what the
-    # opaque 400 was actually about: bisected on 2026-08-23, all four rules went into a FRESH group
-    # cleanly (200 at 1, 2, 3 and 4 rules) while the identical payload into the existing group was
-    # rejected, and Grafana says only "bad request data" either way.
-    #
-    # An earlier commit blamed the rules' uids for this and removed them. That was wrong -- the
-    # uid-less payload failed too. They are restored, because with delete-then-write the uids are
-    # ours to keep, and stable uids are what make deep links and silences survive a redeploy.
-    #
-    # This also makes the operation say what it means: the file is the whole truth for this group,
-    # so the group becomes exactly the file rather than being reconciled towards it.
-    - name: Remove the existing rule group first
-      ansible.builtin.uri:
-        url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/{{ grafana_rule_group }}"
-        method: DELETE
-        headers: { Authorization: "Bearer {{ grafana_token }}" }
-        status_code: [200, 202, 204, 404]
-      changed_when: false
-      when:
-        - grafana_apply_alerts | bool
-        - not ansible_check_mode
-
     - name: Apply the alert rule group
       # PUT of a whole rule group, not POST per rule: the group becomes exactly what the file says,
       # so removing a rule here removes it in Grafana. A per-rule POST would only ever add.
@@ -205,7 +190,8 @@
             {{ grafana_alerts.rules | map('combine', {
                  'orgID': grafana_org.json.id,
                  'folderUID': grafana_folder_uid,
-                 'ruleGroup': grafana_rule_group
+                 'ruleGroup': grafana_rule_group,
+                 'notification_settings': {'receiver': grafana_alert_receiver}
                }) | list }}
         status_code: [200, 202]
       register: grafana_rules_applied
