@@ -80,8 +80,7 @@
             ]
           }
         }
-      ],
-      "uid": "mgmt-host-not-reporting"
+      ]
     },
     {
       "title": "Root filesystem filling",
@@ -161,8 +160,7 @@
             ]
           }
         }
-      ],
-      "uid": "mgmt-root-fs-filling"
+      ]
     },
     {
       "title": "Memory nearly exhausted",
@@ -242,8 +240,7 @@
             ]
           }
         }
-      ],
-      "uid": "mgmt-memory-low"
+      ]
     },
     {
       "title": "Sustained CPU steal",
@@ -324,8 +321,7 @@
             ]
           }
         }
-      ],
-      "uid": "mgmt-cpu-steal"
+      ]
     }
   ]
 }

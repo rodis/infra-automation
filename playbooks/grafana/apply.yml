@@ -149,45 +149,6 @@
     # so removing a rule here removes it in Grafana. A per-rule POST would only ever add, and the
     # file would slowly stop describing reality.
       when: grafana_apply_alerts | bool
-    # TEMPORARY: 1 rule works, 4 do not. Where does it break?
-    - name: BISECT cumulative
-      ansible.builtin.uri:
-        url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/zzz-cum-{{ item }}"
-        method: PUT
-        headers: { Authorization: "Bearer {{ grafana_token }}" }
-        body_format: json
-        body:
-          folderUid: "{{ grafana_folder_uid }}"
-          title: "zzz-cum-{{ item }}"
-          interval: 60
-          rules: "{{ grafana_alerts.rules[0:item | int] | map('combine', {'orgID': grafana_org.json.id, 'folderUID': grafana_folder_uid, 'ruleGroup': 'zzz-cum-' ~ item}) | list }}"
-        status_code: [200, 201, 202, 400, 403, 409, 422]
-      register: cum
-      changed_when: false
-      loop: [1, 2, 3, 4]
-      when:
-        - grafana_apply_alerts | bool
-        - not ansible_check_mode
-
-    - name: BISECT cumulative result
-      ansible.builtin.debug:
-        msg: "{{ cum.results | default([]) | map(attribute='item') | zip(cum.results | default([]) | map(attribute='status')) | list }}"
-      when:
-        - grafana_apply_alerts | bool
-        - not ansible_check_mode
-
-    - name: BISECT cumulative cleanup
-      ansible.builtin.uri:
-        url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/zzz-cum-{{ item }}"
-        method: DELETE
-        headers: { Authorization: "Bearer {{ grafana_token }}" }
-        status_code: [200, 202, 204, 404]
-      loop: [1, 2, 3, 4]
-      changed_when: false
-      when:
-        - grafana_apply_alerts | bool
-        - not ansible_check_mode
-
     - name: Apply the alert rule group
       # PUT of a whole rule group, not POST per rule: the group becomes exactly what the file says,
       # so removing a rule here removes it in Grafana. A per-rule POST would only ever add.
@@ -196,6 +157,13 @@
       # Editor service account does not hold — the first attempt got a 403 naming exactly that.
       # Omitting it is also the behaviour we want: Grafana marks these rules provisioned and makes
       # them read-only in the UI, which is correct when this repository is the source of truth.
+      #
+      # The rules in alerts/ carry NO uid, deliberately. Grafana owns rule uids, and PUTting a
+      # rule with an explicit uid that does not yet exist INTO AN EXISTING GROUP is rejected with
+      # the same opaque 400. Proven by bisect on 2026-08-23: all four rules with uids went into a
+      # fresh group fine (200 at 1, 2, 3 and 4 rules), and the identical payload into the existing
+      # group failed — while the same rule with its uid stripped succeeded. Identity here belongs
+      # to Grafana; this repository owns the rules by title and group.
       #
       # Body shape taken from Grafana's own OpenAPI spec (/public/api-merged.json, definition
       # `AlertRuleGroup`) rather than guessed. Five deploys of guessing produced five identical
