@@ -2,28 +2,76 @@
   "uid": "awx",
   "title": "AWX",
   "description": "AWX is the hands: every verb in infra-objectives executes through it. These are AWX's own metrics, scraped from OUTSIDE the cluster it runs in, so an outage shows as up == 0 rather than as missing data.",
-  "tags": ["managed-by-git", "south", "awx"],
+  "tags": [
+    "managed-by-git",
+    "south",
+    "awx"
+  ],
   "timezone": "utc",
   "editable": false,
   "schemaVersion": 39,
   "refresh": "1m",
-  "time": { "from": "now-6h", "to": "now" },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
   "panels": [
     {
       "id": 1,
       "type": "stat",
       "title": "AWX reachable",
       "description": "The scrape runs from the PostgreSQL VM, outside the Kubernetes cluster AWX lives in. A 0 here is a measurement; if this panel is empty instead, the collector or Grafana is the problem, not AWX.",
-      "gridPos": { "h": 5, "w": 5, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
-      "targets": [{ "refId": "A", "expr": "up{job=\"awx\"}" }],
-      "options": { "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "gridPos": {
+        "h": 5,
+        "w": 5,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=\"awx\"}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "UP",
+                  "color": "green"
+                }
+              }
+            }
           ],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
         },
         "overrides": []
       }
@@ -32,92 +80,401 @@
       "id": 2,
       "type": "stat",
       "title": "Capacity remaining",
-      "description": "Summed across AWX instances. Jobs queue when this reaches zero — which looks like AWX being slow rather than AWX being full, and is the distinction this panel exists to make.",
-      "gridPos": { "h": 5, "w": 5, "x": 5, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "description": "Summed across AWX instances. Jobs queue when this reaches zero \u2014 which looks like AWX being slow rather than AWX being full, and is the distinction this panel exists to make.",
+      "gridPos": {
+        "h": 5,
+        "w": 5,
+        "x": 5,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
       "targets": [
-        { "refId": "A", "expr": "sum(awx_instance_remaining_capacity)", "legendFormat": "remaining" },
-        { "refId": "B", "expr": "sum(awx_instance_capacity)", "legendFormat": "total" }
+        {
+          "refId": "A",
+          "expr": "sum(awx_instance_remaining_capacity)",
+          "legendFormat": "remaining"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(awx_instance_capacity)",
+          "legendFormat": "total"
+        }
       ],
-      "options": { "colorMode": "value", "graphMode": "area" },
-      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "orange", "value": 50 }, { "color": "green", "value": 150 }] } }, "overrides": [] }
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 150
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 3,
       "type": "stat",
-      "title": "Database connections",
-      "description": "AWX's own view of PostgreSQL. This is the level-3 metric that answers a level-1 question: it says the database is reachable FROM AWX, which is a different fact from the postgres VM being up — and the two diverge exactly when it matters.",
-      "gridPos": { "h": 5, "w": 5, "x": 10, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
-      "targets": [{ "refId": "A", "expr": "awx_database_connections_total" }],
-      "options": { "colorMode": "value", "graphMode": "area" }
+      "title": "Database connections (of 97)",
+      "description": "AWX's own count of its PostgreSQL connections. Ceiling is 97, not 100: PostgreSQL on k8s-south-postgresql has max_connections=100 with superuser_reserved_connections=3, so AWX can hold 97. Measured 2026-08-23, when AWX sat AT 97 and postgres began refusing with 'remaining connection slots are reserved'. This number is HARDCODED here because nothing exports it; postgres_exporter would make it a ratio and this panel should switch to that when it exists. At the ceiling the symptom is NOT a slow AWX: it is the web UI dropping requests and the metrics endpoint returning zero samples, because neither can get a connection.",
+      "gridPos": {
+        "h": 5,
+        "w": 5,
+        "x": 10,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(awx_database_connections_total)"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 97,
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 78
+              },
+              {
+                "color": "red",
+                "value": 88
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Connection headroom",
+      "description": "Free slots before AWX starts being refused. This is the number to watch, because the connection COUNT looks unalarming at 94 unless you happen to know the ceiling is 97. Connections are held mostly by wsrelay, which meshes between awx-task pods, so headroom shrinks with the SQUARE of task_replicas (currently 6).",
+      "gridPos": {
+        "h": 5,
+        "w": 5,
+        "x": 15,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "97 - max(awx_database_connections_total)"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 10
+              },
+              {
+                "color": "green",
+                "value": 20
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 4,
       "type": "stat",
       "title": "Instances",
       "description": "AWX control pods reporting capacity. south runs six; a drop means pods are gone or not heartbeating.",
-      "gridPos": { "h": 5, "w": 9, "x": 15, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
-      "targets": [{ "refId": "A", "expr": "count(awx_instance_capacity)" }],
-      "options": { "colorMode": "background", "graphMode": "none" },
-      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "orange", "value": 1 }, { "color": "green", "value": 6 }] } }, "overrides": [] }
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(awx_instance_capacity)"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "green",
+                "value": 6
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 5,
       "type": "timeseries",
       "title": "Capacity consumed vs available",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
       "targets": [
-        { "refId": "A", "expr": "sum(awx_instance_consumed_capacity)", "legendFormat": "consumed" },
-        { "refId": "B", "expr": "sum(awx_instance_capacity)", "legendFormat": "total" }
+        {
+          "refId": "A",
+          "expr": "sum(awx_instance_consumed_capacity)",
+          "legendFormat": "consumed"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(awx_instance_capacity)",
+          "legendFormat": "total"
+        }
       ],
-      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 10 } }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 6,
       "type": "timeseries",
       "title": "Capacity per instance",
       "description": "Per AWX pod. Pods come and go on redeploy, so gaps here are normal; all of them dropping at once is not.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
-      "targets": [{ "refId": "A", "expr": "awx_instance_remaining_capacity", "legendFormat": "{{instance}}" }],
-      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 5 } }, "overrides": [] }
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "awx_instance_remaining_capacity",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 7,
       "type": "timeseries",
-      "title": "Database connections over time",
-      "description": "A climbing floor here, rather than a spike, is the shape that precedes AWX becoming unusable while every pod still reports healthy.",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 13 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
-      "targets": [{ "refId": "A", "expr": "awx_database_connections_total", "legendFormat": "connections" }],
-      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 10 } }, "overrides": [] }
+      "title": "Database connections vs the 97 ceiling",
+      "description": "A climbing FLOOR rather than a spike is the shape that precedes AWX becoming unusable. The flat line is the ceiling. Ceiling is 97, not 100: PostgreSQL on k8s-south-postgresql has max_connections=100 with superuser_reserved_connections=3, so AWX can hold 97. Measured 2026-08-23, when AWX sat AT 97 and postgres began refusing with 'remaining connection slots are reserved'. This number is HARDCODED here because nothing exports it; postgres_exporter would make it a ratio and this panel should switch to that when it exists.",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(awx_database_connections_total)",
+          "legendFormat": "connections"
+        },
+        {
+          "refId": "B",
+          "expr": "vector(97)",
+          "legendFormat": "ceiling (97)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ceiling (97)"
+            },
+            "properties": [
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      }
     },
     {
       "id": 8,
       "type": "timeseries",
       "title": "Inventory of the estate, as AWX sees it",
       "description": "Counts of the things this repo manages. Useful as a change detector: hosts or job templates moving when nobody deployed anything is worth a look.",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 13 },
-      "datasource": { "type": "prometheus", "uid": "grafanacloud-prom" },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "grafanacloud-prom"
+      },
       "targets": [
-        { "refId": "A", "expr": "awx_hosts_total", "legendFormat": "hosts" },
-        { "refId": "B", "expr": "awx_inventories_total", "legendFormat": "inventories" },
-        { "refId": "C", "expr": "awx_job_templates_total", "legendFormat": "job templates" },
-        { "refId": "D", "expr": "awx_organizations_total", "legendFormat": "organizations" }
+        {
+          "refId": "A",
+          "expr": "awx_hosts_total",
+          "legendFormat": "hosts"
+        },
+        {
+          "refId": "B",
+          "expr": "awx_inventories_total",
+          "legendFormat": "inventories"
+        },
+        {
+          "refId": "C",
+          "expr": "awx_job_templates_total",
+          "legendFormat": "job templates"
+        },
+        {
+          "refId": "D",
+          "expr": "awx_organizations_total",
+          "legendFormat": "organizations"
+        }
       ],
-      "fieldConfig": { "defaults": { "min": 0, "custom": { "fillOpacity": 0, "lineWidth": 2 } }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 9,
       "type": "text",
       "title": "What this dashboard cannot tell you",
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 20 },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
       "options": {
         "mode": "markdown",
-        "content": "**Nothing about AWX's pods.** These are AWX's own application metrics, reported by AWX about itself. Pod restarts, evictions, image pulls and scheduling failures need `kube-state-metrics`, which must run inside the cluster — blocked on the `infra-observability` ServiceAccount.\n\n**Nothing about PostgreSQL itself.** `awx_database_connections_total` is AWX's view of its database. Disk, bloat, locks and replication need `postgres_exporter` and a read-only `pg_monitor` role on that VM.\n\n**Nothing when AWX is down.** If AWX cannot serve `/api/v2/metrics`, every panel here goes flat except `up`, which is precisely why the scrape runs from outside the cluster. Cross-check with the **Management plane** dashboard: if the PostgreSQL VM and the Kubernetes nodes are healthy while AWX is not, the fault is in the application layer.\n\n**Nothing about whether a job did the right thing.** AWX reports that jobs ran, not that they were correct — a job template pointed at an empty inventory reports success. See rule 8 in `CLAUDE.md`."
+        "content": "**The connection ceiling is 97 and AWX reached it on 2026-08-23.** `max_connections=100`, `superuser_reserved_connections=3`. At the wall, postgres refuses with *remaining connection slots are reserved for non-replication superuser connections*; AWX's web UI drops requests and `up{job=\"awx\"}` flaps to 0 with `scrape_samples_scraped=0` \u2014 the endpoint answers in 48ms and returns nothing.\n\n**It is not load.** At the ceiling there were 91 idle connections and 1 active. 59 belonged to `wsrelay`, which meshes between `awx-task` pods, so the count scales with the square of `task_replicas` (6 today, in `helm-override-files/awx/awx.yml`).\n\n**A connection pooler does not fix this.** PgBouncer transaction mode \u2014 the only mode that reduces connections \u2014 breaks both LISTEN/NOTIFY (13 backends hold channels) and session-level advisory locks (`pg_advisory_unlock`, seen on 14). The advisory-lock failure is silent: the unlock lands on a different backend and the lock leaks. Session mode is 1:1 and saves nothing. This is protocol-level, so pgcat and Odyssey inherit it.\n\n---\n\n**Nothing about AWX's pods.** These are AWX's own application metrics, reported by AWX about itself. Pod restarts, evictions, image pulls and scheduling failures need `kube-state-metrics`, which must run inside the cluster \u2014 blocked on the `infra-observability` ServiceAccount.\n\n**Nothing about PostgreSQL itself.** `awx_database_connections_total` is AWX's view of its database. Disk, bloat, locks and replication need `postgres_exporter` and a read-only `pg_monitor` role on that VM.\n\n**Nothing when AWX is down.** If AWX cannot serve `/api/v2/metrics`, every panel here goes flat except `up`, which is precisely why the scrape runs from outside the cluster. Cross-check with the **Management plane** dashboard: if the PostgreSQL VM and the Kubernetes nodes are healthy while AWX is not, the fault is in the application layer.\n\n**Nothing about whether a job did the right thing.** AWX reports that jobs ran, not that they were correct \u2014 a job template pointed at an empty inventory reports success. See rule 8 in `CLAUDE.md`."
       }
     }
   ]
