@@ -32,6 +32,20 @@
     run_once: true
     when: alloy_ship_logs | bool
 
+  - name: Check the AWX scrape settings were supplied
+    ansible.builtin.assert:
+      that:
+        - alloy_awx_url | length > 0
+        - alloy_awx_token | length > 0
+      fail_msg: >-
+        ALLOY_SCRAPE_AWX is true but AWX_METRICS_URL or AWX_METRICS_TOKEN is missing. Both are
+        stack-level variables on the PostgreSQL observability stack — deliberately not in the
+        shared Observability context, which autoattaches everywhere and would put an AWX token in
+        every run in the estate.
+      success_msg: "AWX scrape settings present"
+    run_once: true
+    when: alloy_scrape_awx | bool
+
   # Mimir rejects out-of-order samples, so a host whose clock has drifted does not degrade
   # gracefully — it gets 400s from every write. Cheaper to guarantee time sync than to debug it
   # later from the receiving end.

@@ -68,6 +68,24 @@ Label cardinality is kept deliberately small — `job`, `instance`, `unit`, `lev
 stream cardinality rather than volume, and the free tier rejects writes rather than degrading, so
 anything derived from message text or a PID would be a slow-motion outage.
 
+## AWX metrics (level 3)
+
+AWX publishes 70 Prometheus metrics of its own at `/api/v2/metrics` — capacity, remaining capacity,
+instance status, job launch counts, `awx_database_connections_total`. Nothing needed installing;
+the endpoint was simply unread.
+
+`alloy_scrape_awx` is **off by default and enabled on exactly one host**, because every host that
+scraped would emit a duplicate copy of the same series. It is enabled on the **PostgreSQL VM**
+rather than a cluster node, on purpose: AWX runs in that Kubernetes cluster, so a node scraping it
+would go dark for the same reason AWX did — turning an outage into an absence of data. From outside
+the cluster the same outage reads as `up{job="awx"} == 0`, which is a measurement rather than a
+silence.
+
+The credential is a **read-scoped** AWX OAuth token, not the admin write token this estate already
+has too many of. Verified at creation: it reads `/api/v2/metrics` and gets **403** when asked to
+launch a job. It lives as a stack-level secret on that one stack, deliberately not in the shared
+`Observability` context, which autoattaches estate-wide and would put an AWX token in every run.
+
 ## Variables
 
 | variable | default | |
@@ -81,6 +99,9 @@ anything derived from message text or a PID would be a slow-motion outage.
 | `alloy_loki_user` | from `GRAFANA_LOKI_USER` | Loki instance id — **not** the Prometheus one |
 | `alloy_loki_token` | `GRAFANA_LOKI_TOKEN`, else the metrics token | works only if that access policy carries `logs:write` |
 | `alloy_journal_max_age` | `12h` | how far back to read on first start |
+| `alloy_scrape_awx` | from `ALLOY_SCRAPE_AWX` | enable on ONE host only |
+| `alloy_awx_url` | from `AWX_METRICS_URL` | |
+| `alloy_awx_token` | from `AWX_METRICS_TOKEN` | read-scoped, **secret** |
 
 All three come from the Spacelift `Observability` context. The role asserts they are present before
 touching the host, because an Alloy that starts and writes to an empty URL looks healthy from every

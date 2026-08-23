@@ -152,3 +152,32 @@ loki.write "grafana_cloud" {
   }
 }
 {% endif %}
+
+{% if alloy_scrape_awx %}
+
+// ---------------------------------------------------------------------------------------------
+// AWX (level 3)
+//
+// AWX already publishes 70 Prometheus metrics of its own — capacity, remaining capacity, instance
+// status, job launch counts, and awx_database_connections_total. Nothing needed installing for
+// this; the endpoint was simply unread.
+//
+// Scraped from OUTSIDE the cluster AWX runs in, so that an AWX outage produces up{job="awx"} == 0
+// rather than an absence of data. Absence is indistinguishable from a broken collector; a zero is
+// a measurement.
+// ---------------------------------------------------------------------------------------------
+
+prometheus.scrape "awx" {
+  targets = [{
+    __address__      = "{{ alloy_awx_url | regex_replace('^https?://', '') | regex_replace('/$', '') }}",
+    __scheme__       = "https",
+    __metrics_path__ = "/api/v2/metrics",
+    instance         = "awx",
+  }]
+
+  bearer_token    = "{{ alloy_awx_token }}"
+  scrape_interval = "{{ alloy_scrape_interval }}"
+  job_name        = "awx"
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
+{% endif %}

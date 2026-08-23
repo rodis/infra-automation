@@ -17,3 +17,12 @@ alloy_loki_token: "{{ lookup('env', 'GRAFANA_LOKI_TOKEN') or lookup('env', 'GRAF
 # up 20 weeks, and without a bound Alloy would ship its entire historical journal on the first run
 # and spend a large part of the 50GB allowance recovering history nobody asked for.
 alloy_journal_max_age: "12h"
+
+# AWX (level 3). Off by default and enabled on exactly ONE host, because every host that scrapes
+# would produce a duplicate copy of the same series. It is enabled on the PostgreSQL VM rather than
+# a cluster node on purpose: AWX runs in that Kubernetes cluster, so a node scraping it would go
+# dark for the same reason AWX did, turning an outage into missing data. From outside the cluster
+# the same outage reads as up{job="awx"} == 0, which is a fact rather than a silence.
+alloy_scrape_awx: "{{ (lookup('env', 'ALLOY_SCRAPE_AWX') | default('false', true)) | bool }}"
+alloy_awx_url: "{{ lookup('env', 'AWX_METRICS_URL') }}"
+alloy_awx_token: "{{ lookup('env', 'AWX_METRICS_TOKEN') }}"
