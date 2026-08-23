@@ -190,7 +190,15 @@
         body:
           folderUid: "{{ grafana_folder_uid }}"
           title: "{{ grafana_rule_group }}"
-          interval: "{{ grafana_alerts.interval | default(60) | int }}"
+          # A LITERAL, not a template. Grafana requires an integer here, and a templated value is
+          # the one remaining difference between this request and the bisect that returned 200 for
+          # this exact rule set. Ansible preserves int types through a whole-string template in a
+          # local test, but that was never verified on the Spacelift runner, and "verified
+          # somewhere else" is how most of today's wrong turns started.
+          #
+          # The JSON in alerts/ still carries interval: 60 as documentation of intent; if the two
+          # ever need to differ, prove the type on the runner before templating this again.
+          interval: 60
           rules: >-
             {{ grafana_alerts.rules | map('combine', {
                  'orgID': grafana_org.json.id,
