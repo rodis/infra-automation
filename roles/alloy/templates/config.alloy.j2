@@ -62,3 +62,59 @@ prometheus.remote_write "grafana_cloud" {
     }
   }
 }
+
+{% if alloy_ship_logs %}
+
+// ---------------------------------------------------------------------------------------------
+// LOGS
+//
+// Metrics say a host is unwell; logs say why. Every diagnosis on 2026-08-22 came from a log line
+// and not from a threshold — soft lockups in dmesg, Alloy's own "permission denied", a Neutron
+// port stuck DOWN — so this is the half that makes a retrospective possible.
+//
+// It also fixes a stated blind spot in AWX [67] Check kernel health: that reads dmesg live, the
+// ring buffer wraps, and a reboot erases it entirely. Shipped to Loki, a soft lockup stays
+// queryable for 14 days and survives the reboot that hid it.
+// ---------------------------------------------------------------------------------------------
+
+loki.relabel "journal" {
+  // forward_to is empty on purpose: this component exists only to export .rules to the source
+  // below. It is the documented way to attach relabelling to a journal source.
+  forward_to = []
+
+  // Keep the label set SMALL and bounded. Loki charges for stream cardinality, not volume, and
+  // the free tier rejects writes rather than degrading. `unit` and `level` are bounded by the
+  // machine; anything derived from message text or a PID is unbounded and would be a slow-motion
+  // outage.
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+}
+
+loki.source.journal "journal" {
+  forward_to    = [loki.write.grafana_cloud.receiver]
+  relabel_rules = loki.relabel.journal.rules
+  max_age       = "{{ alloy_journal_max_age }}"
+
+  labels = {
+    job      = "journal",
+    instance = "{{ inventory_hostname }}",
+  }
+}
+
+loki.write "grafana_cloud" {
+  endpoint {
+    url = "{{ alloy_loki_url }}"
+
+    basic_auth {
+      username = "{{ alloy_loki_user }}"
+      password = "{{ alloy_loki_token }}"
+    }
+  }
+}
+{% endif %}

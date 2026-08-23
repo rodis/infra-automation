@@ -1,8 +1,19 @@
 ---
-# Where to ship. Supplied by the Spacelift `Observability` context as environment variables; only
-# the token is secret. See the role README.
+# METRICS. Supplied by the Spacelift `Observability` context; only the token is secret.
 alloy_remote_write_url: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_URL') }}"
 alloy_remote_write_user: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_USER') }}"
 alloy_remote_write_token: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_TOKEN') }}"
-
 alloy_scrape_interval: 60s
+
+# LOGS. Loki is a different endpoint with a different instance id from Prometheus — same stack,
+# separate tenants. The token is shared only if the access policy behind it carries logs:write as
+# well as metrics:write; GRAFANA_LOKI_TOKEN overrides when they are separate policies.
+alloy_ship_logs: true
+alloy_loki_url: "{{ lookup('env', 'GRAFANA_LOKI_URL') }}"
+alloy_loki_user: "{{ lookup('env', 'GRAFANA_LOKI_USER') }}"
+alloy_loki_token: "{{ lookup('env', 'GRAFANA_LOKI_TOKEN') or lookup('env', 'GRAFANA_REMOTE_WRITE_TOKEN') }}"
+
+# How far back to read on first start. This matters more than it looks: the PostgreSQL VM has been
+# up 20 weeks, and without a bound Alloy would ship its entire historical journal on the first run
+# and spend a large part of the 50GB allowance recovering history nobody asked for.
+alloy_journal_max_age: "12h"

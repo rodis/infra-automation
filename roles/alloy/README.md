@@ -15,6 +15,30 @@ Two stacks, one in each space, both pointing at `playbooks/observability`. Neith
 exists. An OS conditional inside the role would drag that distinction out of the place that models
 it properly and into a `when:` clause.
 
+## Logs, as well as metrics
+
+Metrics say a host is unwell; logs say why. Every diagnosis on 2026-08-22 came from a log line and
+not from a threshold — soft lockups in `dmesg`, Alloy's own `permission denied`, a Neutron port
+stuck `DOWN`. In a workflow where a human periodically asks "how are things", the retrospective
+matters more than the notification, because nothing is standing by to act on a notification anyway.
+
+It also closes a blind spot this role's own verb has. `[67] Check kernel health` reads `dmesg`
+live; the ring buffer wraps and a reboot erases it. Shipped to Loki, a soft lockup stays queryable
+for 14 days and survives the reboot that hid it.
+
+Two details that would otherwise fail silently:
+
+- **The `alloy` user must be in the `systemd-journal` group.** Without it Alloy reads nothing and
+  reports nothing — service active, metrics flowing, no logs. The role adds the membership and
+  restarts, because group changes only apply to a new process.
+- **`max_age` is set to 12h.** The PostgreSQL VM has 20 weeks of uptime; unbounded, the first run
+  would ship its entire historical journal and spend a large part of the 50GB allowance on history
+  nobody asked for.
+
+Label cardinality is kept deliberately small — `job`, `instance`, `unit`, `level`. Loki charges on
+stream cardinality rather than volume, and the free tier rejects writes rather than degrading, so
+anything derived from message text or a PID would be a slow-motion outage.
+
 ## Variables
 
 | variable | default | |
@@ -23,6 +47,11 @@ it properly and into a `when:` clause.
 | `alloy_remote_write_user` | from `GRAFANA_REMOTE_WRITE_USER` | numeric instance id, not secret |
 | `alloy_remote_write_token` | from `GRAFANA_REMOTE_WRITE_TOKEN` | **secret** |
 | `alloy_scrape_interval` | `60s` | |
+| `alloy_ship_logs` | `true` | journald → Loki |
+| `alloy_loki_url` | from `GRAFANA_LOKI_URL` | push endpoint, not secret |
+| `alloy_loki_user` | from `GRAFANA_LOKI_USER` | Loki instance id — **not** the Prometheus one |
+| `alloy_loki_token` | `GRAFANA_LOKI_TOKEN`, else the metrics token | works only if that access policy carries `logs:write` |
+| `alloy_journal_max_age` | `12h` | how far back to read on first start |
 
 All three come from the Spacelift `Observability` context. The role asserts they are present before
 touching the host, because an Alloy that starts and writes to an empty URL looks healthy from every

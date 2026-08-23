@@ -16,6 +16,22 @@
       success_msg: "remote_write settings present"
     run_once: true
 
+  - name: Check the log shipping settings were supplied
+    ansible.builtin.assert:
+      that:
+        - alloy_loki_url | length > 0
+        - alloy_loki_user | length > 0
+        - alloy_loki_token | length > 0
+      fail_msg: >-
+        alloy_ship_logs is true but the Loki settings are missing. GRAFANA_LOKI_URL and
+        GRAFANA_LOKI_USER go in the `Observability` context — note the Loki instance id is a
+        DIFFERENT number from the Prometheus one. The token falls back to
+        GRAFANA_REMOTE_WRITE_TOKEN, which only works if that access policy carries logs:write as
+        well as metrics:write; otherwise set GRAFANA_LOKI_TOKEN.
+      success_msg: "log shipping settings present"
+    run_once: true
+    when: alloy_ship_logs | bool
+
   # Mimir rejects out-of-order samples, so a host whose clock has drifted does not degrade
   # gracefully — it gets 400s from every write. Cheaper to guarantee time sync than to debug it
   # later from the receiving end.
@@ -74,6 +90,18 @@
     ansible.builtin.apt:
       name: alloy
       state: present
+
+  # Without this Alloy reads NOTHING from the journal and says nothing about it: the service stays
+  # active, metrics keep flowing, and logs simply never appear. Green everywhere and quietly
+  # incomplete is the worst shape of failure available, so it is a task rather than a README note.
+  # Group membership only takes effect on restart, hence the notify.
+  - name: Let Alloy read the systemd journal
+    ansible.builtin.user:
+      name: alloy
+      groups: systemd-journal
+      append: true
+    when: alloy_ship_logs | bool
+    notify: Restart alloy
 
   - name: Write the Alloy configuration
     ansible.builtin.template:
@@ -144,7 +172,9 @@
         curl -s --max-time 10 localhost:12345/metrics
         | awk '/^prometheus_remote_storage_samples_total/ {s=$NF}
                /^prometheus_remote_storage_samples_failed_total/ {f=$NF}
-               END {printf "%d %d", s+0, f+0}'
+               /^loki_write_sent_entries_total/ {le+=$NF}
+               /^loki_write_dropped_entries_total/ {ld+=$NF}
+               END {printf "%d %d %d %d", s+0, f+0, le+0, ld+0}'
       executable: /bin/bash
     changed_when: false
     failed_when: false
@@ -152,21 +182,30 @@
     # The first scrape has to happen before there is anything to count.
     retries: 6
     delay: 15
-    until: (alloy_counters.stdout.split() | first | default(0) | int) > 0
+    until: >-
+      (alloy_counters.stdout.split()[0] | default(0) | int) > 0
+      and (not (alloy_ship_logs | bool)
+           or (alloy_counters.stdout.split()[2] | default(0) | int) > 0)
 
   - name: Report
     ansible.builtin.debug:
       msg: >-
         {{ inventory_hostname }}: alloy {{ alloy_active.stdout }},
-        {{ alloy_counters.stdout.split() | first | default('0') }} samples sent,
-        {{ alloy_counters.stdout.split() | last | default('?') }} rejected
+        metrics {{ alloy_counters.stdout.split()[0] | default('0') }} sent /
+        {{ alloy_counters.stdout.split()[1] | default('?') }} rejected,
+        logs {{ alloy_counters.stdout.split()[2] | default('0') }} sent /
+        {{ alloy_counters.stdout.split()[3] | default('?') }} dropped
 
   - name: Check Alloy is running and its samples are being accepted
     ansible.builtin.assert:
       that:
         - alloy_active.stdout == 'active'
-        - (alloy_counters.stdout.split() | first | default(0) | int) > 0
-        - (alloy_counters.stdout.split() | last | default(1) | int) == 0
+        - (alloy_counters.stdout.split()[0] | default(0) | int) > 0
+        - (alloy_counters.stdout.split()[1] | default(1) | int) == 0
+        # A silent zero here is the journal-group permission, not a quiet machine: even an idle
+        # host logs something within a minute.
+        - not (alloy_ship_logs | bool) or (alloy_counters.stdout.split()[2] | default(0) | int) > 0
+        - (alloy_counters.stdout.split()[3] | default(0) | int) == 0
       fail_msg: >-
         Alloy is not shipping cleanly on {{ inventory_hostname }} — service is
         '{{ alloy_active.stdout }}', {{ alloy_counters.stdout | default('no counters') }}
