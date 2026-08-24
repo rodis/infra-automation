@@ -8,8 +8,22 @@
       apt:
         update_cache: yes
 
+    # GUARDED. This was unconditional -- harmless on a first install, a landmine afterwards, since
+    # re-running this playbook for any reason reboots every node of the management plane and takes
+    # AWX and etcd with it. It nearly blocked a one-line etcd config change on 2026-08-24, because
+    # the only stack that could carry the change would have rebooted the cluster to deliver it.
+    #
+    # Same test the AWX verb `[62] General: Machines: Reboot if required` applies on the other
+    # clusters: reboot when the package manager asks for one, not on principle.
+    - name: has a reboot actually been requested?
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: kube_reboot_required
+      changed_when: false
+
     - name: reboot and wait for reboot to complete
       reboot:
+      when: kube_reboot_required.stat.exists
 
     - name: disable SWAP (Kubeadm requirement)
       shell: |
@@ -140,8 +154,22 @@
         name: net.ipv4.ip_forward
         value: 1
 
+    # GUARDED. This was unconditional -- harmless on a first install, a landmine afterwards, since
+    # re-running this playbook for any reason reboots every node of the management plane and takes
+    # AWX and etcd with it. It nearly blocked a one-line etcd config change on 2026-08-24, because
+    # the only stack that could carry the change would have rebooted the cluster to deliver it.
+    #
+    # Same test the AWX verb `[62] General: Machines: Reboot if required` applies on the other
+    # clusters: reboot when the package manager asks for one, not on principle.
+    - name: has a reboot actually been requested?
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: kube_reboot_required
+      changed_when: false
+
     - name: reboot and wait for reboot to complete
       reboot:
+      when: kube_reboot_required.stat.exists
 
 - hosts: kube_control_plane
   tasks:

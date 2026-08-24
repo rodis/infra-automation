@@ -1,0 +1,152 @@
+---
+# Tune etcd's backend commit batching for slow storage.
+#
+# WHY: the disks under these clusters are a network filesystem with another storage layer on top.
+# etcd fsyncs on every write and is therefore maximally sensitive to it -- measured on south,
+# 2026-08-24: WAL fsync p99 566ms against a 10ms healthy bar, backend commit p99 845ms, and ~2,800
+# "apply request took too long" lines every six hours. The disk is idle 88% of the time with a
+# queue depth of 0.27, so this is per-operation latency, not contention. See the storage substrate
+# section in infra-objectives/CLAUDE.md.
+#
+# WHAT: --backend-batch-interval, raised from etcd's default 100ms to 500ms. At 2.9 proposals/sec
+# the batch LIMIT is never the binding constraint -- etcd commits on the interval regardless, so
+# it is doing ~10 boltdb commits a second, nearly all of them almost empty, each one paying the
+# full fsync cost. At 500ms that becomes ~2. Fewer, larger syncs is exactly the right trade when
+# the problem is latency per operation rather than throughput.
+#
+# This does NOT help WAL fsync (the 566ms number). That is the raft log write path and is not
+# batched by this setting. Expect the backend commit figure to improve and the WAL figure not to.
+# Saying so up front so the result is graded honestly rather than talked into being a success.
+#
+# SAFETY: this edits a static pod manifest on the management plane's only control-plane node. A
+# broken manifest means no etcd, which means no Kubernetes API, which means no AWX. So: back up
+# first, verify etcd actually comes back, and restore automatically if it does not.
+#
+# Durability is unaffected. The WAL is the durability guarantee and is untouched; a larger backend
+# batch only means more WAL replay on an unclean start.
+#
+# Run it deliberately, on its own. It is NOT part of main.yml, because main.yml reboots the nodes.
+
+- name: Tune etcd backend batching
+  hosts: "{{ etcd_tuning_hosts | default('all') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    etcd_manifest: /etc/kubernetes/manifests/etcd.yaml
+    etcd_backup: /etc/kubernetes/etcd.yaml.bak-before-batch-tuning
+    etcd_batch_interval: 500ms
+    etcd_metrics_url: http://127.0.0.1:2381/metrics
+
+  tasks:
+
+    - name: Is this a control-plane node with an etcd manifest?
+      ansible.builtin.stat:
+        path: "{{ etcd_manifest }}"
+      register: etcd_manifest_stat
+      changed_when: false
+
+    - name: Everything below applies only there
+      when: etcd_manifest_stat.stat.exists
+      block:
+
+        - name: Confirm etcd is healthy BEFORE touching anything
+          ansible.builtin.uri:
+            url: "{{ etcd_metrics_url }}"
+            status_code: [200]
+            timeout: 10
+          changed_when: false
+
+        - name: Is the flag already set?
+          ansible.builtin.command:
+            argv: [grep, -c, "--backend-batch-interval", "{{ etcd_manifest }}"]
+          register: etcd_flag_present
+          changed_when: false
+          failed_when: false
+
+        - name: Apply the change
+          when: (etcd_flag_present.stdout | trim | int) == 0
+          block:
+
+            - name: Back up the manifest
+              ansible.builtin.copy:
+                src: "{{ etcd_manifest }}"
+                dest: "{{ etcd_backup }}"
+                remote_src: true
+                mode: "0600"
+
+            # Inserted after --snapshot-count, which kubeadm always emits, so the anchor exists and
+            # the new line lands inside the command list rather than at file scope.
+            - name: Add --backend-batch-interval
+              ansible.builtin.lineinfile:
+                path: "{{ etcd_manifest }}"
+                insertafter: '^\s+- --snapshot-count='
+                line: "    - --backend-batch-interval={{ etcd_batch_interval }}"
+                state: present
+
+            - name: Check the manifest still parses as YAML
+              ansible.builtin.command:
+                argv:
+                  - python3
+                  - -c
+                  - "import yaml,sys; yaml.safe_load(open(sys.argv[1]))"
+                  - "{{ etcd_manifest }}"
+              register: etcd_yaml_check
+              changed_when: false
+              failed_when: false
+
+            - name: Restore and stop if it does not
+              when: etcd_yaml_check.rc is defined and etcd_yaml_check.rc not in [0, 2]
+              block:
+                - ansible.builtin.copy:
+                    src: "{{ etcd_backup }}"
+                    dest: "{{ etcd_manifest }}"
+                    remote_src: true
+                    mode: "0600"
+                - ansible.builtin.fail:
+                    msg: "Manifest failed to parse after editing; original restored. {{ etcd_yaml_check.stderr | default('') }}"
+
+            # kubelet notices the manifest change and restarts the static pod by itself. That takes
+            # the API server down with it briefly, so the wait has to be generous and the failure
+            # has to be caught rather than reported.
+            - name: Wait for etcd to come back
+              ansible.builtin.uri:
+                url: "{{ etcd_metrics_url }}"
+                status_code: [200]
+                timeout: 5
+              register: etcd_back
+              retries: 30
+              delay: 10
+              until: etcd_back.status | default(0) == 200
+              changed_when: false
+              failed_when: false
+
+            - name: If it did not, put the old manifest back
+              when: (etcd_back.status | default(0)) != 200
+              block:
+                - ansible.builtin.copy:
+                    src: "{{ etcd_backup }}"
+                    dest: "{{ etcd_manifest }}"
+                    remote_src: true
+                    mode: "0600"
+                - ansible.builtin.uri:
+                    url: "{{ etcd_metrics_url }}"
+                    status_code: [200]
+                    timeout: 5
+                  retries: 30
+                  delay: 10
+                  register: etcd_rolled_back
+                  until: etcd_rolled_back.status | default(0) == 200
+                  changed_when: false
+                - ansible.builtin.fail:
+                    msg: >-
+                      etcd did not return after the change; the original manifest has been restored
+                      and etcd is serving again. The tuning was NOT applied.
+
+        - name: Report
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}:
+              {{ 'already tuned, nothing changed'
+                 if (etcd_flag_present.stdout | trim | int) > 0
+                 else 'backend-batch-interval=' ~ etcd_batch_interval ~ ' applied, etcd healthy' }}

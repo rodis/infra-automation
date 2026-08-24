@@ -407,6 +407,34 @@ loki.process "pods" {
   // containerd writes CRI format: "<rfc3339nano> <stdout|stderr> <F|P> <message>". Without this
   // every line arrives with that header glued to the front and the real message is unsearchable.
   stage.cri {}
+
+  // Drop etcd's chronic slow-storage chatter.
+  //
+  // Measured 2026-08-24: etcd produced 11,759 lines in six hours against 65 from everything else
+  // in kube-system and 5,525 from all of AWX -- 99.4% of the namespace's volume, from one
+  // container. Half of it is these four messages, repeating because the storage underneath is a
+  // network filesystem with another layer on top and etcd fsyncs on every write. See the storage
+  // substrate section in infra-objectives/CLAUDE.md.
+  //
+  // This loses no diagnostic ability, which is the only reason it is acceptable. The condition is
+  // fully visible in metrics we already collect -- etcd_disk_wal_fsync_duration_seconds and
+  // etcd_disk_backend_commit_duration_seconds carry the actual latencies as histograms, which is
+  // strictly better than counting log lines about them. What is dropped is the narration.
+  //
+  // Deliberately NOT dropped: compaction, hash storage, purges, rejected connections, leader
+  // changes, and anything at error level. Those are rare and each one means something.
+  //
+  // Scoped by filename because at this point in the pipeline the namespace/pod/container labels do
+  // not exist yet -- they are derived from the path in loki.relabel below.
+  stage.match {
+    selector = "{filename=~\".*/kube-system_etcd-.*\"}"
+
+    stage.drop {
+      expression          = "(apply request took too long|request stats|waiting for ReadIndex response took too long|slow fdatasync)"
+      drop_counter_reason = "etcd_chronic_slow_storage"
+    }
+  }
+
   forward_to = [loki.relabel.pods.receiver]
 }
 
