@@ -25,7 +25,31 @@
 # Durability is unaffected. The WAL is the durability guarantee and is untouched; a larger backend
 # batch only means more WAL replay on an unclean start.
 #
-# Run it deliberately, on its own. It is NOT part of main.yml, because main.yml reboots the nodes.
+# HOW TO RUN IT. Not part of main.yml -- main.yml reboots the nodes (now guarded, but still). It
+# is delivered as a Spacelift TASK on the "Ansible: south: Install Kube" stack, whose workspace has
+# the right inventory, key and contexts:
+#
+#   spacectl stack task --id emoji-gear-ansible-install-kubernetes-on-dev-cluster --tail \
+#     "chmod 600 /mnt/workspace/key; ansible-playbook etcd_tuning.yml --limit k8s_cluster \
+#      --ssh-extra-args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'"
+#
+# The two incantations are not superstition and took four attempts to find:
+#
+#   chmod 600     a custom task does NOT get the SSH setup a plan/apply phase gets. The key is
+#                 mounted with permissions ssh refuses to use, and every host comes back
+#                 UNREACHABLE with a wall of debug output that never names the real reason.
+#   StrictHostKey ansible.cfg here sets UserKnownHostsFile=/dev/null but not StrictHostKeyChecking,
+#                 so every host is permanently unknown and ssh tries to prompt.
+#   --limit       the inventory includes the Debian PostgreSQL VM, and this space connects as
+#                 `ubuntu`. Without the limit that host fails and takes the play's exit code
+#                 with it, even though this playbook has nothing to do there.
+#
+# VERIFYING IT. Do not trust "etcd answered on :2381" alone -- the endpoint never goes down if
+# kubelet has not picked the manifest up, so that check passes whether or not anything happened.
+# Confirm the flag is on the RUNNING process, and be aware that the mirror pod's startedAt lags:
+#
+#   sudo pgrep -a etcd | tr ' ' '\n' | grep backend-batch
+#   sudo journalctl -u kubelet | grep "didn't match the static Pod"
 
 - name: Tune etcd backend batching
   hosts: "{{ etcd_tuning_hosts | default('all') }}"
