@@ -29,12 +29,54 @@ postgresql_global_config_options:
   # CHANGING THIS REQUIRES A POSTGRESQL RESTART, which briefly drops every AWX connection.
   - option: max_connections
     value: 200
+  # Only FAILED logins are logged by default, which is exactly backwards for the question that
+  # matters. On 2026-08-23 we could count 138 rejected attempts precisely because they failed --
+  # and had one of them succeeded there would have been no record of it at all. An allowlist is
+  # only as good as the ability to notice it being defeated.
+  #
+  # log_disconnections is deliberately NOT enabled: it roughly doubles the line count for an
+  # estate whose logs now ship to a 50GB/month allowance, and answers a question nobody is asking.
+  - option: log_connections
+    value: 'on'
 postgresql_hba_entries:
   - {type: local, database: all, user: postgres, auth_method: peer}
   - {type: local, database: all, user: all, auth_method: peer}
   - {type: host, database: all, user: all, address: '127.0.0.1/32', auth_method: "{{ postgresql_auth_method }}"}
   - {type: host, database: all, user: all, address: '::1/128', auth_method: "{{ postgresql_auth_method }}"}
-  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '0.0.0.0/0', auth_method: "{{ postgresql_auth_method }}"}
+  # WAS 0.0.0.0/0. PostgreSQL listens on a public address because OpenStack networking here breaks
+  # private networks the moment a floating IP is attached, so every service on these machines is
+  # internet-facing whether it wants to be or not. On 2026-08-23 that produced 138 rejected logins
+  # in one day from five source addresses, guessing `postgres`, `wog` and `pgg_superadmins` -- and
+  # the only thing between the internet and the AWX database was the strength of one password.
+  #
+  # Filtering by network is not an option: the provider's public range is large and not ours to
+  # predict. What IS stable is the cluster -- three nodes, public IPs assigned directly to the
+  # machines rather than floated, and not autoscaled. So the allowlist is those three hosts.
+  #
+  # Verified before narrowing, rather than assumed: pg_stat_activity showed AWX connecting from
+  # 208.113.135.15 and 208.113.130.17, the two worker nodes, SNAT'd to the node address. master-1
+  # is included even though it currently connects from nowhere -- it carries the control-plane
+  # taint so no AWX pod schedules there today, and leaving it out would turn a future scheduling
+  # change into a database outage.
+  #
+  # What this list is coupled to, precisely, because "rebuilt" is ambiguous and the difference
+  # decides whether the coupling is safe:
+  #
+  #   openstack server rebuild   keeps the instance UUID and its PORTS, so the address survives --
+  #                              it swaps the disk image inside the same envelope.  Harmless here.
+  #   destroy and recreate       new instance, new port, new address.  This list goes stale and AWX
+  #     (terraform -replace)     loses its database until somebody updates it.
+  #
+  # The second is rung 3 of the escalation ladder in infra-objectives, and it is exactly what
+  # rule 7 forbids absolutely in `south`: never destroy a VM there, on any occasion. So hardcoding
+  # addresses is defensible in THIS tenant because the operation that would invalidate them is
+  # already prohibited -- not because addresses are inherently stable.
+  #
+  # Do not copy this pattern to west, east or north. Those tenants are rebuilt routinely, by
+  # design, and an allowlist of instance addresses there would be a trap rather than a control.
+  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.131.96/32', auth_method: "{{ postgresql_auth_method }}"}
+  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.135.15/32', auth_method: "{{ postgresql_auth_method }}"}
+  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.130.17/32', auth_method: "{{ postgresql_auth_method }}"}
 postgresql_privs:
   - db: "{{ lookup('env', 'DB_NAME') }}"
     roles: "{{ lookup('env', 'DB_USER') }}"
