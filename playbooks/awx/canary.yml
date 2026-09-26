@@ -1,0 +1,50 @@
+---
+# AWX canary: proves AWX can execute a job, end to end, while touching no machine.
+#
+# WHY THIS EXISTS
+#
+# Every status AWX reports can be green while it is unable to run anything: /api/v2/ping answers,
+# instances report capacity, heartbeats are fresh — and the next launch still dies on Receptor, on
+# pod creation, on an image pull, or on a project sync. On 2026-09-26 no playbook job had run for
+# a month, so nothing had proved in that time that AWX could still do the one thing it is for.
+#
+# A job from this template exercises the whole path an objective's verb takes: launch, project
+# sync from rodis/infra-automation (the project updates on launch), a container-group pod, the
+# pinned execution environment, and a play reporting per-host events. Any of those failing fails
+# this job.
+#
+# WHAT IT TARGETS
+#
+# The inventory `General: AWX: Canary`, holding one host, `localhost`, with ansible_connection=local.
+# "Local" is the EE pod itself, so the play runs where every job runs and reaches no machine. That
+# keeps the verdict about AWX alone: it does not go false because west is mid-rebuild.
+#
+# HOW TO READ THE RESULT
+#
+# Grade on the job's EVENTS, not its status — `runner_on_ok` for localhost on every task, and no
+# failed/unreachable. CLAUDE.md rule 8, amended 2026-08-23: a job has reported `error` while every
+# host was ok. And the play asserts it matched exactly one host, because a play that matches none
+# succeeds having run nothing.
+#
+# Read-only. Safe to run as often as wanted; it changes nothing anywhere.
+
+- name: AWX canary
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Refuse to pass on an empty or wrong host pattern
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | length == 1
+          - inventory_hostname == 'localhost'
+        fail_msg: >-
+          The canary matched {{ ansible_play_hosts_all | length }} host(s), {{ ansible_play_hosts_all }}.
+          It must run against exactly `localhost` in `General: AWX: Canary`; anything else means the
+          job was launched against the wrong inventory and proves nothing.
+
+    - name: Execute a module in the execution environment
+      ansible.builtin.ping:
+
+    - name: Report what ran
+      ansible.builtin.debug:
+        msg: "ansible {{ ansible_version.full }} under {{ ansible_playbook_python }}"
