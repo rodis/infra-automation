@@ -30,3 +30,55 @@ ksm_resources:
   - daemonsets
   - jobs
   - persistentvolumeclaims
+  # Added 2026-09-27 so platform-healthy can read the IngressClass and every Ingress host from
+  # Grafana rather than over SSH (infra-objectives CLAUDE.md, "Unattended checks never use SSH").
+  - ingresses
+  - ingressclasses
+
+# Object labels KSM exports as `kube_<kind>_labels`. Only these two, and only because
+# platform-healthy compares them with the pins in helm-override-files: the Traefik chart version and
+# the cert-manager version.
+ksm_metric_labels_allowlist: "daemonsets=[helm.sh/chart],deployments=[app.kubernetes.io/version]"
+
+# Custom-resource metrics for the three kinds platform-healthy grades — each exported as
+# kube_customresource_<name>. Conditions become one series per condition type (1 = True, 0 = False);
+# notAfter and renewalTime are RFC3339 strings, which KSM turns into Unix timestamps. Read-only on all
+# three; nothing here touches a Secret (the DopplerSecret predicate was amended for that reason).
+ksm_custom_resource_state:
+  kind: CustomResourceStateMetrics
+  spec:
+    resources:
+      - groupVersionKind: {group: cert-manager.io, version: v1, kind: Certificate}
+        labelsFromPath: {name: [metadata, name], namespace: [metadata, namespace]}
+        metrics:
+          - name: certificate_condition
+            help: "cert-manager Certificate status conditions (1 = True)"
+            each:
+              type: Gauge
+              gauge: {path: [status, conditions], labelsFromPath: {type: [type]}, valueFrom: [status]}
+          - name: certificate_not_after
+            help: "cert-manager Certificate expiry (status.notAfter) as a Unix timestamp"
+            each:
+              type: Gauge
+              gauge: {path: [status], valueFrom: [notAfter]}
+          - name: certificate_renewal_time
+            help: "cert-manager Certificate renewal time (status.renewalTime) as a Unix timestamp"
+            each:
+              type: Gauge
+              gauge: {path: [status], valueFrom: [renewalTime]}
+      - groupVersionKind: {group: cert-manager.io, version: v1, kind: ClusterIssuer}
+        labelsFromPath: {name: [metadata, name]}
+        metrics:
+          - name: clusterissuer_condition
+            help: "cert-manager ClusterIssuer status conditions (1 = True)"
+            each:
+              type: Gauge
+              gauge: {path: [status, conditions], labelsFromPath: {type: [type]}, valueFrom: [status]}
+      - groupVersionKind: {group: secrets.doppler.com, version: v1alpha1, kind: DopplerSecret}
+        labelsFromPath: {name: [metadata, name], namespace: [metadata, namespace]}
+        metrics:
+          - name: dopplersecret_condition
+            help: "Doppler operator DopplerSecret status conditions (1 = True)"
+            each:
+              type: Gauge
+              gauge: {path: [status, conditions], labelsFromPath: {type: [type]}, valueFrom: [status]}
