@@ -66,10 +66,11 @@
     watcher_workspaces: [infra, production, development]
 
   handlers:
+    # "[d]agu": as a regex it still matches Dagu, but not the literal text in this handler's own
+    # command line. Without the brackets, pkill -f matched and killed the handler (rc -15, job 3733).
+    # (Kept out of the shell text: a quote in a comment there breaks Ansible's argument splitting.)
     - name: Restart dagu
       ansible.builtin.shell: |
-        # "[d]agu": the regex still matches Dagu, but not this shell's own command line — without the
-        # brackets pkill -f matched and killed the handler itself (rc -15, job 3733).
         pkill -u "$(id -u)" -f "{{ watcher_bin }}/[d]agu start-all" || true
         sleep 2
         {{ watcher_home }}/watchdog.sh
