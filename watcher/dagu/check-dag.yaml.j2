@@ -1,0 +1,49 @@
+# Rendered by playbooks/watcher/install.yml from watcher/dagu/check-dag.yaml.j2 — edit the template.
+description: >
+  {{ item.description }}
+  Exit 0 satisfied, 1 a finding, 2 the facts could not be established — the failed step's name says
+  which, and that name is what reaches Telegram.
+labels: [workspace={{ item.workspace }}]
+schedule: "{{ item.schedule }}"
+
+steps:
+  # The 1Password API specifically: run.sh cannot resolve a single credential without it.
+  - id: wait_for_network
+    command: curl -sS -o /dev/null --max-time 10 https://my.1password.com
+    retry_policy: {limit: 30, interval_sec: 60}
+
+  # The pins the checks compare against, and AWX's task_replicas. A failed pull leaves yesterday's
+  # clone in place — stale pins are still pins — so it never fails the run.
+  - id: refresh_pins
+    depends: [wait_for_network]
+    command: git -C {{ watcher_home }}/helm-override-files pull --ff-only -q
+    continue_on: {failure: true}
+
+  # Always exits 0 so its full report stays readable; the verdict steps below carry the result.
+  # No retry: a retry only repeats a finding and spends 1Password quota (run.sh).
+  - id: {{ item.step }}
+    depends: [refresh_pins]
+    timeout_sec: 1800
+    command: sh -c './run.sh python3 -u checks/{{ item.script }}; echo $? > "/tmp/dagu-verdict-${DAG_RUN_ID}"'
+
+  - id: finding
+    depends: [{{ item.step }}]
+    preconditions:
+      - condition: 'test "$(cat /tmp/dagu-verdict-${DAG_RUN_ID})" = 1'
+    command: sh -c 'echo "FINDING — a success predicate is false. Read the {{ item.step }} step log."; exit 1'
+
+  - id: facts_not_established
+    depends: [{{ item.step }}]
+    preconditions:
+      - condition: 'test "$(cat /tmp/dagu-verdict-${DAG_RUN_ID})" = 2'
+    command: sh -c 'echo "FACTS NOT ESTABLISHED — the check could not see (rule 8). Not evidence about the estate."; exit 1'
+
+  - id: check_broken
+    depends: [{{ item.step }}]
+    preconditions:
+      - condition: 'test "$(cat /tmp/dagu-verdict-${DAG_RUN_ID})" -gt 2'
+    command: sh -c 'echo "CHECK BROKEN — the checker itself crashed or was not found."; exit 1'
+
+handler_on:
+  exit:
+    command: rm -f "/tmp/dagu-verdict-${DAG_RUN_ID}"

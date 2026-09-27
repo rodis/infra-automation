@@ -1,0 +1,10 @@
+# Dagu server config for the watcher — rendered by playbooks/watcher/install.yml.
+# Loopback only: this Managed VPS has no firewall, and DreamHost's own services already listen on its
+# public interface. The UI is reached through an SSH tunnel.
+host: 127.0.0.1
+port: {{ watcher_dagu_port }}
+# "07:00" means the owner's 07:00, as it did on the Mac; the VPS clock is not in that zone.
+tz: {{ watcher_tz }}
+# DAG files are symlinks into {{ watcher_home }}/dagu; Dagu refuses external symlinks without this.
+dag_discovery:
+  symlinks: true

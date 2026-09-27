@@ -1,0 +1,11 @@
+# Defaults for every DAG labelled workspace={{ item }}. Layered: global base.yaml -> this -> the DAG.
+working_dir: {{ watcher_home }}
+env:
+  - ESTATE_WORKSPACE: {{ item }}
+  # Where the checkers read the version pins and AWX's task_replicas: a read-only public clone.
+  - HELM_OVERRIDE_FILES: {{ watcher_home }}/helm-override-files
+# Checks only read, so a missed run is run late rather than skipped; "latest" folds several into one.
+catchup_window: 16h
+overlap_policy: latest
+hist_retention_days: 90
+timeout_sec: 3600

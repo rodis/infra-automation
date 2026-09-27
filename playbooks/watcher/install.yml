@@ -1,0 +1,292 @@
+---
+# Install (or upgrade — it is idempotent) the watcher: Dagu running the estate's scheduled checks on
+# the DreamHost VPS, alerting to Telegram.
+#
+# WHY IT IS SHAPED THIS WAY
+#
+# - AWX may BUILD the watcher; the watcher must never NEED AWX to run. Everything installed here runs
+#   on its own once installed, so an AWX outage — the moment the watcher matters — does not touch it.
+#   Re-provisioning needs AWX, and for that case this playbook also runs directly with
+#   ansible-playbook from the owner's Mac.
+# - The VPS is a DreamHost Managed VPS: no root, no sudo, no firewall, and user systemd units stop at
+#   logout. So everything is user-level (`become: false`), Dagu listens on 127.0.0.1 only, and cron
+#   is the supervisor.
+# - The bootstrap secret (the `watcher-vps` 1Password service-account token) is placed BY HAND by the
+#   owner and never passes through this playbook, so it is not in AWX's job history. The playbook
+#   refuses to proceed without it.
+# - The checks read Grafana and AWX only — never SSH — with the narrow credentials in vault `watcher`.
+#
+# WHAT IS LEFT TO THE OWNER, IN THE DAGU UI (through an SSH tunnel), AFTER THE FIRST RUN
+#   the admin login, the three workspaces (Dagu keeps them in its store — labels alone do nothing),
+#   and the Telegram channel + infra rule (the bot token is typed by the owner).
+#
+# Graded on the installed thing, not on this play's exit status: Dagu answering on loopback, the DAGs
+# listed with next-run times, and nothing listening publicly on Dagu's port.
+
+- name: Install the watcher
+  hosts: all
+  become: false
+  gather_facts: true
+  vars:
+    watcher_home: "{{ ansible_env.HOME }}/watcher"
+    watcher_bin: "{{ ansible_env.HOME }}/bin"
+    watcher_dagu_config_dir: "{{ ansible_env.HOME }}/.config/dagu"
+    watcher_token_file: "{{ ansible_env.HOME }}/.config/watcher/op-token"
+    watcher_dagu_port: 8080
+    watcher_tz: Europe/Zurich
+    watcher_src: "{{ playbook_dir }}/../../watcher"
+
+    # Pinned, with checksums verified against the published checksums.txt (Dagu) and computed from the
+    # official download (op, which publishes signatures rather than a checksum file), 2026-09-27.
+    # Same versions as the Mac.
+    watcher_dagu_version: "2.17.2"
+    watcher_dagu_sha256: "404f61946d57896f0c8aa90a95d925d32de33beaae0492a744473bc11de2b463"
+    watcher_op_version: "2.35.0"
+    watcher_op_sha256: "4457ade59850b852c64c77164235b34dd0b984ef7826eb0ccd32f1fd78a2ceb7"
+
+    watcher_checks:
+      - name: infra-check-cluster-status
+        workspace: infra
+        schedule: "0 7 * * *"
+        step: estate_status
+        script: estate-status.py
+        description: "The management plane's overall status — checks/estate-status.py: collectors, hosts, etcd, kube-state, PostgreSQL, AWX, logs. Read-only."
+      - name: infra-check-awx-status
+        workspace: infra
+        schedule: "15 7 * * *"
+        step: awx_healthy
+        script: check-awx-status.py
+        description: "Evaluates objective awx-healthy — can AWX execute a job right now, and can its database serve it. Launches the read-only canary [68]; changes nothing else."
+      - name: infra-check-platform-status
+        workspace: infra
+        schedule: "30 7 * * *"
+        step: platform_healthy
+        script: check-platform-status.py infra
+        description: "Evaluates objective platform-healthy for infra — Traefik, cert-manager and the Doppler operator, read from kube-state-metrics in Grafana plus public HTTPS probes."
+    watcher_workspaces: [infra, production, development]
+
+  handlers:
+    - name: Restart dagu
+      ansible.builtin.shell: |
+        pkill -u "$(id -u)" -f "{{ watcher_bin }}/dagu start-all" || true
+        sleep 2
+        {{ watcher_home }}/watchdog.sh
+      changed_when: true
+
+  tasks:
+    - name: Look for the hand-placed 1Password token
+      ansible.builtin.stat:
+        path: "{{ watcher_token_file }}"
+      register: watcher_token
+
+    - name: Refuse to install without it
+      ansible.builtin.assert:
+        that:
+          - watcher_token.stat.exists
+          - watcher_token.stat.mode == '0600'
+        fail_msg: >-
+          The watcher-vps token must be at {{ watcher_token_file }} with mode 600, placed by the owner
+          by hand (it is deliberately not carried by this playbook). Then re-run.
+        quiet: true
+
+    - name: Create directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ watcher_bin }}"
+        - "{{ watcher_home }}"
+        - "{{ watcher_home }}/checks"
+        - "{{ watcher_home }}/dagu"
+        - "{{ watcher_home }}/logs"
+        - "{{ watcher_home }}/downloads"
+        - "{{ watcher_dagu_config_dir }}/dags"
+
+    - name: Download Dagu {{ watcher_dagu_version }}
+      ansible.builtin.get_url:
+        url: "https://github.com/dagucloud/dagu/releases/download/v{{ watcher_dagu_version }}/dagu_{{ watcher_dagu_version }}_linux_amd64.tar.gz"
+        dest: "{{ watcher_home }}/downloads/dagu_{{ watcher_dagu_version }}.tar.gz"
+        checksum: "sha256:{{ watcher_dagu_sha256 }}"
+        mode: "0600"
+
+    - name: Unpack Dagu
+      ansible.builtin.unarchive:
+        src: "{{ watcher_home }}/downloads/dagu_{{ watcher_dagu_version }}.tar.gz"
+        dest: "{{ watcher_home }}/downloads"
+        remote_src: true
+        include: [dagu]
+        creates: "{{ watcher_home }}/downloads/dagu"
+
+    - name: Install Dagu into ~/bin
+      ansible.builtin.copy:
+        src: "{{ watcher_home }}/downloads/dagu"
+        dest: "{{ watcher_bin }}/dagu"
+        remote_src: true
+        mode: "0755"
+      notify: Restart dagu
+
+    - name: Download op {{ watcher_op_version }}
+      ansible.builtin.get_url:
+        url: "https://cache.agilebits.com/dist/1P/op2/pkg/v{{ watcher_op_version }}/op_linux_amd64_v{{ watcher_op_version }}.zip"
+        dest: "{{ watcher_home }}/downloads/op_{{ watcher_op_version }}.zip"
+        checksum: "sha256:{{ watcher_op_sha256 }}"
+        mode: "0600"
+
+    - name: Unpack op
+      ansible.builtin.unarchive:
+        src: "{{ watcher_home }}/downloads/op_{{ watcher_op_version }}.zip"
+        dest: "{{ watcher_home }}/downloads"
+        remote_src: true
+        include: [op]
+        creates: "{{ watcher_home }}/downloads/op"
+
+    - name: Install op into ~/bin
+      ansible.builtin.copy:
+        src: "{{ watcher_home }}/downloads/op"
+        dest: "{{ watcher_bin }}/op"
+        remote_src: true
+        mode: "0755"
+
+    - name: Install the checks
+      ansible.builtin.copy:
+        src: "{{ watcher_src }}/checks/"
+        dest: "{{ watcher_home }}/checks/"
+        mode: "0600"
+
+    - name: Install run.sh, watchdog.sh and watcher.env
+      ansible.builtin.copy:
+        src: "{{ watcher_src }}/{{ item.name }}"
+        dest: "{{ watcher_home }}/{{ item.name }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - {name: run.sh, mode: "0700"}
+        - {name: watchdog.sh, mode: "0700"}
+        - {name: watcher.env, mode: "0600"}
+
+    - name: Clone helm-override-files (public, read-only — the pins and AWX's task_replicas)
+      ansible.builtin.git:
+        repo: https://github.com/rodis/helm-override-files.git
+        dest: "{{ watcher_home }}/helm-override-files"
+        version: main
+        depth: 1
+        update: true
+
+    # Before Dagu's first start: it writes example DAGs unless this marker exists.
+    - name: Skip Dagu's example DAGs
+      ansible.builtin.copy:
+        content: ""
+        dest: "{{ watcher_dagu_config_dir }}/dags/.examples-created"
+        force: false
+        mode: "0600"
+
+    - name: Dagu server config
+      ansible.builtin.template:
+        src: "{{ watcher_src }}/dagu/config.yaml.j2"
+        dest: "{{ watcher_dagu_config_dir }}/config.yaml"
+        mode: "0600"
+      notify: Restart dagu
+
+    - name: Render the workspace bases
+      ansible.builtin.template:
+        src: "{{ watcher_src }}/dagu/workspace-base.yaml.j2"
+        dest: "{{ watcher_home }}/dagu/workspace-{{ item }}.yaml"
+        mode: "0600"
+      loop: "{{ watcher_workspaces }}"
+
+    - name: Workspace base directories in Dagu
+      ansible.builtin.file:
+        path: "{{ watcher_dagu_config_dir }}/dags/workspaces/{{ item }}"
+        state: directory
+        mode: "0700"
+      loop: "{{ watcher_workspaces }}"
+
+    - name: Link the workspace bases
+      ansible.builtin.file:
+        src: "{{ watcher_home }}/dagu/workspace-{{ item }}.yaml"
+        dest: "{{ watcher_dagu_config_dir }}/dags/workspaces/{{ item }}/base.yaml"
+        state: link
+      loop: "{{ watcher_workspaces }}"
+
+    - name: Render the check DAGs
+      ansible.builtin.template:
+        src: "{{ watcher_src }}/dagu/check-dag.yaml.j2"
+        dest: "{{ watcher_home }}/dagu/{{ item.name }}.yaml"
+        mode: "0600"
+      loop: "{{ watcher_checks }}"
+      loop_control: {label: "{{ item.name }}"}
+
+    - name: Link the check DAGs
+      ansible.builtin.file:
+        src: "{{ watcher_home }}/dagu/{{ item.name }}.yaml"
+        dest: "{{ watcher_dagu_config_dir }}/dags/{{ item.name }}.yaml"
+        state: link
+      loop: "{{ watcher_checks }}"
+      loop_control: {label: "{{ item.name }}"}
+
+    - name: Validate every rendered DAG with Dagu itself
+      ansible.builtin.command:
+        argv: ["{{ watcher_bin }}/dagu", "validate", "{{ watcher_home }}/dagu/{{ item.name }}.yaml"]
+      loop: "{{ watcher_checks }}"
+      loop_control: {label: "{{ item.name }}"}
+      changed_when: false
+
+    - name: Cron supervises Dagu — every 5 minutes
+      ansible.builtin.cron:
+        name: "watcher: keep dagu running"
+        minute: "*/5"
+        job: "{{ watcher_home }}/watchdog.sh"
+
+    - name: Cron supervises Dagu — at boot
+      ansible.builtin.cron:
+        name: "watcher: start dagu at boot"
+        special_time: reboot
+        job: "{{ watcher_home }}/watchdog.sh"
+
+    - name: Apply pending restarts
+      ansible.builtin.meta: flush_handlers
+
+    - name: Make sure Dagu is running (idempotent)
+      ansible.builtin.command: "{{ watcher_home }}/watchdog.sh"
+      changed_when: false
+
+    # ---- Graded on the installed thing ----
+    - name: Dagu answers on loopback
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ watcher_dagu_port }}/"
+        status_code: [200, 302]
+      register: watcher_ui
+      retries: 12
+      delay: 5
+      until: watcher_ui.status in [200, 302]
+
+    - name: Nothing listens publicly on Dagu's port
+      ansible.builtin.command: ss -ltn
+      register: watcher_listen
+      changed_when: false
+
+    - name: Assert Dagu is bound to loopback only
+      ansible.builtin.assert:
+        that:
+          - watcher_listen.stdout is search('127\.0\.0\.1:' ~ watcher_dagu_port)
+          - watcher_listen.stdout is not search('(0\.0\.0\.0|\*|\[::\]):' ~ watcher_dagu_port ~ '\s')
+        fail_msg: "Dagu must listen on 127.0.0.1:{{ watcher_dagu_port }} and nowhere else — this box has no firewall."
+        quiet: true
+
+    - name: List the DAGs Dagu sees
+      ansible.builtin.command:
+        argv: ["{{ watcher_bin }}/dagu", "ls", "-n"]
+      register: watcher_ls
+      changed_when: false
+
+    - name: Assert every check DAG is scheduled
+      ansible.builtin.assert:
+        that: watcher_ls.stdout is search(item.name ~ '\s+\d{4}-\d{2}-\d{2}T')
+        fail_msg: "{{ item.name }} is not listed with a next-run time:\n{{ watcher_ls.stdout }}"
+        quiet: true
+      loop: "{{ watcher_checks }}"
+      loop_control: {label: "{{ item.name }}"}
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "Watcher installed: Dagu {{ watcher_dagu_version }} on 127.0.0.1:{{ watcher_dagu_port }}, {{ watcher_checks | length }} checks scheduled ({{ watcher_tz }}). Next: the owner's UI steps through an SSH tunnel."
