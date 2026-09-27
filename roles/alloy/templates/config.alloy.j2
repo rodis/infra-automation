@@ -276,6 +276,20 @@ prometheus.relabel "etcd_keep" {
 prometheus.exporter.postgres "pg" {
   // No password: peer auth over the unix socket. See defaults/main.yml.
   data_source_names = ["postgresql:///postgres?host={{ alloy_postgres_socket_dir }}&user={{ alloy_postgres_role }}&sslmode=disable"]
+
+  // enabled_collectors REPLACES the default set rather than adding to it, so this lists all eleven
+  // upstream defaults (as reported by pg_scrape_collector_success on 2026-09-27) plus one.
+  // Naming only the new collector would silently switch off connections, locks and database
+  // stats, which dashboards and awx-healthy grade on.
+  //
+  // database_wraparound is the addition: transaction ID age per database, which awx-healthy gates
+  // on (at the limit PostgreSQL refuses writes). It used to be read over SSH; unattended checks no
+  // longer use SSH (infra-objectives CLAUDE.md, "Unattended checks never use SSH").
+  enabled_collectors = [
+    "database", "locks", "replication", "replication_slot", "roles", "stat_bgwriter",
+    "stat_database", "stat_progress_vacuum", "stat_user_tables", "statio_user_tables", "wal",
+    "database_wraparound",
+  ]
 }
 
 discovery.relabel "pg" {
@@ -302,7 +316,11 @@ prometheus.relabel "postgres_keep" {
 
   rule {
     source_labels = ["__name__"]
-    regex  = "up|pg_up|pg_settings_max_connections|pg_settings_superuser_reserved_connections|pg_settings_shared_buffers_bytes|pg_settings_work_mem_bytes|pg_settings_effective_cache_size_bytes|pg_stat_database_numbackends|pg_stat_database_(xact_commit|xact_rollback|blks_read|blks_hit|conflicts|deadlocks|temp_files|temp_bytes)|pg_stat_bgwriter_.+|pg_locks_count|pg_database_size_bytes|pg_exporter_last_scrape_error|pg_exporter_scrapes_total"
+    // pg_stat_activity_* and the wraparound age were added 2026-09-27 so awx-healthy can read idle-in-
+    // transaction, the oldest open transaction and XID age from here instead of over SSH: ~60
+    // series (4 databases x 7 session states x 2, plus 4). The wraparound metric's `_seconds`
+    // suffix is an upstream misnomer — its value is age(datfrozenxid), a transaction COUNT.
+    regex  = "up|pg_up|pg_settings_max_connections|pg_settings_superuser_reserved_connections|pg_settings_shared_buffers_bytes|pg_settings_work_mem_bytes|pg_settings_effective_cache_size_bytes|pg_stat_database_numbackends|pg_stat_database_(xact_commit|xact_rollback|blks_read|blks_hit|conflicts|deadlocks|temp_files|temp_bytes)|pg_stat_bgwriter_.+|pg_locks_count|pg_database_size_bytes|pg_exporter_last_scrape_error|pg_exporter_scrapes_total|pg_stat_activity_count|pg_stat_activity_max_tx_duration|pg_database_wraparound_age_datfrozenxid_seconds"
     action = "keep"
   }
 }
