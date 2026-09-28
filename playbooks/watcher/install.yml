@@ -44,22 +44,26 @@
     watcher_op_version: "2.35.0"
     watcher_op_sha256: "4457ade59850b852c64c77164235b34dd0b984ef7826eb0ccd32f1fd78a2ceb7"
 
+    # Hourly, clustered one minute apart (2026-09-28). Daily was a laptop constraint, not a
+    # monitoring choice. Clustered so the first run warms op's cache and the next two ride on it
+    # (measured on the VPS: a cached run costs 0 requests, an uncached one 2); one minute apart rather
+    # than the same minute, so they do not all miss the cache at once. flock serialises the pins pull.
     watcher_checks:
       - name: infra-check-cluster-status
         workspace: infra
-        schedule: "0 7 * * *"
+        schedule: "0 * * * *"
         step: estate_status
         script: estate-status.py
         description: "The management plane's overall status — checks/estate-status.py: collectors, hosts, etcd, kube-state, PostgreSQL, AWX, logs. Read-only."
       - name: infra-check-awx-status
         workspace: infra
-        schedule: "15 7 * * *"
+        schedule: "1 * * * *"
         step: awx_healthy
         script: check-awx-status.py
         description: "Evaluates objective awx-healthy — can AWX execute a job right now, and can its database serve it. Launches the read-only canary [68]; changes nothing else."
       - name: infra-check-platform-status
         workspace: infra
-        schedule: "30 7 * * *"
+        schedule: "2 * * * *"
         step: platform_healthy
         script: check-platform-status.py infra
         description: "Evaluates objective platform-healthy for infra — Traefik, cert-manager and the Doppler operator, read from kube-state-metrics in Grafana plus public HTTPS probes."
