@@ -19,6 +19,8 @@ Three rules it tries hard to honour, all of them learned the hard way in this re
 """
 import json, os, sys, time, urllib.error, urllib.parse, urllib.request
 
+from grafana_wake import wake
+
 GRAFANA = (os.environ.get("GRAFANA_URL") or "").rstrip("/")
 TOKEN   = os.environ.get("GRAFANA_TOKEN") or ""
 AWX     = (os.environ.get("CONTROLLER_HOST") or "").rstrip("/")
@@ -77,34 +79,6 @@ def _get(path, params):
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
-
-
-def wake_grafana(wait=180, every=10):
-    """A free Grafana Cloud stack spins down when idle and answers {"code":"Loading"} while it wakes.
-
-    Without this the first sweep after a quiet spell reports CANNOT REACH GRAFANA -- a broken
-    monitoring path -- when the stack was merely asleep and our own request is what woke it.
-    Returns True if the stack had to be woken. Anything other than "Loading" is left for the
-    collectors check to report, so a genuinely broken path still fails loudly.
-    """
-    woke, deadline = False, time.monotonic() + wait
-    while True:
-        try:
-            with urllib.request.urlopen(f"{GRAFANA}/api/health", timeout=15):
-                return woke
-        except urllib.error.HTTPError as e:
-            try:
-                loading = json.load(e).get("code") == "Loading"
-            except Exception:
-                loading = False
-        except Exception:
-            loading = False
-        if not loading or time.monotonic() > deadline:
-            return woke
-        if not woke:
-            print(f"   grafana stack is asleep; waiting up to {wait}s for it to wake ...")
-        woke = True
-        time.sleep(every)
 
 
 def promq(expr):
@@ -216,7 +190,7 @@ print("=" * 70)
 
 # ------------------------------------------------- 1. can we see at all? -----
 section("1. COLLECTORS  -- read this first; everything below depends on it")
-if wake_grafana():
+if wake(GRAFANA, TOKEN):
     print("   grafana stack was asleep and has woken (free tier idles; not a fault)")
 targets = promq(f'up{{{HOST_SEL}}} or up{{{KSM_SEL}}}' + (' or up{job="awx"}' if 'awx' in T_['sections'] else ''))
 if isinstance(targets, tuple) and targets[0] == "ERROR":

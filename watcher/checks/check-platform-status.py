@@ -17,6 +17,8 @@ than grant `list secrets`, which returns the values.
 """
 import datetime, json, os, re, ssl, sys, urllib.error, urllib.parse, urllib.request
 
+from grafana_wake import wake
+
 # infra reads south's kube-state-metrics in Grafana. production, when added, reads through AWX jobs
 # (task production-cluster-check) — never SSH.
 # ksm: the `instance` label kube-state-metrics series carry for that cluster — every query is scoped to
@@ -85,6 +87,8 @@ def facts_from_grafana(ksm):
     if not (G and T):
         raise RuntimeError("GRAFANA_URL / GRAFANA_TOKEN not set — run through ./agent/run.sh")
 
+    if wake(G, T):
+        print("  grafana stack was asleep and has woken (free tier idles; not a fault)")
     sel = f'instance="{ksm}"'
 
     def q(expr):

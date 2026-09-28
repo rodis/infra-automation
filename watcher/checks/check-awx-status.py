@@ -23,6 +23,8 @@ read further, stop, report.
 import datetime, json, os, re, socket, ssl, sys, time
 import urllib.error, urllib.parse, urllib.request
 
+from grafana_wake import wake
+
 GRAFANA = (os.environ.get("GRAFANA_URL") or "").rstrip("/")
 GRAFANA = GRAFANA if GRAFANA.startswith("http") or not GRAFANA else "https://" + GRAFANA
 GTOKEN  = os.environ.get("GRAFANA_TOKEN") or ""
@@ -113,6 +115,8 @@ if not (GRAFANA and GTOKEN and AWX and AWXTOK):
     sys.exit(2)
 
 section("1. freshness — nothing below is trusted on stale data")
+if wake(GRAFANA, GTOKEN):
+    print("  grafana stack was asleep and has woken (free tier idles; not a fault)")
 def _fresh():
     ages = {j: prom(f'time() - timestamp({q})') for j, q in (("awx", 'up{job="awx"}'), ("postgres", f"pg_up{{{PGSEL}}}"))}
     missing = [j for j, a in ages.items() if a is None]
