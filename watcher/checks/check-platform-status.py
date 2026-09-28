@@ -21,7 +21,11 @@ import datetime, json, os, re, ssl, sys, urllib.error, urllib.parse, urllib.requ
 # (task production-cluster-check) — never SSH.
 # ksm: the `instance` label kube-state-metrics series carry for that cluster — every query is scoped to
 # it, because several clusters share one Grafana stack.
-TARGETS = {"infra": {"ksm": "k8s-south"}}
+TARGETS = {
+    "infra": {"ksm": "k8s-south"},
+    # Same approved predicates (owner's standing approval, 2026-09-28: production copies infra's).
+    "production": {"ksm": "k8s-production"},
+}
 # The pins live in helm-override-files. On the VPS they must be shipped with the checker.
 HOF = os.environ.get("HELM_OVERRIDE_FILES", os.path.expanduser("~/Development/personal/helm-override-files"))
 ISSUERS = ["letsencrypt-prod", "letsencrypt-staging"]
