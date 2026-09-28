@@ -245,16 +245,47 @@ prometheus.relabel "etcd_keep" {
 }
 {% endif %}
 {% if alloy_has_apiserver | default(false) %}
+// API server readiness — filled in 2026-09-28; this block used to be empty ("a follow-up").
+//
+// /readyz is readable anonymously (system:public-info-viewer), so this needs no token and no
+// ServiceAccount. It matters most on production, where etcd is a single dedicated member that serves
+// its metrics only over TLS with a client certificate — and that certificate is full read-write
+// access to the cluster's data, which a metrics collector must not hold. /readyz includes the API
+// server's own etcd check ("[+]etcd ok"), so probe_success here answers "can this control plane
+// reach etcd", from every control-plane node, without that certificate.
+prometheus.exporter.blackbox "apiserver" {
+  config = "{ modules: { readyz: { prober: http, timeout: 5s, http: { valid_status_codes: [200], tls_config: { insecure_skip_verify: true } } } } }"
 
-// The API server answered /healthz, but there is deliberately NO scrape for it.
-//
-// /healthz returns the string "ok", not Prometheus exposition format, so prometheus.scrape can
-// never parse it and produces up{job="kube-apiserver"} = 0 forever — a permanent zero that reads
-// exactly like a dead control plane. A metric that is always wrong is worse than a missing one.
-//
-// Liveness of an endpoint that does not speak Prometheus is a job for a blackbox probe
-// (prometheus.exporter.blackbox), and the API server's real /metrics needs a bearer token, which
-// means the in-cluster ServiceAccount from the infra-observability policy. Both are follow-ups.
+  target {
+    name    = "readyz"
+    address = "https://127.0.0.1:6443/readyz"
+    module  = "readyz"
+  }
+}
+
+discovery.relabel "apiserver" {
+  targets = prometheus.exporter.blackbox.apiserver.targets
+  rule {
+    target_label = "instance"
+    replacement  = "{{ inventory_hostname }}"
+  }
+}
+
+prometheus.scrape "apiserver" {
+  targets         = discovery.relabel.apiserver.output
+  scrape_interval = "{{ alloy_scrape_interval }}"
+  job_name        = "apiserver"
+  forward_to      = [prometheus.relabel.apiserver_keep.receiver]
+}
+
+prometheus.relabel "apiserver_keep" {
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+  rule {
+    source_labels = ["__name__"]
+    regex  = "probe_success|probe_duration_seconds|probe_http_status_code"
+    action = "keep"
+  }
+}
 {% endif %}
 {% if alloy_has_postgres | default(false) %}
 

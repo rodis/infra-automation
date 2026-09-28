@@ -33,7 +33,7 @@ alloy_awx_token: "{{ lookup('env', 'AWX_METRICS_TOKEN') }}"
 #
 # What this can and cannot reach, and why:
 #   etcd  127.0.0.1:2381/metrics   — no auth by default, control-plane only         -> scraped
-#   API   127.0.0.1:6443/healthz   — anonymous access is normally permitted          -> scraped
+#   API   127.0.0.1:6443/readyz    — anonymous access is normally permitted  -> blackbox probe (probe_success)
 #   kubelet   :10250, apiserver /metrics, controller-manager, scheduler              -> need a
 #     bearer token, which means an in-cluster ServiceAccount, which is the
 #     infra-observability grant that is DESIGNED BUT NOT GRANTED. Not attempted here.
