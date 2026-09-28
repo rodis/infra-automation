@@ -14,9 +14,13 @@ steps:
 
   # The pins the checks compare against, and AWX's task_replicas. A failed pull leaves yesterday's
   # clone in place — stale pins are still pins — so it never fails the run.
+  #
+  # flock, because the three checks share one clone: when Dagu catches up several missed runs at
+  # once they start together, and concurrent pulls in one repo fail ("Cannot fast-forward to
+  # multiple branches" — the first catch-up, 2026-09-27). -w 120 so a stuck pull cannot hold a check.
   - id: refresh_pins
     depends: [wait_for_network]
-    command: git -C {{ watcher_home }}/helm-override-files pull --ff-only -q
+    command: flock -w 120 {{ watcher_home }}/.pins.lock git -C {{ watcher_home }}/helm-override-files pull --ff-only -q
     continue_on: {failure: true}
 
   # Always exits 0 so its full report stays readable; the verdict steps below carry the result.
