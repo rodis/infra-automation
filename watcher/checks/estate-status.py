@@ -36,6 +36,13 @@ EXPECTED = ["k8s-south-master-1", "k8s-south-node-1", "k8s-south-node-2", "k8s-s
 # the same reason as EXPECTED; change both together or the sweep flags a healthy AWX.
 AWX_TASK_REPLICAS = 4
 
+# SCOPE. This sweep is south's. Every cluster-level or aggregate query names south explicitly, so other
+# clusters shipping to the same Grafana stack (production, from 2026-09-28) cannot leak into it: an
+# unscoped query returns every cluster's series, and a scalar() of that is whichever came first.
+SOUTH_KSM   = 'instance="k8s-south"'          # kube-state-metrics labels series with the CLUSTER
+SOUTH_HOSTS = 'instance=~"k8s-south-.*"'      # host series and every log stream carry the host
+PG_HOST     = 'instance="k8s-south-postgresql"'
+
 findings = []          # (severity, text) -- severity in {"RED", "AMBER"}
 NODATA = object()
 
@@ -186,7 +193,7 @@ print("=" * 70)
 section("1. COLLECTORS  -- read this first; everything below depends on it")
 if wake_grafana():
     print("   grafana stack was asleep and has woken (free tier idles; not a fault)")
-targets = promq("up")
+targets = promq(f'up{{{SOUTH_HOSTS}}} or up{{job="awx"}} or up{{{SOUTH_KSM}}}')
 if targets is NODATA or (isinstance(targets, tuple) and targets[0] == "ERROR"):
     print("   CANNOT REACH GRAFANA. Nothing below can be trusted.")
     print("   " + ("`up` returned no series" if targets is NODATA else f"query failed: {targets[1]}"))
@@ -252,20 +259,20 @@ for h in EXPECTED:
 
 # -------------------------------------------------------- 4. kubernetes -----
 section("4. KUBERNETES (south)")
-check("nodes Ready", scalar('count(kube_node_status_condition{condition="Ready",status="true"} == 1)'),
+check("nodes Ready", scalar(f'count(kube_node_status_condition{{{SOUTH_KSM},condition="Ready",status="true"}} == 1)'),
       red=3, higher_is_worse=False, nd=0, note="expected 3; any node down is worth knowing")
 check("pods not Running/Succeeded",
-      scalar('count(kube_pod_status_phase{phase!="Running",phase!="Succeeded"} == 1) or vector(0)'),
+      scalar(f'count(kube_pod_status_phase{{{SOUTH_KSM},phase!="Running",phase!="Succeeded"}} == 1) or vector(0)'),
       red=3, amber=1, nd=0)
 check_counter("container restarts", "sum(kube_pod_container_status_restarts_total)",
               red=5, amber=1)
 check("deployments below desired",
-      scalar('count(kube_deployment_status_replicas_available < kube_deployment_spec_replicas) or vector(0)'),
+      scalar(f'count(kube_deployment_status_replicas_available{{{SOUTH_KSM}}} < kube_deployment_spec_replicas{{{SOUTH_KSM}}}) or vector(0)'),
       red=1, nd=0)
 
 # -------------------------------------------------------------- 5. etcd -----
 section("5. ETCD  -- slow fsync here is CHRONIC (network storage), not news")
-check("has leader", scalar('etcd_server_has_leader'), red=1, higher_is_worse=False, nd=0)
+check("has leader", scalar(f'etcd_server_has_leader{{{SOUTH_HOSTS}}}'), red=1, higher_is_worse=False, nd=0)
 check_counter("leader changes", "etcd_server_leader_changes_seen_total", red=2, amber=1)
 check_counter("proposals failed", "etcd_server_proposals_failed_total", red=20, amber=1)
 # Thresholds raised deliberately after the 2026-08-24 batching change. --backend-batch-interval
@@ -273,26 +280,26 @@ check_counter("proposals failed", "etcd_server_proposals_failed_total", red=20, 
 # expected to be high, and p99 of a per-operation metric is the wrong lens on a change that makes
 # operations bigger and rarer on purpose. Judging it at the old threshold would flag RED forever.
 # What actually improved is below it -- commits/sec collapsed, and apiserver timeouts went to zero.
-check("backend commit p99", scalar('histogram_quantile(0.99, sum by (le) (rate(etcd_disk_backend_commit_duration_seconds_bucket[30m])))'),
+check("backend commit p99", scalar(f'histogram_quantile(0.99, sum by (le) (rate(etcd_disk_backend_commit_duration_seconds_bucket{{{SOUTH_HOSTS}}}[30m])))'),
       red=2.0, amber=1.0, unit="s", nd=3, note="high BY DESIGN since batching; watch the rate below")
-check("backend commits/sec", scalar('rate(etcd_disk_backend_commit_duration_seconds_count[15m])'),
+check("backend commits/sec", scalar(f'rate(etcd_disk_backend_commit_duration_seconds_count{{{SOUTH_HOSTS}}}[15m])'),
       red=8, amber=4, nd=2, note="was ~10 before batching, ~1.2 after")
-check("commit load (sec/sec)", scalar('rate(etcd_disk_backend_commit_duration_seconds_sum[15m])'),
+check("commit load (sec/sec)", scalar(f'rate(etcd_disk_backend_commit_duration_seconds_sum{{{SOUTH_HOSTS}}}[15m])'),
       red=0.5, amber=0.25, nd=3, note="fraction of wall time spent committing")
-check("WAL fsync p99", scalar('histogram_quantile(0.99, sum by (le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket[30m])))'),
+check("WAL fsync p99", scalar(f'histogram_quantile(0.99, sum by (le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket{{{SOUTH_HOSTS}}}[30m])))'),
       unit="s", nd=3, note="chronic ~0.4-0.6s; alert on apiserver timeouts instead")
 
 # -------------------------------------------------------- 6. postgresql -----
 section("6. POSTGRESQL")
-check("pg_up", scalar('pg_up'), red=1, higher_is_worse=False, nd=0)
+check("pg_up", scalar(f'pg_up{{{PG_HOST}}}'), red=1, higher_is_worse=False, nd=0)
 check("connection headroom",
-      scalar('sum(pg_settings_max_connections) - sum(pg_settings_superuser_reserved_connections) - sum(pg_stat_database_numbackends)'),
+      scalar(f'sum(pg_settings_max_connections{{{PG_HOST}}}) - sum(pg_settings_superuser_reserved_connections{{{PG_HOST}}}) - sum(pg_stat_database_numbackends{{{PG_HOST}}})'),
       red=10, amber=30, higher_is_worse=False, nd=0)
 check("utilisation",
-      scalar('100 * sum(pg_stat_database_numbackends) / (sum(pg_settings_max_connections) - sum(pg_settings_superuser_reserved_connections))'),
+      scalar(f'100 * sum(pg_stat_database_numbackends{{{PG_HOST}}}) / (sum(pg_settings_max_connections{{{PG_HOST}}}) - sum(pg_settings_superuser_reserved_connections{{{PG_HOST}}}))'),
       red=90, amber=80, unit="%", nd=1)
 check("cache hit ratio",
-      scalar('100 * sum(pg_stat_database_blks_hit) / clamp_min(sum(pg_stat_database_blks_hit) + sum(pg_stat_database_blks_read), 1)'),
+      scalar(f'100 * sum(pg_stat_database_blks_hit{{{PG_HOST}}}) / clamp_min(sum(pg_stat_database_blks_hit{{{PG_HOST}}}) + sum(pg_stat_database_blks_read{{{PG_HOST}}}), 1)'),
       red=90, amber=98, higher_is_worse=False, unit="%", nd=2)
 
 # --------------------------------------------------------------- 7. awx -----
@@ -316,11 +323,11 @@ section("8. LOGS  -- graded on the last 5m; longer windows are context only")
 # pair, every deliberate change -- a restart, a fix that stopped an error -- reads as a fresh
 # problem for hours afterwards, which is exactly how a status report trains you to ignore it.
 for label, sel, red, amber in [
-    ("kernel lockups / OOM", '{job="journal"} |~ "(?i)watchdog|soft lockup|hard lockup|oom-kill|blocked for more than"', 1, None),
-    ("postgres FATAL/PANIC", '{job="postgresql", level=~"FATAL|PANIC"}', 100, 1),
-    ("postgres rejected logins", '{job="postgresql"} |~ "no pg_hba.conf entry"', None, 1),
-    ("apiserver etcd timeouts", '{job="pods", container="kube-apiserver"} |~ "etcdserver: request timed out"', 50, 5),
-    ("AWX db errors", '{job="pods", namespace="awx"} |~ "OperationalError|remaining connection"', 20, 1),
+    ("kernel lockups / OOM", f'{{job="journal",{SOUTH_HOSTS}}} |~ "(?i)watchdog|soft lockup|hard lockup|oom-kill|blocked for more than"', 1, None),
+    ("postgres FATAL/PANIC", f'{{job="postgresql",{PG_HOST},level=~"FATAL|PANIC"}}', 100, 1),
+    ("postgres rejected logins", f'{{job="postgresql",{PG_HOST}}} |~ "no pg_hba.conf entry"', None, 1),
+    ("apiserver etcd timeouts", f'{{job="pods",{SOUTH_HOSTS},container="kube-apiserver"}} |~ "etcdserver: request timed out"', 50, 5),
+    ("AWX db errors", f'{{job="pods",{SOUTH_HOSTS},namespace="awx"}} |~ "OperationalError|remaining connection"', 20, 1),
 ]:
     six  = logq(f"sum(count_over_time({sel} [6h]))")
     half = logq(f"sum(count_over_time({sel} [30m]))")

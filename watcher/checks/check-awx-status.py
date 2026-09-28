@@ -33,6 +33,9 @@ PROM = "/api/datasources/proxy/uid/grafanacloud-prom/api/v1"
 LOKI = "/api/datasources/proxy/uid/grafanacloud-logs/loki/api/v1"
 
 PG_NODE  = "k8s-south-postgresql"
+# Every PostgreSQL series and log stream is scoped to AWX's database VM, so another cluster's series in
+# the same Grafana stack can never answer for it.
+PGSEL    = f'instance="{PG_NODE}"'
 TLS_HOST = "infra.rods.me"
 CANARY_TEMPLATE = 68                  # General: AWX: Canary
 CANARY_INVENTORY = 29                 # General: AWX: Canary — localhost, ansible_connection=local
@@ -111,7 +114,7 @@ if not (GRAFANA and GTOKEN and AWX and AWXTOK):
 
 section("1. freshness — nothing below is trusted on stale data")
 def _fresh():
-    ages = {j: prom(f'time() - timestamp({q})') for j, q in (("awx", 'up{job="awx"}'), ("postgres", "pg_up"))}
+    ages = {j: prom(f'time() - timestamp({q})') for j, q in (("awx", 'up{job="awx"}'), ("postgres", f"pg_up{{{PGSEL}}}"))}
     missing = [j for j, a in ages.items() if a is None]
     if missing:
         verdict("collectors scraped within 5m", None, f"no series for {missing}")
@@ -165,13 +168,13 @@ guarded(f"TLS for {TLS_HOST} valid > 14 days", _tls)
 
 section("3. AWX's database — measured from outside AWX")
 def _pgup():
-    v = prom("pg_up")
+    v = prom(f"pg_up{{{PGSEL}}}")
     verdict("pg_up == 1", None if v is None else v == 1, "no series" if v is None else f"{v:.0f}")
 guarded("pg_up == 1", _pgup)
 
 def _conns():
-    v = prom("100 * sum(pg_stat_database_numbackends) / (sum(pg_settings_max_connections)"
-             " - sum(pg_settings_superuser_reserved_connections))")
+    v = prom(f"100 * sum(pg_stat_database_numbackends{{{PGSEL}}}) / (sum(pg_settings_max_connections{{{PGSEL}}})"
+             f" - sum(pg_settings_superuser_reserved_connections{{{PGSEL}}}))")
     verdict("connection use < 80%", None if v is None else v < 80, "no series" if v is None else f"{v:.0f}%")
 guarded("connection use < 80%", _conns)
 
@@ -183,9 +186,9 @@ def _disk():
 guarded("root filesystem > 20% free", _disk)
 
 def _logs():
-    slots = loki_count('sum(count_over_time({job="postgresql"} |~ "remaining connection slots|too many clients" [15m]))')
-    panic = loki_count('sum(count_over_time({job="postgresql", level="PANIC"} [15m]))')
-    lines = loki_count('sum(count_over_time({job="postgresql"} [15m]))')
+    slots = loki_count(f'sum(count_over_time({{job="postgresql",{PGSEL}}} |~ "remaining connection slots|too many clients" [15m]))')
+    panic = loki_count(f'sum(count_over_time({{job="postgresql",{PGSEL},level="PANIC"}} [15m]))')
+    lines = loki_count(f'sum(count_over_time({{job="postgresql",{PGSEL}}} [15m]))')
     if lines == 0:
         # Zero lines of any kind is a blind collector, not a quiet database (CLAUDE.md, PostgreSQL logs).
         verdict("no slot exhaustion / PANIC in 15m", None, "no postgresql log lines at all in 15m — collector blind?")
@@ -197,7 +200,7 @@ guarded("no slot exhaustion / PANIC in 15m", _logs)
 def _xid():
     # pg_database_wraparound_age_datfrozenxid_seconds is age(datfrozenxid), a transaction COUNT —
     # the `_seconds` suffix is an upstream misnomer.
-    pct = prom("100 * max(pg_database_wraparound_age_datfrozenxid_seconds) / 2147483647")
+    pct = prom(f"100 * max(pg_database_wraparound_age_datfrozenxid_seconds{{{PGSEL}}}) / 2147483647")
     verdict("transaction ID age < 50% of wraparound", None if pct is None else pct < 50,
             "no series" if pct is None else f"{pct:.2f}%")
 guarded("transaction ID age < 50% of wraparound", _xid)
@@ -246,8 +249,8 @@ def _backup():
 _backup()
 
 def _sessions():
-    idle = prom('max(pg_stat_activity_max_tx_duration{state=~"idle in transaction.*"})')
-    oldest = prom("max(pg_stat_activity_max_tx_duration)")
+    idle = prom(f'max(pg_stat_activity_max_tx_duration{{{PGSEL},state=~"idle in transaction.*"}})')
+    oldest = prom(f"max(pg_stat_activity_max_tx_duration{{{PGSEL}}})")
     # max_tx_duration is measured from xact_start, so for idle-in-transaction it reads the whole
     # transaction's age, not just the idle part: slightly stricter than the SQL it replaced.
     report("no idle-in-transaction > 10 min", "UNKNOWN" if idle is None else ("ok" if idle <= 600 else "FINDING"),
@@ -258,7 +261,7 @@ try: _sessions()
 except Exception as e: report("sessions", "UNKNOWN", str(e)[:120])
 
 for name, expr, fmt in (
-    ("deadlocks in the last hour", "sum(increase(pg_stat_database_deadlocks[1h]))", "{:.0f}"),
+    ("deadlocks in the last hour", f"sum(increase(pg_stat_database_deadlocks{{{PGSEL}}}[1h]))", "{:.0f}"),
     ("disk write latency, 1h avg (never thresholded)",
      f'1000*rate(node_disk_write_time_seconds_total{{instance="{PG_NODE}",device="vda"}}[1h])'
      f'/rate(node_disk_writes_completed_total{{instance="{PG_NODE}",device="vda"}}[1h])', "{:.1f} ms"),

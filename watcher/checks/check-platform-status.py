@@ -19,7 +19,9 @@ import datetime, json, os, re, ssl, sys, urllib.error, urllib.parse, urllib.requ
 
 # infra reads south's kube-state-metrics in Grafana. production, when added, reads through AWX jobs
 # (task production-cluster-check) — never SSH.
-TARGETS = {"infra": {}}
+# ksm: the `instance` label kube-state-metrics series carry for that cluster — every query is scoped to
+# it, because several clusters share one Grafana stack.
+TARGETS = {"infra": {"ksm": "k8s-south"}}
 # The pins live in helm-override-files. On the VPS they must be shipped with the checker.
 HOF = os.environ.get("HELM_OVERRIDE_FILES", os.path.expanduser("~/Development/personal/helm-override-files"))
 ISSUERS = ["letsencrypt-prod", "letsencrypt-staging"]
@@ -72,12 +74,14 @@ def pin(path, pattern):
 #   containers          [{pod, container, restarts, started: dt, crashloop: bool}]
 # ------------------------------------------------------------------------------------------------
 
-def facts_from_grafana():
+def facts_from_grafana(ksm):
     G = (os.environ.get("GRAFANA_URL") or "").rstrip("/")
     G = G if G.startswith("http") or not G else "https://" + G
     T = os.environ.get("GRAFANA_TOKEN") or ""
     if not (G and T):
         raise RuntimeError("GRAFANA_URL / GRAFANA_TOKEN not set — run through ./agent/run.sh")
+
+    sel = f'instance="{ksm}"'
 
     def q(expr):
         url = f"{G}/api/datasources/proxy/uid/grafanacloud-prom/api/v1/query?" + urllib.parse.urlencode({"query": expr})
@@ -89,49 +93,49 @@ def facts_from_grafana():
 
     # Freshness first: every fact below is from kube-state-metrics, so if it is not being scraped they
     # are all stale — and stale looks exactly like healthy (rule 8).
-    age = one('time() - max(timestamp(kube_daemonset_status_number_ready{daemonset="traefik"}))')
+    age = one(f'time() - max(timestamp(kube_daemonset_status_number_ready{{{sel},daemonset="traefik"}}))')
     if age is None or age > 300:
         raise RuntimeError(f"kube-state-metrics not scraped recently (age {age}) — facts would be stale")
 
-    f = {"cp_nodes": int(one('count(kube_node_role{role="control-plane"})') or 0)}
+    f = {"cp_nodes": int(one(f'count(kube_node_role{{{sel},role="control-plane"}})') or 0)}
     f["traefik"] = {
-        "ready": one('kube_daemonset_status_number_ready{namespace="traefik",daemonset="traefik"}'),
-        "desired": one('kube_daemonset_status_desired_number_scheduled{namespace="traefik",daemonset="traefik"}'),
-        "chart": next((r["metric"].get("label_helm_sh_chart") for r in q('kube_daemonset_labels{namespace="traefik",daemonset="traefik"}')), None),
+        "ready": one(f'kube_daemonset_status_number_ready{{{sel},namespace="traefik",daemonset="traefik"}}'),
+        "desired": one(f'kube_daemonset_status_desired_number_scheduled{{{sel},namespace="traefik",daemonset="traefik"}}'),
+        "chart": next((r["metric"].get("label_helm_sh_chart") for r in q(f'kube_daemonset_labels{{{sel},namespace="traefik",daemonset="traefik"}}')), None),
     }
-    ic = q('kube_ingressclass_info{ingressclass="nginx"}')
+    ic = q(f'kube_ingressclass_info{{{sel},ingressclass="nginx"}}')
     f["ingressclass"] = ic[0]["metric"].get("controller") if ic else None
-    f["hosts"] = sorted({r["metric"]["host"] for r in q("kube_ingress_path") if r["metric"].get("host")})
+    f["hosts"] = sorted({r["metric"]["host"] for r in q(f"kube_ingress_path{{{sel}}}") if r["metric"].get("host")})
 
-    ready = {r["metric"]["deployment"]: float(r["value"][1]) for r in q('kube_deployment_status_replicas_ready{namespace="cert-manager"}')}
-    spec = {r["metric"]["deployment"]: float(r["value"][1]) for r in q('kube_deployment_spec_replicas{namespace="cert-manager"}')}
-    ver = {r["metric"]["deployment"]: r["metric"].get("label_app_kubernetes_io_version") for r in q('kube_deployment_labels{namespace="cert-manager"}')}
+    ready = {r["metric"]["deployment"]: float(r["value"][1]) for r in q(f'kube_deployment_status_replicas_ready{{{sel},namespace="cert-manager"}}')}
+    spec = {r["metric"]["deployment"]: float(r["value"][1]) for r in q(f'kube_deployment_spec_replicas{{{sel},namespace="cert-manager"}}')}
+    ver = {r["metric"]["deployment"]: r["metric"].get("label_app_kubernetes_io_version") for r in q(f'kube_deployment_labels{{{sel},namespace="cert-manager"}}')}
     f["cm_deploys"] = {n: {"ready": ready.get(n, 0), "desired": spec.get(n, 0), "version": ver.get(n)} for n in spec}
 
-    f["issuers"] = {r["metric"]["name"]: float(r["value"][1]) == 1 for r in q('kube_customresource_clusterissuer_condition{type="Ready"}')}
+    f["issuers"] = {r["metric"]["name"]: float(r["value"][1]) == 1 for r in q(f'kube_customresource_clusterissuer_condition{{{sel},type="Ready"}}')}
 
     certs = {}
-    for r in q('kube_customresource_certificate_condition{type="Ready"}'):
+    for r in q(f'kube_customresource_certificate_condition{{{sel},type="Ready"}}'):
         certs.setdefault(f'{r["metric"]["namespace"]}/{r["metric"]["name"]}', {})["ready"] = float(r["value"][1]) == 1
     for metric, key in (("kube_customresource_certificate_not_after", "not_after"), ("kube_customresource_certificate_renewal_time", "renewal")):
-        for r in q(metric):
+        for r in q(f"{metric}{{{sel}}}"):
             certs.setdefault(f'{r["metric"]["namespace"]}/{r["metric"]["name"]}', {})[key] = from_epoch(float(r["value"][1]))
     f["certs"] = [{"name": k, "ready": v.get("ready", False), "not_after": v.get("not_after"), "renewal": v.get("renewal")} for k, v in certs.items()]
 
-    dr = one('kube_deployment_status_replicas_ready{namespace="doppler-operator-system",deployment="doppler-operator-controller-manager"}')
-    ds = one('kube_deployment_spec_replicas{namespace="doppler-operator-system",deployment="doppler-operator-controller-manager"}')
-    imgs = sorted({r["metric"].get("image", "") for r in q('kube_pod_container_info{namespace="doppler-operator-system",container="manager"}')})
+    dr = one(f'kube_deployment_status_replicas_ready{{{sel},namespace="doppler-operator-system",deployment="doppler-operator-controller-manager"}}')
+    ds = one(f'kube_deployment_spec_replicas{{{sel},namespace="doppler-operator-system",deployment="doppler-operator-controller-manager"}}')
+    imgs = sorted({r["metric"].get("image", "") for r in q(f'kube_pod_container_info{{{sel},namespace="doppler-operator-system",container="manager"}}')})
     f["doppler"] = None if ds is None else {"ready": dr == ds, "images": imgs}
 
     f["dsecrets"] = [{"name": f'{r["metric"]["name"]} -> {r["metric"]["namespace"]}', "sync": float(r["value"][1]) == 1}
-                     for r in q('kube_customresource_dopplersecret_condition{type="secrets.doppler.com/SecretSyncReady"}')]
+                     for r in q(f'kube_customresource_dopplersecret_condition{{{sel},type="secrets.doppler.com/SecretSyncReady"}}')]
 
     nsre = "|".join(sorted(PLATFORM_NS))
-    started = {r["metric"]["pod"]: from_epoch(float(r["value"][1])) for r in q(f'kube_pod_start_time{{namespace=~"{nsre}"}}')}
-    crash = {(r["metric"]["pod"], r["metric"]["container"]) for r in q(f'kube_pod_container_status_waiting_reason{{namespace=~"{nsre}",reason="CrashLoopBackOff"}} == 1')}
+    started = {r["metric"]["pod"]: from_epoch(float(r["value"][1])) for r in q(f'kube_pod_start_time{{{sel},namespace=~"{nsre}"}}')}
+    crash = {(r["metric"]["pod"], r["metric"]["container"]) for r in q(f'kube_pod_container_status_waiting_reason{{{sel},namespace=~"{nsre}",reason="CrashLoopBackOff"}} == 1')}
     f["containers"] = [{"pod": r["metric"]["pod"], "container": r["metric"]["container"], "restarts": int(float(r["value"][1])),
                         "started": started.get(r["metric"]["pod"]), "crashloop": (r["metric"]["pod"], r["metric"]["container"]) in crash}
-                       for r in q(f'kube_pod_container_status_restarts_total{{namespace=~"{nsre}"}}')]
+                       for r in q(f'kube_pod_container_status_restarts_total{{{sel},namespace=~"{nsre}"}}')]
     return f
 
 
@@ -141,7 +145,7 @@ if target not in TARGETS:
     print(f"usage: {sys.argv[0]} <{'|'.join(TARGETS)}>"); sys.exit(2)
 print(f"platform-healthy [{target}] from Grafana — {NOW:%Y-%m-%d %H:%M UTC}")
 try:
-    F = facts_from_grafana()
+    F = facts_from_grafana(TARGETS[target]["ksm"])
 except Exception as e:
     print(f"\nFACTS NOT ESTABLISHED — could not read the cluster: {e}"); sys.exit(2)
 
