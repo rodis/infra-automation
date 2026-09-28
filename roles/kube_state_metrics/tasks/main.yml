@@ -11,9 +11,14 @@
   changed_when: false
   check_mode: false
 
+# Apply from ONE control-plane node. Every kubespray control-plane node holds admin.conf, so on
+# production (three of them) the manifest would otherwise be applied three times, racing itself. The
+# first host of kube_control_plane applies it; south has no such group and one control-plane node.
 - name: Record whether this host can drive the cluster
   ansible.builtin.set_fact:
-    ksm_is_control_plane: "{{ ksm_admin_conf.stat.exists | default(false) | bool }}"
+    ksm_is_control_plane: >-
+      {{ (ksm_admin_conf.stat.exists | default(false) | bool)
+         and inventory_hostname == (groups['kube_control_plane'] | default([inventory_hostname]) | sort | first) }}
 
 - name: Install kube-state-metrics
   when: ksm_is_control_plane | bool

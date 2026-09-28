@@ -238,9 +238,16 @@
       - alloy_scrape_kube_state_metrics | bool
       - alloy_admin_conf.stat.exists | default(false)
 
+  # ONE scraper per cluster. The NodePort answers on every node and every control-plane node holds
+  # admin.conf, so on a cluster with several control-plane nodes (production has three) "probe
+  # answered" alone would scrape it three times and triple every series. When the inventory has a
+  # kube_control_plane group (kubespray clusters), only its first host scrapes; south has no such
+  # group and a single control-plane node, so it is unaffected.
   - name: Record whether to scrape it here
     ansible.builtin.set_fact:
-      alloy_has_ksm: "{{ (alloy_ksm_probe.status | default(0)) == 200 }}"
+      alloy_has_ksm: >-
+        {{ (alloy_ksm_probe.status | default(0)) == 200
+           and inventory_hostname == (groups['kube_control_plane'] | default([inventory_hostname]) | sort | first) }}
     when: alloy_scrape_kube_state_metrics | bool
 
   - name: Report
