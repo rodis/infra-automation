@@ -1,4 +1,6 @@
 # Rendered by playbooks/watcher/install.yml from watcher/dagu/check-dag.yaml.j2 — edit the template.
+# Dagu does not reload a changed DAG behind a symlink, so a change here restarts Dagu (the playbook
+# notifies its handler); without that, a new schedule is written and silently ignored.
 description: >
   {{ item.description }}
   Exit 0 satisfied, 1 a finding, 2 the facts could not be established — the failed step's name says

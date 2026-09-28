@@ -200,6 +200,7 @@
         dest: "{{ watcher_home }}/dagu/workspace-{{ item }}.yaml"
         mode: "0600"
       loop: "{{ watcher_workspaces }}"
+      notify: Restart dagu
 
     - name: Workspace base directories in Dagu
       ansible.builtin.file:
@@ -222,6 +223,7 @@
         mode: "0600"
       loop: "{{ watcher_checks }}"
       loop_control: {label: "{{ item.name }}"}
+      notify: Restart dagu
 
     - name: Link the check DAGs
       ansible.builtin.file:
@@ -286,10 +288,17 @@
       register: watcher_ls
       changed_when: false
 
-    - name: Assert every check DAG is scheduled
+    # Not just "has a next-run time": the next run must fall within the next 61 minutes, since every
+    # check is hourly. A merely-present time passed on 2026-09-28 while Dagu still held the old daily
+    # schedules — it had not reloaded the changed DAGs. A stale schedule looks exactly like a valid one.
+    - name: Assert every check DAG is scheduled, on its current schedule
       ansible.builtin.assert:
-        that: watcher_ls.stdout is search(item.name ~ '\s+\d{4}-\d{2}-\d{2}T')
-        fail_msg: "{{ item.name }} is not listed with a next-run time:\n{{ watcher_ls.stdout }}"
+        that:
+          - watcher_ls.stdout is search(item.name ~ '\s+\d{4}-\d{2}-\d{2}T')
+          - >-
+            ((watcher_ls.stdout | regex_search(item.name ~ '\s+(\S+)', '\\1') | first | to_datetime('%Y-%m-%dT%H:%M:%SZ')) -
+             (ansible_date_time.iso8601 | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).total_seconds() < 3660
+        fail_msg: "{{ item.name }}'s next run is not within the hour — Dagu may hold a stale schedule:\n{{ watcher_ls.stdout }}"
         quiet: true
       loop: "{{ watcher_checks }}"
       loop_control: {label: "{{ item.name }}"}
