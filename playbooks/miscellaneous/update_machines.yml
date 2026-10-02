@@ -13,8 +13,15 @@
         # have run first.
         lock_timeout: 600
 
+    # ASYNC, because the upgrade can restart sshd under the connection running it. On 2026-10-02
+    # openssh-server was upgraded on k8s-west-master-2, sshd restarted at 09:54:56, apt finished 20s
+    # later — and the job (3987) never got the result, hanging 51 minutes until cancelled. With
+    # async the upgrade runs detached on the host, and Ansible checks on it every `poll` seconds over
+    # a fresh, short connection that an sshd restart cannot strand.
     - name: Upgrade packages with apt
       when: ansible_pkg_mgr == 'apt'
       ansible.builtin.apt:
         upgrade: dist
         lock_timeout: 600
+      async: 2400   # 40 min: well over the slowest seen (~23 min on node-1, same day)
+      poll: 15
