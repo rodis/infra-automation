@@ -54,6 +54,119 @@
         regexp: '^(\s*[^#\n]\S*\s+\S+\s+swap\s+.*)$'
         replace: '# \1   # disabled for kubernetes'
 
+    # etcd's data volume (2026-10-02). Only for hosts whose instance carries `etcd_volume` in its
+    # OpenStack metadata — terraform/kubernetes/etcd.tf sets it when ETCD_VOLUME_SIZE > 0. The
+    # volume is mounted AT /var/lib/etcd, so kubespray's etcd_data_dir is unchanged.
+    #
+    # It never moves existing data: if /var/lib/etcd already holds data on the root disk, this
+    # stops. Migrating a live etcd (production) is a planned procedure, not a side effect of prep.
+    - name: Put etcd's data on its own volume
+      when: (openstack.metadata.etcd_volume | default('')) | length > 0
+      vars:
+        etcd_volume_dev: "/dev/disk/by-id/virtio-{{ openstack.metadata.etcd_volume[:20] }}"
+      block:
+        - name: Wait for the etcd volume to appear (found by volume id, not device name)
+          ansible.builtin.wait_for:
+            path: "{{ etcd_volume_dev }}"
+            timeout: 120
+
+        - name: Install xfsprogs
+          ansible.builtin.apt:
+            name: xfsprogs
+            state: present
+            lock_timeout: 600
+
+        - name: Read the volume's filesystem type, if any
+          ansible.builtin.command: blkid -o value -s TYPE {{ etcd_volume_dev }}
+          register: etcd_volume_fstype
+          check_mode: false   # a read; must run in --check too, or the guards below see nothing
+          changed_when: false
+          failed_when: etcd_volume_fstype.rc not in [0, 2]   # 2: no filesystem yet
+
+        - name: Refuse a volume that already holds something other than XFS
+          ansible.builtin.assert:
+            that: etcd_volume_fstype.stdout in ['', 'xfs']
+            fail_msg: "{{ etcd_volume_dev }} holds {{ etcd_volume_fstype.stdout }} — not formatting over it"
+
+        - name: Check whether /var/lib/etcd is already a mountpoint
+          ansible.builtin.command: findmnt -no SOURCE /var/lib/etcd
+          register: etcd_mounted
+          check_mode: false   # a read; must run in --check too, or the guards below see nothing
+          changed_when: false
+          failed_when: false
+
+        - name: List /var/lib/etcd on the root disk
+          ansible.builtin.find:
+            paths: /var/lib/etcd
+            file_type: any
+            hidden: true
+          register: etcd_root_contents
+          when: etcd_mounted.rc != 0
+
+        - name: Refuse to hide existing etcd data under the mount
+          ansible.builtin.assert:
+            that: etcd_mounted.rc == 0 or etcd_root_contents.matched | default(0) == 0
+            fail_msg: >-
+              /var/lib/etcd already holds data on the root disk. Mounting the volume over it would
+              hide that data from etcd. Migrating it is a separate, planned procedure.
+
+        - name: Format the volume as XFS (only when blank)
+          ansible.builtin.command: mkfs.xfs -L etcd-data {{ etcd_volume_dev }}
+          when: etcd_volume_fstype.stdout == ''
+
+        - name: Read the volume's UUID
+          ansible.builtin.command: blkid -o value -s UUID {{ etcd_volume_dev }}
+          register: etcd_volume_uuid
+          check_mode: false   # a read; must run in --check too, or the guards below see nothing
+          changed_when: false
+
+        # nofail: a missing volume must not stop the host booting — it stays reachable over SSH.
+        # The drop-in below is what stops etcd starting on an empty directory in that case.
+        - name: Mount /var/lib/etcd from the volume at boot
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: '^\S+\s+/var/lib/etcd\s'
+            line: "UUID={{ etcd_volume_uuid.stdout }} /var/lib/etcd xfs noatime,nofail 0 0"
+
+        - name: Create the mountpoint
+          ansible.builtin.file:
+            path: /var/lib/etcd
+            state: directory
+            mode: "0700"
+
+        - name: Mount it now
+          ansible.builtin.command: mount /var/lib/etcd
+          when: etcd_mounted.rc != 0
+
+        - name: Create etcd's systemd drop-in directory
+          ansible.builtin.file:
+            path: /etc/systemd/system/etcd.service.d
+            state: directory
+            mode: "0755"
+
+        - name: Never start etcd without its volume
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/etcd.service.d/10-require-data-volume.conf
+            mode: "0644"
+            content: |
+              # Written by prepare_for_kubespray.yml. Without this, a volume that failed to attach
+              # would leave etcd starting on an empty directory on the root disk.
+              [Unit]
+              RequiresMountsFor=/var/lib/etcd
+          register: etcd_dropin
+
+        - name: Reload systemd for the drop-in
+          ansible.builtin.systemd:
+            daemon_reload: true
+          when: etcd_dropin.changed
+
+        - name: Confirm /var/lib/etcd is XFS on the volume
+          ansible.builtin.command: findmnt -no SOURCE,FSTYPE /var/lib/etcd
+          register: etcd_mount_check
+          check_mode: false   # a read; must run in --check too, or the guards below see nothing
+          changed_when: false
+          failed_when: "'xfs' not in etcd_mount_check.stdout"
+
     - name: Confirm python3 is usable by Ansible
       ansible.builtin.command: python3 --version
       register: python_version
