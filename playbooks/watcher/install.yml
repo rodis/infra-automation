@@ -75,6 +75,13 @@
         step: aiven_healthy
         script: "check-aiven-status.py --json {{ watcher_home }}/results/aiven-healthy.json"
         description: "Evaluates objective aiven-healthy for Aiven project aware — services running, and every Kafka client certificate issued by the project's current CA, unexpired, and accepted by the broker. Read-only Aiven token, public TLS handshake."
+      # Gmail credential health through a canary webhook (inference connectors/n8n/gmail-canary).
+      - name: production-check-gmail-status
+        workspace: production
+        schedule: "4 * * * *"
+        step: gmail_healthy
+        script: "check-gmail-status.py --json {{ watcher_home }}/results/gmail-healthy.json"
+        description: "Evaluates objective gmail-healthy — does the 'Gmail account' OAuth credential the invoice gates and the Gmail connectors use still work. Calls a canary that lists labels and answers only a count."
     watcher_workspaces: [infra, production, development]
 
   handlers:
