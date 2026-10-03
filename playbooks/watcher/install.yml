@@ -67,6 +67,14 @@
         step: platform_healthy
         script: check-platform-status.py infra
         description: "Evaluates objective platform-healthy for infra — Traefik, cert-manager and the Doppler operator, read from kube-state-metrics in Grafana plus public HTTPS probes."
+      # The first production check, and the first to write a check-result/v1 document (--json).
+      # One check per Aiven PROJECT, not per service: a CA rotation hits every service at once.
+      - name: production-check-aiven-status
+        workspace: production
+        schedule: "3 * * * *"
+        step: aiven_healthy
+        script: "check-aiven-status.py --json {{ watcher_home }}/results/aiven-healthy.json"
+        description: "Evaluates objective aiven-healthy for Aiven project aware — services running, and every Kafka client certificate issued by the project's current CA, unexpired, and accepted by the broker. Read-only Aiven token, public TLS handshake."
     watcher_workspaces: [infra, production, development]
 
   handlers:
@@ -107,6 +115,9 @@
         - "{{ watcher_home }}/checks"
         - "{{ watcher_home }}/dagu"
         - "{{ watcher_home }}/logs"
+        # check-result/v1 documents (`--json`), the latest per check. What an agent reads to act on a
+        # result; nothing reads them yet.
+        - "{{ watcher_home }}/results"
         - "{{ watcher_home }}/downloads"
         - "{{ watcher_dagu_config_dir }}/dags"
 
