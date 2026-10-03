@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Evaluate objectives/aiven-healthy.yml for the Aiven project behind Aware. Read-only.
+
+  ./run.sh python3 -u checks/check-aiven-status.py                 # on the watcher
+  ./agent/run.sh python3 <path>/check-aiven-status.py              # from infra-objectives
+
+Written 2026-10-03, after Aiven rotated project `aware` to "Project CA GEN 2" and the Kafka broker
+stopped accepting client certificates from the old CA at ~08:12 UTC. Every Kafka client (the
+runtime, bmw-cardata, Vector) still held an old-CA certificate; nothing reached Neon all morning,
+and it looked like a database problem. The new CA had existed since 2026-08-06, so the predicate
+that matters is the LEADING one: a client certificate not issued by the project's CURRENT CA. The
+live handshake alone stays green for as long as the broker trusts both CAs, which was two months.
+
+Exit codes, the contract every check-*.py shares (see infra-objectives/CLAUDE.md, "Scheduled checks"):
+  0  every success: predicate holds        1  a predicate is false        2  facts not established
+
+The service list from the API carries each user's PASSWORD and ACCESS KEY next to the certificate.
+This script reads `access_cert` and nothing else from a user, never prints a user object, and
+parses certificates through openssl on stdin so no file is left behind.
+"""
+import datetime, json, os, re, subprocess, sys, urllib.error, urllib.request
+
+API = "https://api.aiven.io/v1"
+PROJECT = "aware"
+# Services Aware and n8n depend on. A service missing from the project, or not RUNNING, is a finding.
+# Anything else in the project is reported, not graded (valkey is POWEROFF as of 2026-10-03; whether
+# that is intended is the owner's call — see the objective).
+EXPECTED = {"kafka-13776261": "kafka", "pg-af720c5": "pg"}
+CERT_MIN_DAYS = 30
+
+results, reported = [], []
+NOW = datetime.datetime.now(datetime.timezone.utc)
+
+
+def verdict(name, ok, detail=""):
+    v = "PASS" if ok is True else "FAIL" if ok is False else "UNKNOWN"
+    results.append((v, name, detail)); print(f"  {v:8} {name:58} {detail}")
+
+
+def report(name, flag, detail=""):
+    reported.append((flag, name, detail)); print(f"  {flag:8} {name:58} {detail}")
+
+
+def guarded(name, fn):
+    try: fn()
+    except Exception as e: verdict(name, None, f"could not evaluate: {type(e).__name__}: {str(e)[:110]}")
+
+
+def api(path):
+    token = os.environ.get("AIVEN_TOKEN") or ""
+    if not token:
+        raise RuntimeError("AIVEN_TOKEN not set — run through run.sh")
+    req = urllib.request.Request(f"{API}{path}", headers={"Authorization": f"aivenv1 {token}"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def cert_info(pem):
+    """subject CN, issuer CN, notAfter — from a PEM, via openssl on stdin."""
+    out = subprocess.run(["openssl", "x509", "-noout", "-subject", "-issuer", "-enddate", "-nameopt", "RFC2253"],
+                         input=pem, capture_output=True, text=True, timeout=15, check=True).stdout
+
+    def cn(line):
+        m = re.search(r"CN=([^,]+)", line); return m.group(1).strip() if m else line.strip()
+    f = dict(l.split("=", 1) for l in out.strip().splitlines())
+    not_after = datetime.datetime.strptime(f["notAfter"].strip(), "%b %d %H:%M:%S %Y %Z").replace(tzinfo=datetime.timezone.utc)
+    return {"subject": cn(f["subject"]), "issuer": cn(f["issuer"]), "not_after": not_after}
+
+
+def broker_client_cas(host, port):
+    """The CA names a TLS server says it accepts client certificates from. A public handshake: no key."""
+    out = subprocess.run(["openssl", "s_client", "-connect", f"{host}:{port}", "-servername", host],
+                         input="", capture_output=True, text=True, timeout=30).stdout
+    m = re.search(r"Acceptable client certificate CA names\n(.*?)\n(?:Requested|Client Certificate Types|Shared)", out, re.S)
+    if not m:
+        raise RuntimeError("handshake returned no acceptable-CA list")
+    return [re.search(r"CN\s*=\s*(.+)$", l).group(1).strip() for l in m.group(1).splitlines() if "CN" in l]
+
+
+# ------------------------------------------------------------------------------------------------
+print(f"aiven-healthy [{PROJECT}] — {NOW:%Y-%m-%d %H:%M UTC}")
+try:
+    current_ca = cert_info(api(f"/project/{PROJECT}/kms/ca")["certificate"])
+    services = {s["service_name"]: s for s in api(f"/project/{PROJECT}/service")["services"]}
+except Exception as e:
+    print(f"\nFACTS NOT ESTABLISHED — could not read the Aiven API: {type(e).__name__}: {str(e)[:150]}")
+    sys.exit(2)
+print(f"  current project CA: {current_ca['subject']} (until {current_ca['not_after']:%Y-%m-%d})")
+
+print("\n== services")
+for name, stype in EXPECTED.items():
+    def _svc(name=name, stype=stype):
+        s = services.get(name)
+        verdict(f"{name} exists, type {stype}, RUNNING",
+                bool(s) and s["service_type"] == stype and s["state"] == "RUNNING",
+                f"{s['service_type']} {s['state']} ({s['plan']})" if s else "missing from the project")
+    guarded(f"{name} RUNNING", _svc)
+for name, s in sorted(services.items()):
+    if name not in EXPECTED:
+        report(f"{name} (not graded)", "ok" if s["state"] == "RUNNING" else "FINDING", f"{s['service_type']} {s['state']}")
+
+print("\n== Kafka client certificates")
+for name, s in sorted(services.items()):
+    if s["service_type"] != "kafka":
+        continue
+    comp = next((c for c in s.get("components", []) if c.get("component") == "kafka"
+                 and c.get("route") == "dynamic" and c.get("usage") == "primary"), None)
+    try:
+        accepted = broker_client_cas(comp["host"], comp["port"]) if comp else None
+    except Exception as e:
+        accepted = None
+        verdict(f"{name}: broker answers a TLS handshake", None, f"could not evaluate: {str(e)[:100]}")
+    for user in s.get("users", []):
+        pem = user.get("access_cert")      # the ONLY field read from a user object
+        if not pem:
+            continue
+        label = f"{name}/{user['username']}"
+
+        def _user(pem=pem, label=label):
+            c = cert_info(pem)
+            # The leading predicate: true on 2026-08-06, two months before anything broke.
+            verdict(f"{label}: issued by the current project CA", c["issuer"] == current_ca["subject"],
+                    f"issuer {c['issuer']!r}")
+            days = (c["not_after"] - NOW).days
+            verdict(f"{label}: expires more than {CERT_MIN_DAYS} days out", days > CERT_MIN_DAYS,
+                    f"{c['not_after']:%Y-%m-%d} ({days} days)")
+            # The lagging predicate: is it broken right now.
+            if accepted is not None:
+                verdict(f"{label}: broker accepts its issuer", c["issuer"] in accepted,
+                        f"broker accepts {accepted}")
+        guarded(f"{label} certificate", _user)
+
+print("\n== reported — never gating")
+for name, s in sorted(services.items()):
+    for u in (s.get("maintenance") or {}).get("updates", []):
+        due = u.get("deadline") or u.get("start_after") or "unscheduled"
+        report(f"{name}: maintenance pending", "info", f"{(u.get('description') or '')[:60]} — due {due}")
+    for n in s.get("service_notifications") or []:
+        report(f"{name}: notification ({n.get('level')})", "info", (n.get("message") or "")[:100])
+
+failed = [r for r in results if r[0] == "FAIL"]
+unknown = [r for r in results if r[0] == "UNKNOWN"]
+print()
+if failed:
+    print(f"NOT SATISFIED — {len(failed)} predicate(s) false:")
+    for _, n, d in failed: print(f"  - {n}: {d}")
+    sys.exit(1)
+if unknown:
+    print(f"FACTS NOT ESTABLISHED — {len(unknown)} predicate(s) could not be evaluated.")
+    sys.exit(2)
+print(f"SATISFIED — all {len(results)} predicates hold.")
+sys.exit(0)
