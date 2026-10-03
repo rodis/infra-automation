@@ -110,6 +110,13 @@ for name, s in sorted(services.items()):
     except Exception as e:
         accepted = None
         verdict(f"{name}: broker answers a TLS handshake", None, f"could not evaluate: {str(e)[:100]}")
+    # A Kafka service authenticating by certificate must show at least one. A read-only token may
+    # not be shown users' credentials at all, and then the loop below would grade nothing and the
+    # check would PASS having looked at nothing — an empty host pattern, one layer up. That is
+    # "facts not established", never a pass.
+    if not any(u.get("access_cert") for u in s.get("users", [])):
+        verdict(f"{name}: client certificates visible to this token", None,
+                "could not evaluate: no user carries access_cert (token scope too narrow?)")
     for user in s.get("users", []):
         pem = user.get("access_cert")      # the ONLY field read from a user object
         if not pem:
