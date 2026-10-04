@@ -220,6 +220,19 @@ def _canary():
             if j["status"] in ("successful", "failed", "error", "canceled") or time.time() - t0 > 480:
                 break
             time.sleep(5)
+        # A terminal STATUS is not a complete event log: AWX saves events asynchronously and sets
+        # event_processing_finished once the last one is in. Counting at "successful" read 2 of 3
+        # runner_on_ok about once a day (jobs 4131 and 4207, 2026-10-03/04) and reported a healthy
+        # AWX as broken — this check's own rule 8 failure. Wait for the flag; if it never comes,
+        # the count is not a fact, so do not grade it.
+        t1 = time.time()
+        while not j.get("event_processing_finished") and time.time() - t1 < 60:
+            time.sleep(2)
+            j = awx(f"/api/v2/jobs/{job_id}/")
+        if not j.get("event_processing_finished"):
+            verdict("canary: 3 x runner_on_ok on localhost", None,
+                    f"job {job_id}: {j['status']}, but AWX had not finished saving its events after 60s")
+            return
         events, url = [], f"/api/v2/jobs/{job_id}/job_events/?page_size=200"
         while url:
             page = awx(url.replace(AWX, "")); events += page["results"]; url = page["next"]
