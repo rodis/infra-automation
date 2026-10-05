@@ -276,21 +276,26 @@
       register: monitoring_listen
       changed_when: false
 
+    # Each ss line has TWO address columns, local and peer, and every listener's peer reads "0.0.0.0:*"
+    # — so a pattern over the whole line calls a loopback listener public (job 4288). Match the LOCAL
+    # column only (field 4: State Recv-Q Send-Q Local Peer). And the kernel truncates process names to
+    # 15 characters: VictoriaMetrics appears as "victoria-metric", so match that, or a public
+    # VictoriaMetrics would slip through unnoticed.
     - name: Exactly one public listener of ours, and it is vmauth on its port
+      vars:
+        local_re: '^LISTEN\s+\d+\s+\d+\s+'
+        ours: 'users:\(\("(victoria-metric|vmauth-prod)"'
       ansible.builtin.assert:
         that:
-          - monitoring_listen.stdout is search('127\.0\.0\.1:' ~ monitoring_vm_port ~ '\s')
-          - monitoring_listen.stdout is not search('(0\.0\.0\.0|\*|\[::\]):' ~ monitoring_vm_port ~ '\s')
-          - monitoring_listen.stdout is search('127\.0\.0\.1:' ~ monitoring_vmauth_internal_port ~ '\s')
-          - monitoring_listen.stdout is not search('(0\.0\.0\.0|\*|\[::\]):' ~ monitoring_vmauth_internal_port ~ '\s')
-          - monitoring_listen.stdout is search('0\.0\.0\.0:' ~ monitoring_vmauth_port ~ '\s')
-          # ss -p only shows processes this user owns, so every public line naming one of OUR binaries
-          # must be vmauth's port. Anything else of ours bound publicly fails the run.
+          - monitoring_listen.stdout_lines | select('search', local_re ~ '127\.0\.0\.1:' ~ monitoring_vm_port ~ '\s') | list | length == 1
+          - monitoring_listen.stdout_lines | select('search', local_re ~ '127\.0\.0\.1:' ~ monitoring_vmauth_internal_port ~ '\s') | list | length == 1
+          - monitoring_listen.stdout_lines | select('search', local_re ~ '0\.0\.0\.0:' ~ monitoring_vmauth_port ~ '\s') | list | length == 1
+          # every listener of ours whose LOCAL address is a wildcard must be vmauth's public port
           - >-
             monitoring_listen.stdout_lines
-            | select('search', 'victoria-metrics-prod|vmauth-prod')
-            | select('search', '(0\.0\.0\.0|\*|\[::\]):')
-            | reject('search', ':' ~ monitoring_vmauth_port ~ '\s')
+            | select('search', ours)
+            | select('search', local_re ~ '(0\.0\.0\.0|\*|\[::\]):')
+            | reject('search', local_re ~ '\S+:' ~ monitoring_vmauth_port ~ '\s')
             | list | length == 0
         fail_msg: "Listener layout is wrong — this box has no firewall:\n{{ monitoring_listen.stdout }}"
         quiet: true
