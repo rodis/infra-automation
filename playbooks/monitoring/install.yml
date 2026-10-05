@@ -1,0 +1,323 @@
+---
+# Install (or upgrade — it is idempotent) the self-hosted monitoring stack on the watcher VPS, as
+# `rods_brain`. AWX template "General: Monitoring: Install", inventory "Monitoring: VPS", credentials
+# "Machine: Monitoring VPS (rods_brain)" + "VictoriaMetrics writers". Policy: monitoring-estate
+# (infra-objectives/CLAUDE.md). Plan: vault `tasks`, project self-hosted-metrics.
+#
+# WHY IT IS SHAPED THIS WAY
+#
+# - One box, two tenants. The watcher (`rods_pinky`) and this stack (`rods_brain`) share vps71884 by the
+#   owner's decision (2026-10-05). Separate Unix users with 710 homes keep a compromised monitoring
+#   process away from the watcher's 1Password token; this play never touches the watcher's files.
+# - The box has NO firewall: anything bound to 0.0.0.0 is on the internet (measured 2026-10-05). So
+#   exactly one process listens publicly — vmauth, TLS, a bearer token per sender, routed to the write
+#   path only — and the play FAILS if anything else here is bound publicly.
+# - A Managed VPS: no root, no system service, Linger=no. Cron supervises, as it does Dagu.
+# - The 4 GiB cgroup cap is shared with the watcher and kills rather than swaps, so every process gets
+#   a Go memory ceiling and VictoriaMetrics gets query limits. A bad query should fail, not kill.
+# - No Grafana (owner, 2026-10-05): every reader is a program using the query API on loopback.
+# - TRIAL phase: a self-signed certificate for vps71884.dreamhostps.com, which senders pin explicitly,
+#   and 30-day retention. A real certificate and the final retention come after the trial.
+# - The agent reads as `rods_reader`, which cannot enter this home: an ACL grants it the logs and the
+#   public certificate, nothing else.
+#
+# Graded on the installed thing, not on this play's exit status.
+
+- name: Install the monitoring stack
+  hosts: all
+  become: false
+  gather_facts: true
+  vars:
+    monitoring_home: "{{ ansible_env.HOME }}/monitoring"
+    monitoring_bin: "{{ ansible_env.HOME }}/bin"
+    monitoring_src: "{{ playbook_dir }}/../../monitoring"
+    monitoring_reader: rods_reader
+    monitoring_hostname: vps71884.dreamhostps.com
+
+    # Pinned; both checksums computed from the official downloads AND matched against the published
+    # *_checksums.txt, 2026-10-05. Open-source single-node build, not cluster or enterprise.
+    monitoring_vm_version: "v1.153.0"
+    monitoring_vm_sha256: "1b495bde563825cf83dc7c0425a9d8fa03e7214858e0949f9177efc6bb1f8bfc"
+    monitoring_vmutils_sha256: "85aea24a4829cf26033d810aceb7888070bd4eaff321357168ff6db24bf7c00c"
+
+    monitoring_vm_port: 8428              # loopback only
+    monitoring_vmauth_port: 8427          # the one public port
+    monitoring_vmauth_internal_port: 8426 # vmauth's own /health and /metrics, loopback only
+    monitoring_vm_retention: 30d          # trial
+    # Sized from the estimate (2026-10-05): at 100k active series VictoriaMetrics needs well under 1 GB.
+    monitoring_vm_gomemlimit: 1536MiB
+    monitoring_vm_cache_bytes: 1GiB
+    monitoring_vm_max_concurrent_queries: 4
+    monitoring_vm_max_memory_per_query: 256MiB
+    monitoring_vmauth_gomemlimit: 128MiB
+
+    # From the AWX credential "VictoriaMetrics writers": a JSON list of {"name", "token"}. Never in a
+    # repo, never in a vault the agent reads.
+    monitoring_writers: "{{ (monitoring_writers_json | default('[]')) | from_json }}"
+
+  handlers:
+    - name: Restart victoria-metrics
+      ansible.builtin.shell: |
+        pkill -u "$(id -u)" -f "{{ monitoring_bin }}/[v]ictoria-metrics-prod" || true
+        for i in $(seq 1 30); do pgrep -u "$(id -u)" -f "{{ monitoring_bin }}/[v]ictoria-metrics-prod" >/dev/null || break; sleep 1; done
+        {{ monitoring_home }}/watchdog.sh
+      changed_when: true
+
+    - name: Restart vmauth
+      ansible.builtin.shell: |
+        pkill -u "$(id -u)" -f "{{ monitoring_bin }}/[v]mauth-prod" || true
+        sleep 2
+        {{ monitoring_home }}/watchdog.sh
+      changed_when: true
+
+  tasks:
+    # ---- Refuse what would be unsafe ----
+    - name: Refuse to run as the watcher's user
+      ansible.builtin.assert:
+        that: ansible_env.USER != 'rods_pinky'
+        fail_msg: >-
+          This play runs as rods_brain (inventory "Monitoring: VPS"). Run as rods_pinky it would put a
+          public listener in the home that holds the watcher's 1Password token.
+        quiet: true
+
+    - name: Refuse to install without senders, or with a weak token
+      ansible.builtin.assert:
+        that:
+          - monitoring_writers | length > 0
+          - monitoring_writers | map(attribute='token') | map('length') | min >= 32
+          - monitoring_writers | map(attribute='name') | unique | length == monitoring_writers | length
+        fail_msg: >-
+          No usable writers. Attach the AWX credential "VictoriaMetrics writers" (a JSON list of
+          {"name", "token"}, every token at least 32 characters, names unique). A vmauth with no users
+          is a public port that does nothing.
+        quiet: true
+      no_log: true
+
+    # ---- Layout ----
+    - name: Create directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ monitoring_bin }}"
+        - "{{ monitoring_home }}"
+        - "{{ monitoring_home }}/config"
+        - "{{ monitoring_home }}/tls"
+        - "{{ monitoring_home }}/logs"
+        - "{{ monitoring_home }}/downloads"
+        - "{{ monitoring_home }}/downloads/{{ monitoring_vm_version }}"
+        - "{{ monitoring_home }}/data"
+        - "{{ monitoring_home }}/data/victoria-metrics"
+
+    # ---- Binaries ----
+    - name: Download VictoriaMetrics {{ monitoring_vm_version }}
+      ansible.builtin.get_url:
+        url: "https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/{{ monitoring_vm_version }}/{{ item.file }}"
+        dest: "{{ monitoring_home }}/downloads/{{ item.file }}"
+        checksum: "sha256:{{ item.sha256 }}"
+        mode: "0600"
+      loop:
+        - {file: "victoria-metrics-linux-amd64-{{ monitoring_vm_version }}.tar.gz", sha256: "{{ monitoring_vm_sha256 }}"}
+        - {file: "vmutils-linux-amd64-{{ monitoring_vm_version }}.tar.gz", sha256: "{{ monitoring_vmutils_sha256 }}"}
+      loop_control: {label: "{{ item.file }}"}
+
+    - name: Unpack them into the per-version directory
+      ansible.builtin.unarchive:
+        src: "{{ monitoring_home }}/downloads/{{ item.file }}"
+        dest: "{{ monitoring_home }}/downloads/{{ monitoring_vm_version }}"
+        remote_src: true
+        include: ["{{ item.binary }}"]
+        creates: "{{ monitoring_home }}/downloads/{{ monitoring_vm_version }}/{{ item.binary }}"
+      loop:
+        - {file: "victoria-metrics-linux-amd64-{{ monitoring_vm_version }}.tar.gz", binary: victoria-metrics-prod}
+        - {file: "vmutils-linux-amd64-{{ monitoring_vm_version }}.tar.gz", binary: vmauth-prod}
+      loop_control: {label: "{{ item.binary }}"}
+
+    # One task per binary, so a new vmauth restarts only vmauth.
+    - name: Install victoria-metrics into ~/bin
+      ansible.builtin.copy:
+        src: "{{ monitoring_home }}/downloads/{{ monitoring_vm_version }}/victoria-metrics-prod"
+        dest: "{{ monitoring_bin }}/victoria-metrics-prod"
+        remote_src: true
+        mode: "0755"
+      notify: Restart victoria-metrics
+
+    - name: Install vmauth into ~/bin
+      ansible.builtin.copy:
+        src: "{{ monitoring_home }}/downloads/{{ monitoring_vm_version }}/vmauth-prod"
+        dest: "{{ monitoring_bin }}/vmauth-prod"
+        remote_src: true
+        mode: "0755"
+      notify: Restart vmauth
+
+    # ---- TLS (trial: self-signed, pinned by the senders) ----
+    - name: Generate vmauth's key and self-signed certificate, once
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -x509
+          - -newkey
+          - ec
+          - -pkeyopt
+          - ec_paramgen_curve:prime256v1
+          - -nodes
+          - -days
+          - "825"
+          - -subj
+          - "/CN={{ monitoring_hostname }}"
+          - -addext
+          - "subjectAltName=DNS:{{ monitoring_hostname }}"
+          - -keyout
+          - "{{ monitoring_home }}/tls/vmauth.key"
+          - -out
+          - "{{ monitoring_home }}/tls/vmauth.crt"
+        creates: "{{ monitoring_home }}/tls/vmauth.crt"
+      notify: Restart vmauth
+
+    - name: Key 600, certificate 644 (the certificate is public; senders pin it)
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: "{{ monitoring_home }}/tls/vmauth.key", mode: "0600"}
+        - {path: "{{ monitoring_home }}/tls/vmauth.crt", mode: "0644"}
+
+    # ---- Configuration ----
+    - name: vmauth configuration (holds every writer token)
+      ansible.builtin.template:
+        src: "{{ monitoring_src }}/vmauth.yml.j2"
+        dest: "{{ monitoring_home }}/config/vmauth.yml"
+        mode: "0600"
+      no_log: true
+      notify: Restart vmauth
+
+    - name: vmauth accepts its configuration
+      ansible.builtin.command:
+        argv: ["{{ monitoring_bin }}/vmauth-prod", "-auth.config={{ monitoring_home }}/config/vmauth.yml", "-dryRun"]
+      changed_when: false
+
+    - name: Watchdog
+      ansible.builtin.template:
+        src: "{{ monitoring_src }}/watchdog.sh.j2"
+        dest: "{{ monitoring_home }}/watchdog.sh"
+        mode: "0700"
+      notify:
+        - Restart victoria-metrics
+        - Restart vmauth
+
+    # ---- The agent's read access: logs and the public certificate, nothing else ----
+    - name: Let {{ monitoring_reader }} traverse to the logs and the certificate
+      ansible.builtin.command:
+        argv: [setfacl, -m, "u:{{ monitoring_reader }}:x", "{{ item }}"]
+      loop:
+        - "{{ ansible_env.HOME }}"
+        - "{{ monitoring_home }}"
+        - "{{ monitoring_home }}/tls"
+      changed_when: false
+
+    - name: Let {{ monitoring_reader }} read the logs, including logs created later
+      ansible.builtin.command:
+        argv: [setfacl, -R, -m, "u:{{ monitoring_reader }}:rX,d:u:{{ monitoring_reader }}:rX", "{{ monitoring_home }}/logs"]
+      changed_when: false
+
+    - name: Let {{ monitoring_reader }} read the certificate
+      ansible.builtin.command:
+        argv: [setfacl, -m, "u:{{ monitoring_reader }}:r", "{{ monitoring_home }}/tls/vmauth.crt"]
+      changed_when: false
+
+    # ---- Supervision ----
+    - name: Cron supervises the stack — every 5 minutes
+      ansible.builtin.cron:
+        name: "monitoring: keep the stack running"
+        minute: "*/5"
+        job: "{{ monitoring_home }}/watchdog.sh"
+
+    - name: Cron supervises the stack — at boot
+      ansible.builtin.cron:
+        name: "monitoring: start the stack at boot"
+        special_time: reboot
+        job: "{{ monitoring_home }}/watchdog.sh"
+
+    - name: Apply pending restarts
+      ansible.builtin.meta: flush_handlers
+
+    - name: Make sure everything is running (idempotent)
+      ansible.builtin.command: "{{ monitoring_home }}/watchdog.sh"
+      changed_when: false
+
+    # ---- Graded on the installed thing ----
+    - name: VictoriaMetrics answers on loopback
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ monitoring_vm_port }}/health"
+        return_content: true
+      register: monitoring_vm_health
+      retries: 12
+      delay: 5
+      until: monitoring_vm_health.status == 200 and 'OK' in monitoring_vm_health.content
+
+    - name: vmauth answers on its internal loopback port
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ monitoring_vmauth_internal_port }}/health"
+        return_content: true
+      register: monitoring_vmauth_health
+      retries: 12
+      delay: 5
+      until: monitoring_vmauth_health.status == 200
+
+    - name: Read what is listening, as this user
+      ansible.builtin.command: ss -ltnpH
+      register: monitoring_listen
+      changed_when: false
+
+    - name: Exactly one public listener of ours, and it is vmauth on its port
+      ansible.builtin.assert:
+        that:
+          - monitoring_listen.stdout is search('127\.0\.0\.1:' ~ monitoring_vm_port ~ '\s')
+          - monitoring_listen.stdout is not search('(0\.0\.0\.0|\*|\[::\]):' ~ monitoring_vm_port ~ '\s')
+          - monitoring_listen.stdout is search('127\.0\.0\.1:' ~ monitoring_vmauth_internal_port ~ '\s')
+          - monitoring_listen.stdout is not search('(0\.0\.0\.0|\*|\[::\]):' ~ monitoring_vmauth_internal_port ~ '\s')
+          - monitoring_listen.stdout is search('0\.0\.0\.0:' ~ monitoring_vmauth_port ~ '\s')
+          # ss -p only shows processes this user owns, so every public line naming one of OUR binaries
+          # must be vmauth's port. Anything else of ours bound publicly fails the run.
+          - >-
+            monitoring_listen.stdout_lines
+            | select('search', 'victoria-metrics-prod|vmauth-prod')
+            | select('search', '(0\.0\.0\.0|\*|\[::\]):')
+            | reject('search', ':' ~ monitoring_vmauth_port ~ '\s')
+            | list | length == 0
+        fail_msg: "Listener layout is wrong — this box has no firewall:\n{{ monitoring_listen.stdout }}"
+        quiet: true
+
+    - name: The public port refuses a write without a token
+      ansible.builtin.uri:
+        url: "https://{{ monitoring_hostname }}:{{ monitoring_vmauth_port }}/api/v1/write"
+        method: POST
+        body: ""
+        ca_path: "{{ monitoring_home }}/tls/vmauth.crt"
+        status_code: [401]
+      changed_when: false
+
+    - name: A writer token cannot query (it is routed to the write path only)
+      ansible.builtin.uri:
+        url: "https://{{ monitoring_hostname }}:{{ monitoring_vmauth_port }}/api/v1/query?query=up"
+        headers: {Authorization: "Bearer {{ monitoring_writers[0].token }}"}
+        ca_path: "{{ monitoring_home }}/tls/vmauth.crt"
+        status_code: [400, 401, 403, 404]
+      changed_when: false
+      no_log: true
+
+    - name: Read the certificate senders must pin
+      ansible.builtin.command:
+        argv: [openssl, x509, -in, "{{ monitoring_home }}/tls/vmauth.crt", -noout, -fingerprint, -sha256, -enddate]
+      register: monitoring_cert
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "VictoriaMetrics {{ monitoring_vm_version }} on 127.0.0.1:{{ monitoring_vm_port }}, retention {{ monitoring_vm_retention }}"
+          - "vmauth on 0.0.0.0:{{ monitoring_vmauth_port }} (TLS 1.3), {{ monitoring_writers | length }} writer(s): {{ monitoring_writers | map(attribute='name') | join(', ') }}"
+          - "certificate to pin: {{ monitoring_cert.stdout_lines | join(' | ') }}"
+          - "public certificate readable by {{ monitoring_reader }} at {{ monitoring_home }}/tls/vmauth.crt"

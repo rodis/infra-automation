@@ -1,0 +1,14 @@
+# Rendered by playbooks/monitoring/install.yml from monitoring/vmauth.yml.j2 — edit the template.
+# Mode 600: it holds every sender's token. The tokens come from the AWX credential
+# "VictoriaMetrics writers" at deploy time and exist nowhere the agent can read.
+#
+# One user per sender, so one leak is revoked alone. Each user is routed to the WRITE path only — a
+# writer token cannot query, so it can neither read the estate's data nor see what it would forge.
+users:
+{% for w in monitoring_writers %}
+  - name: "writer-{{ w.name }}"
+    bearer_token: "{{ w.token }}"
+    url_map:
+      - src_paths: ["/api/v1/write"]
+        url_prefix: "http://127.0.0.1:{{ monitoring_vm_port }}"
+{% endfor %}

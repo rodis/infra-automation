@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Rendered by playbooks/monitoring/install.yml from monitoring/watchdog.sh.j2 — edit the template.
+#
+# Keep the monitoring stack running. Called by cron every 5 minutes and @reboot: a Managed VPS gives no
+# root and no system service, and user systemd units stop at logout (Linger=no), so cron supervises —
+# the same shape as the watcher's own watchdog, on the same box, as a different user.
+#
+# Starting only what is not already running makes it safe to call as often as cron likes. "[x]" in each
+# pgrep pattern means the pattern can never match a command line that merely contains it.
+set -u
+H="{{ monitoring_home }}"
+B="{{ monitoring_bin }}"
+L="$H/logs"
+mkdir -p "$L"
+
+# Logs are appended (>>), so truncating one in place is safe while its process keeps writing. A log
+# is history, not state; 50 MB is far more than any question asked of it needs.
+for f in "$L"/*.log; do
+  [ -f "$f" ] && [ "$(stat -c %s "$f")" -gt 52428800 ] && : > "$f"
+done
+
+note() { echo "$(date -u +%FT%TZ) watchdog: $*" >>"$L/watchdog.log"; }
+
+# VictoriaMetrics single-node. Loopback only: nothing reaches it except through vmauth.
+# GOMEMLIMIT is the Go runtime's soft ceiling; the box's 4 GiB cgroup cap is shared with the watcher and
+# kills rather than swaps, so every process here gets a ceiling well below it.
+if ! pgrep -u "$(id -u)" -f "$B/[v]ictoria-metrics-prod" >/dev/null; then
+  GOMEMLIMIT={{ monitoring_vm_gomemlimit }} nohup "$B/victoria-metrics-prod" \
+    -storageDataPath="$H/data/victoria-metrics" \
+    -retentionPeriod={{ monitoring_vm_retention }} \
+    -httpListenAddr=127.0.0.1:{{ monitoring_vm_port }} \
+    -memory.allowedBytes={{ monitoring_vm_cache_bytes }} \
+    -search.maxConcurrentRequests={{ monitoring_vm_max_concurrent_queries }} \
+    -search.maxMemoryPerQuery={{ monitoring_vm_max_memory_per_query }} \
+    -selfScrapeInterval=30s \
+    >>"$L/victoria-metrics.log" 2>&1 &
+  note "started victoria-metrics (pid $!)"
+fi
+
+# vmauth: the ONLY process on this box that listens publicly. TLS, a bearer token per sender, each
+# token routed only to the write path. Its own /metrics and /health are moved to loopback with
+# -httpInternalListenAddr, so the public port serves nothing without a token.
+if ! pgrep -u "$(id -u)" -f "$B/[v]mauth-prod" >/dev/null; then
+  GOMEMLIMIT={{ monitoring_vmauth_gomemlimit }} nohup "$B/vmauth-prod" \
+    -auth.config="$H/config/vmauth.yml" \
+    -httpListenAddr=0.0.0.0:{{ monitoring_vmauth_port }} \
+    -httpInternalListenAddr=127.0.0.1:{{ monitoring_vmauth_internal_port }} \
+    -tls -tlsCertFile="$H/tls/vmauth.crt" -tlsKeyFile="$H/tls/vmauth.key" -tlsMinVersion=TLS13 \
+    >>"$L/vmauth.log" 2>&1 &
+  note "started vmauth (pid $!)"
+fi
