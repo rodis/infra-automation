@@ -1,3 +1,7 @@
+{#- Every metric pipeline forwards here. Grafana Cloud always; VictoriaMetrics on the watcher VPS too
+    during the self-hosted-metrics trial (alloy_vm_enabled — defaults/main.yml). One list, so a new
+    pipeline cannot forget the second sink. -#}
+{%- set metrics_sinks = (['prometheus.remote_write.grafana_cloud.receiver'] + (['prometheus.remote_write.victoriametrics.receiver'] if alloy_vm_enabled | bool else [])) | join(', ') -%}
 // Managed by playbooks/observability/install_alloy.yml — edits here are overwritten.
 //
 // Host metrics only. PostgreSQL metrics are deliberately absent: they need a dedicated read-only
@@ -41,7 +45,7 @@ discovery.relabel "host" {
 
 prometheus.scrape "host" {
   targets    = discovery.relabel.host.output
-  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+  forward_to = [{{ metrics_sinks }}]
 
   scrape_interval = "{{ alloy_scrape_interval }}"
 
@@ -71,6 +75,35 @@ prometheus.remote_write "grafana_cloud" {
   }
 }
 
+{% if alloy_vm_enabled | bool %}
+// ---------------------------------------------------------------------------------------------
+// SECOND SINK — VictoriaMetrics on the watcher VPS (trial, 2026-10-05; project self-hosted-metrics)
+//
+// Same series as Grafana Cloud, so the two can be compared before Grafana Cloud's metrics are dropped.
+// vmauth routes this token to /api/v1/write only. TLS is pinned to the trial's self-signed certificate.
+// VictoriaMetrics accepts out-of-order samples, unlike Mimir, so a backlog after an outage drains
+// rather than wedging; the queue is still kept modest — the box's memory cap is shared.
+// ---------------------------------------------------------------------------------------------
+
+prometheus.remote_write "victoriametrics" {
+  endpoint {
+    url          = "{{ alloy_vm_url }}"
+    bearer_token = "{{ alloy_vm_token }}"
+
+    tls_config {
+      ca_file     = "{{ alloy_vm_ca_file }}"
+      min_version = "TLS13"
+    }
+
+    queue_config {
+      capacity             = 2500
+      max_shards           = 4
+      max_samples_per_send = 500
+    }
+  }
+}
+
+{% endif %}
 {% if alloy_ship_logs %}
 
 // ---------------------------------------------------------------------------------------------
@@ -195,7 +228,7 @@ prometheus.scrape "awx" {
   bearer_token    = "{{ alloy_awx_token }}"
   scrape_interval = "{{ alloy_scrape_interval }}"
   job_name        = "awx"
-  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+  forward_to      = [{{ metrics_sinks }}]
 }
 {% endif %}
 
@@ -235,7 +268,7 @@ prometheus.scrape "etcd" {
 // need. grpc_server_started_total is kept for request rate by method; handled_total is dropped,
 // which costs the per-code error breakdown — the one real loss, and the dashboard says so.
 prometheus.relabel "etcd_keep" {
-  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+  forward_to = [{{ metrics_sinks }}]
 
   rule {
     source_labels = ["__name__"]
@@ -279,7 +312,7 @@ prometheus.scrape "apiserver" {
 }
 
 prometheus.relabel "apiserver_keep" {
-  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+  forward_to = [{{ metrics_sinks }}]
   rule {
     source_labels = ["__name__"]
     regex  = "probe_success|probe_duration_seconds|probe_http_status_code"
@@ -343,7 +376,7 @@ prometheus.scrape "postgres" {
 // What survives is connection headroom, the counters needed to judge cache behaviour before
 // touching shared_buffers, and enough of pg_stat_database to see errors and contention.
 prometheus.relabel "postgres_keep" {
-  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+  forward_to = [{{ metrics_sinks }}]
 
   rule {
     source_labels = ["__name__"]
@@ -559,7 +592,7 @@ prometheus.scrape "kube_state_metrics" {
 // sets multiply quickly; what survives is what answers "is the cluster healthy" -- readiness,
 // phases, restarts, desired-vs-available -- plus enough capacity to see a node filling up.
 prometheus.relabel "ksm_keep" {
-  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+  forward_to = [{{ metrics_sinks }}]
 
   // kube_node_role .. kube_customresource_* added 2026-09-27 so platform-healthy can read from Grafana
   // instead of over SSH: control-plane count, chart/version pins, IngressClass and hosts, restart rates,

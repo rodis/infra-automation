@@ -32,6 +32,15 @@
     run_once: true
     when: alloy_ship_logs | bool
 
+  - name: Check the VictoriaMetrics trial token, when it is supplied
+    ansible.builtin.assert:
+      that: alloy_vm_token | length >= 32
+      fail_msg: VM_WRITE_TOKEN_INFRA is set but shorter than 32 characters — not the token vmauth holds.
+      quiet: true
+    when: alloy_vm_enabled | bool
+    no_log: true
+    run_once: true
+
   - name: Check the AWX scrape settings were supplied
     ansible.builtin.assert:
       that:
@@ -301,6 +310,18 @@
     when:
       - alloy_has_pod_logs | default(false)
       - "'default:user:alloy:r-x' not in (alloy_pod_getfacl.stdout | default(''))"
+
+  # Public: the trial's self-signed certificate, which the second remote_write pins. Installed before
+  # the candidate config so a config that names it never runs without it.
+  - name: Install the VictoriaMetrics certificate to pin
+    ansible.builtin.copy:
+      src: victoriametrics-ca.crt
+      dest: "{{ alloy_vm_ca_file }}"
+      owner: root
+      group: alloy
+      mode: "0644"
+    when: alloy_vm_enabled | bool
+    notify: Restart alloy
 
   - name: Write the candidate Alloy configuration
     ansible.builtin.template:
