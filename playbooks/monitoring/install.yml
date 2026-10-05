@@ -257,9 +257,14 @@
       delay: 5
       until: monitoring_vm_health.status == 200 and 'OK' in monitoring_vm_health.content
 
+    # vmauth applies -tls to its internal listener too (job 4285: plain HTTP got "Client sent an HTTP
+    # request to an HTTPS server"). The certificate names the public hostname, not 127.0.0.1, so it
+    # cannot be verified here — acceptable for a loopback-only health probe, and the public port's
+    # certificate IS verified below, against the pinned file.
     - name: vmauth answers on its internal loopback port
       ansible.builtin.uri:
-        url: "http://127.0.0.1:{{ monitoring_vmauth_internal_port }}/health"
+        url: "https://127.0.0.1:{{ monitoring_vmauth_internal_port }}/health"
+        validate_certs: false
         return_content: true
       register: monitoring_vmauth_health
       retries: 12
