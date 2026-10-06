@@ -51,3 +51,15 @@ variable "ETCD_ANTI_AFFINITY" {
   type        = bool
   default     = false
 }
+# Opt-in stacked etcd on the masters (2026-10-06). Unset, they leave a stack exactly as it was. See
+# master.tf.
+variable "MASTER_ETCD_VOLUME_SIZE" {
+  description = "GB of etcd data volume per master; > 0 also puts every master in the etcd group (stacked etcd); 0 means neither"
+  type        = number
+  default     = 0
+}
+variable "MASTER_ANTI_AFFINITY" {
+  description = "Spread masters across hypervisors with a soft-anti-affinity server group"
+  type        = bool
+  default     = false
+}
