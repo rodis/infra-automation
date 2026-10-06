@@ -20,6 +20,7 @@ Three rules it tries hard to honour, all of them learned the hard way in this re
 import json, os, sys, time, urllib.error, urllib.parse, urllib.request
 
 from grafana_wake import wake
+import metrics   # where METRICS come from (Grafana Cloud or VictoriaMetrics); Loki stays on Grafana
 
 GRAFANA = (os.environ.get("GRAFANA_URL") or "").rstrip("/")
 TOKEN   = os.environ.get("GRAFANA_TOKEN") or ""
@@ -84,7 +85,7 @@ def _get(path, params):
 def promq(expr):
     """Instant query. Returns list of (labels, float) or NODATA. Never returns 0 for 'unanswerable'."""
     try:
-        d = _get(PROM + "/query", {"query": expr})
+        d = metrics.get("/query", {"query": expr})
     except Exception as e:
         return ("ERROR", str(e)[:80])
     res = (d.get("data") or {}).get("result") or []
@@ -153,7 +154,7 @@ def check(label, value, red=None, amber=None, unit="", nd=2, higher_is_worse=Tru
     line(label, v + unit, (mark + "  " if mark else "") + note)
 
 
-def check_counter(label, metric, red=None, amber=None, recent="15m", long="24h", note=""):
+def check_counter(label, selector, red=None, amber=None, recent="15m", long="24h", note="", agg="sum"):
     """A COUNTER graded on the recent window, with the long window as context.
 
     Same reasoning as the log checks, and added for the same reason: `proposals failed = 55` and
@@ -162,10 +163,19 @@ def check_counter(label, metric, red=None, amber=None, recent="15m", long="24h",
     "happening" from "happened", so it makes every deliberate change look like an incident until
     the window rolls past it -- which is precisely how a status tool teaches you to ignore it.
     """
-    now = scalar(f"increase({metric}[{recent}])")
-    day = scalar(f"increase({metric}[{long}])")
-    now = 0.0 if now is NODATA or isinstance(now, tuple) else now
-    day = 0.0 if day is NODATA or isinstance(day, tuple) else day
+    # `selector` is a raw series selector and the aggregation happens OUTSIDE increase(): a range like
+    # [24h] is only valid on a selector. The old form, increase(sum(...)[24h]), is invalid PromQL —
+    # Grafana Cloud rejected it, and the rejection below became 0, i.e. "quiet". So "container
+    # restarts" read quiet whatever happened; VictoriaMetrics, whose dialect accepts the form, showed
+    # 4 restarts in 24h that both backends' raw data agreed on (2026-10-06). `agg` is "sum" for a
+    # count across pods, "max" for a counter every etcd member reports for the same event.
+    now = scalar(f"{agg}(increase({selector}[{recent}]))")
+    day = scalar(f"{agg}(increase({selector}[{long}]))")
+    # A failed query or no data is reported as such — check() makes them RED/AMBER — never as zero.
+    for v in (now, day):
+        if v is NODATA or isinstance(v, tuple):
+            check(label, v, red=red, amber=amber, nd=0, note=note)
+            return
     if now > 0:
         state, graded = f"{day:,.0f} in {long} - HAPPENING NOW", now
     elif day > 0:
@@ -186,6 +196,7 @@ if not GRAFANA or not TOKEN:
 
 print("=" * 70)
 print(f"  ESTATE STATUS: {TARGET}  (read-only; mutates nothing)")
+print(f"  metrics from: {metrics.describe()}")
 print("=" * 70)
 
 # ------------------------------------------------- 1. can we see at all? -----
@@ -271,7 +282,7 @@ check("nodes Ready", scalar(f'count(kube_node_status_condition{{{KSM_SEL},condit
 check("pods not Running/Succeeded",
       scalar(f'count(kube_pod_status_phase{{{KSM_SEL}{NS_SEL},phase!="Running",phase!="Succeeded"}} == 1) or vector(0)'),
       red=3, amber=1, nd=0)
-check_counter("container restarts", f"sum(kube_pod_container_status_restarts_total{{{KSM_SEL}{NS_SEL}}})",
+check_counter("container restarts", f"kube_pod_container_status_restarts_total{{{KSM_SEL}{NS_SEL}}}",
               red=5, amber=1)
 check("deployments below desired",
       scalar(f'count(kube_deployment_status_replicas_available{{{KSM_SEL}{NS_SEL}}} < kube_deployment_spec_replicas{{{KSM_SEL}{NS_SEL}}}) or vector(0)'),
@@ -281,8 +292,8 @@ check("deployments below desired",
 if "etcd" in T_["sections"]:
     section("5. ETCD  -- slow fsync here is CHRONIC (network storage), not news")
     check("has leader", scalar(f'etcd_server_has_leader{{{HOST_SEL}}}'), red=1, higher_is_worse=False, nd=0)
-    check_counter("leader changes", "etcd_server_leader_changes_seen_total", red=2, amber=1)
-    check_counter("proposals failed", "etcd_server_proposals_failed_total", red=20, amber=1)
+    check_counter("leader changes", "etcd_server_leader_changes_seen_total", red=2, amber=1, agg="max")
+    check_counter("proposals failed", "etcd_server_proposals_failed_total", red=20, amber=1, agg="max")
     # Thresholds raised deliberately after the 2026-08-24 batching change. --backend-batch-interval
     # went 100ms -> 500ms, so each commit now carries roughly 8x the work: the DURATION of a commit is
     # expected to be high, and p99 of a per-operation metric is the wrong lens on a change that makes

@@ -24,6 +24,7 @@ import datetime, json, os, re, socket, ssl, sys, time
 import urllib.error, urllib.parse, urllib.request
 
 from grafana_wake import wake
+import metrics   # where METRICS come from (Grafana Cloud or VictoriaMetrics); Loki stays on Grafana
 
 GRAFANA = (os.environ.get("GRAFANA_URL") or "").rstrip("/")
 GRAFANA = GRAFANA if GRAFANA.startswith("http") or not GRAFANA else "https://" + GRAFANA
@@ -82,9 +83,7 @@ def awx(path, body=None):
 def prom(expr):
     """Scalar from an instant query, or None when the query returns no series. None is 'no data',
     which is never the same fact as zero."""
-    d = http_json(f"{GRAFANA}{PROM}/query?" + urllib.parse.urlencode({"query": expr}),
-                  {"Authorization": "Bearer " + GTOKEN})
-    res = d["data"]["result"]
+    res = metrics.query(expr)
     return float(res[0]["value"][1]) if res else None
 
 
@@ -109,8 +108,8 @@ def section(title):
 
 
 # ------------------------------------------------------------------------------------------------
-print(f"awx-healthy — {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M UTC}")
-if not (GRAFANA and GTOKEN and AWX and AWXTOK):
+print(f"awx-healthy — {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M UTC} — metrics from {metrics.describe()}")
+if not (metrics.configured()[0] and GRAFANA and GTOKEN and AWX and AWXTOK):
     print("missing GRAFANA_* or CONTROLLER_* — run through ./agent/run.sh")
     sys.exit(2)
 

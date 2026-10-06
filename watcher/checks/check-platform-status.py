@@ -17,7 +17,7 @@ than grant `list secrets`, which returns the values.
 """
 import datetime, json, os, re, ssl, sys, urllib.error, urllib.parse, urllib.request
 
-from grafana_wake import wake
+import metrics   # where METRICS come from: Grafana Cloud or VictoriaMetrics
 
 # infra reads south's kube-state-metrics in Grafana. production, when added, reads through AWX jobs
 # (task production-cluster-check) — never SSH.
@@ -81,20 +81,16 @@ def pin(path, pattern):
 # ------------------------------------------------------------------------------------------------
 
 def facts_from_grafana(ksm):
-    G = (os.environ.get("GRAFANA_URL") or "").rstrip("/")
-    G = G if G.startswith("http") or not G else "https://" + G
-    T = os.environ.get("GRAFANA_TOKEN") or ""
-    if not (G and T):
-        raise RuntimeError("GRAFANA_URL / GRAFANA_TOKEN not set — run through ./agent/run.sh")
+    ok, missing = metrics.configured()
+    if not ok:
+        raise RuntimeError(f"{missing} not set — run through ./agent/run.sh")
 
-    if wake(G, T):
+    if metrics.wake_if_needed():
         print("  grafana stack was asleep and has woken (free tier idles; not a fault)")
     sel = f'instance="{ksm}"'
 
     def q(expr):
-        url = f"{G}/api/datasources/proxy/uid/grafanacloud-prom/api/v1/query?" + urllib.parse.urlencode({"query": expr})
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"Authorization": "Bearer " + T}), timeout=30) as r:
-            return json.load(r)["data"]["result"]
+        return metrics.query(expr)
 
     def one(expr):
         r = q(expr); return float(r[0]["value"][1]) if r else None
@@ -151,7 +147,7 @@ def facts_from_grafana(ksm):
 target = sys.argv[1] if len(sys.argv) > 1 else ""
 if target not in TARGETS:
     print(f"usage: {sys.argv[0]} <{'|'.join(TARGETS)}>"); sys.exit(2)
-print(f"platform-healthy [{target}] from Grafana — {NOW:%Y-%m-%d %H:%M UTC}")
+print(f"platform-healthy [{target}] — {NOW:%Y-%m-%d %H:%M UTC} — metrics from {metrics.describe()}")
 try:
     F = facts_from_grafana(TARGETS[target]["ksm"])
 except Exception as e:
