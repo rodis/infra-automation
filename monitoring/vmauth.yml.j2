@@ -11,4 +11,20 @@ users:
     url_map:
       - src_paths: ["/api/v1/write"]
         url_prefix: "http://127.0.0.1:{{ monitoring_vm_port }}"
+        headers: ["Authorization: Basic {{ monitoring_vm_basic_auth }}"]
+{% endfor %}
+{% for r in monitoring_readers %}
+  # READ only: the query API, never a write path — so a reader cannot forge what it reads.
+  - name: "reader-{{ r.name }}"
+    bearer_token: "{{ r.token }}"
+    url_map:
+      - src_paths:
+          - "/api/v1/query"
+          - "/api/v1/query_range"
+          - "/api/v1/series"
+          - "/api/v1/labels"
+          - "/api/v1/label/[^/]+/values"
+          - "/api/v1/status/tsdb"
+        url_prefix: "http://127.0.0.1:{{ monitoring_vm_port }}"
+        headers: ["Authorization: Basic {{ monitoring_vm_basic_auth }}"]
 {% endfor %}

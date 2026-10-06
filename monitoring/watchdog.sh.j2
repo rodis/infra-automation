@@ -21,11 +21,17 @@ done
 
 note() { echo "$(date -u +%FT%TZ) watchdog: $*" >>"$L/watchdog.log"; }
 
-# VictoriaMetrics single-node. Loopback only: nothing reaches it except through vmauth.
+# VictoriaMetrics single-node. Loopback only, AND password-protected: loopback alone is not a boundary
+# on a shared box — every local user (the watcher, the agent's rods_reader) could otherwise write to it
+# without a token, which would break "the agent never holds a way to write what it is graded on". The
+# password comes from a 600 file into the ENVIRONMENT (-envflag.enable), never the command line, which
+# `ps` shows to every user; a process's environment is readable only by its own user.
 # GOMEMLIMIT is the Go runtime's soft ceiling; the box's 4 GiB cgroup cap is shared with the watcher and
 # kills rather than swaps, so every process here gets a ceiling well below it.
 if ! pgrep -u "$(id -u)" -f "$B/[v]ictoria-metrics-prod" >/dev/null; then
+  httpAuth_username=vmauth httpAuth_password="$(cat "$H/config/vm-password")" \
   GOMEMLIMIT={{ monitoring_vm_gomemlimit }} nohup "$B/victoria-metrics-prod" \
+    -envflag.enable \
     -storageDataPath="$H/data/victoria-metrics" \
     -retentionPeriod={{ monitoring_vm_retention }} \
     -httpListenAddr=127.0.0.1:{{ monitoring_vm_port }} \
