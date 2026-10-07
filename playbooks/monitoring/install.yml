@@ -1,7 +1,8 @@
 ---
 # Install (or upgrade — it is idempotent) the self-hosted monitoring stack on the watcher VPS, as
 # `rods_brain`. AWX template "General: Monitoring: Install", inventory "Monitoring: VPS", credentials
-# "Machine: Monitoring VPS (rods_brain)" + "VictoriaMetrics writers". Policy: monitoring-estate
+# "Machine: Monitoring VPS (rods_brain)" + "VictoriaMetrics writers", and optionally
+# "VictoriaMetrics readers" + "VictoriaMetrics agent reader". Policy: monitoring-estate
 # (infra-objectives/CLAUDE.md). Plan: vault `tasks`, project self-hosted-metrics.
 #
 # WHY IT IS SHAPED THIS WAY
@@ -54,9 +55,15 @@
     # From the AWX credential "VictoriaMetrics writers": a JSON list of {"name", "token"}. Never in a
     # repo, never in a vault the agent reads.
     monitoring_writers: "{{ (monitoring_writers_json | default('[]')) | from_json }}"
-    # From the AWX credential "VictoriaMetrics readers": the same shape. May be empty — the stack runs
-    # without readers; only the checks need them. Routed to the query API only.
-    monitoring_readers: "{{ (monitoring_readers_json | default('[]')) | from_json }}"
+    # Readers, routed to the query API only. Two AWX credentials, one per OWNER of a token, so no token
+    # passes through someone else (owner, 2026-10-07):
+    #   "VictoriaMetrics readers"      — JSON list of {name, token}; the owner writes it (the watcher's)
+    #   "VictoriaMetrics agent reader" — one token the agent generates into agent-managed and here
+    # The AWX API never returns a credential's secret, so a single combined list would have to be
+    # rewritten by someone holding every token in it. Both are optional; the stack runs without readers.
+    monitoring_readers: >-
+      {{ ((monitoring_readers_json | default('[]')) | from_json)
+         + ([{'name': 'agent', 'token': monitoring_agent_reader_token}] if (monitoring_agent_reader_token | default('')) else []) }}
 
   handlers:
     - name: Restart victoria-metrics
@@ -90,6 +97,7 @@
           - monitoring_writers | map(attribute='token') | map('length') | min >= 32
           - monitoring_writers | map(attribute='name') | unique | length == monitoring_writers | length
           - (monitoring_readers | length == 0) or (monitoring_readers | map(attribute='token') | map('length') | min >= 32)
+          - monitoring_readers | map(attribute='name') | unique | length == monitoring_readers | length
         fail_msg: >-
           No usable writers. Attach the AWX credential "VictoriaMetrics writers" (a JSON list of
           {"name", "token"}, every token at least 32 characters, names unique). A vmauth with no users
