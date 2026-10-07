@@ -188,6 +188,9 @@
         - {name: run.sh, mode: "0700"}
         - {name: watchdog.sh, mode: "0700"}
         - {name: watcher.env, mode: "0600"}
+        # Public: the monitoring box's self-signed certificate, pinned by the checks (VM_CA_FILE). The
+        # watcher cannot read rods_brain's copy, and should not need to.
+        - {name: victoriametrics-ca.crt, mode: "0644"}
 
     - name: Clone helm-override-files (public, read-only — the pins and AWX's task_replicas)
       ansible.builtin.git:
