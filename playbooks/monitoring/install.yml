@@ -44,7 +44,10 @@
     monitoring_vm_port: 8428              # loopback only
     monitoring_vmauth_port: 8427          # the one public port
     monitoring_vmauth_internal_port: 8426 # vmauth's own /health and /metrics, loopback only
-    monitoring_vm_retention: 30d          # trial
+    # 180 days (owner, 2026-10-07). Growing it is harmless; SHRINKING it deletes data, which the
+    # monitoring-estate policy reserves for the owner. ~0.5 bytes/sample measured: infra for 180 days is
+    # ~0.4 GB. No backups by the owner's decision — losing the box loses the history, nothing else.
+    monitoring_vm_retention: 180d
     # Sized from the estimate (2026-10-05): at 100k active series VictoriaMetrics needs well under 1 GB.
     monitoring_vm_gomemlimit: 1536MiB
     monitoring_vm_cache_bytes: 1GiB
