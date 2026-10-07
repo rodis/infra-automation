@@ -66,17 +66,23 @@
          + ([{'name': 'agent', 'token': monitoring_agent_reader_token}] if (monitoring_agent_reader_token | default('')) else []) }}
 
   handlers:
-    - name: Restart victoria-metrics
-      ansible.builtin.shell: |
-        pkill -u "$(id -u)" -f "{{ monitoring_bin }}/[v]ictoria-metrics-prod" || true
-        for i in $(seq 1 30); do pgrep -u "$(id -u)" -f "{{ monitoring_bin }}/[v]ictoria-metrics-prod" >/dev/null || break; sleep 1; done
-        {{ monitoring_home }}/watchdog.sh
-      changed_when: true
-
+    # ORDER MATTERS, and Ansible runs handlers in the order they are DEFINED here, not notified.
+    # vmauth first: when a deploy changes VictoriaMetrics' password, vmauth must already be presenting
+    # the new header when VictoriaMetrics starts demanding it — VictoriaMetrics ignores a header it does
+    # not require. The other way round, job 4449 (2026-10-07): VictoriaMetrics required the password
+    # ~4 s before vmauth sent it, vmauth relayed 401, Alloy treats a 4xx as non-recoverable and dropped
+    # a whole batch (477 samples, k8s-south-node-2). A 502 while a backend restarts IS retried.
     - name: Restart vmauth
       ansible.builtin.shell: |
         pkill -u "$(id -u)" -f "{{ monitoring_bin }}/[v]mauth-prod" || true
         sleep 2
+        {{ monitoring_home }}/watchdog.sh
+      changed_when: true
+
+    - name: Restart victoria-metrics
+      ansible.builtin.shell: |
+        pkill -u "$(id -u)" -f "{{ monitoring_bin }}/[v]ictoria-metrics-prod" || true
+        for i in $(seq 1 30); do pgrep -u "$(id -u)" -f "{{ monitoring_bin }}/[v]ictoria-metrics-prod" >/dev/null || break; sleep 1; done
         {{ monitoring_home }}/watchdog.sh
       changed_when: true
 
