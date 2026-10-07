@@ -136,19 +136,13 @@ loki.relabel "journal" {
     target_label  = "level"
   }
 
-  // Alloy is by far the noisiest unit on these hosts — roughly 870 lines per 15 minutes, about
-  // 83k a day, almost all of it the collector narrating its own scrape loop. Dropping its info and
-  // debug lines removes the bulk of the volume and loses nothing anyone would query.
-  //
-  // Its warn/error/crit lines are KEPT deliberately. Those are how we would learn that shipping
-  // has broken, and a collector that stops reporting its own failures is the observability
-  // equivalent of a smoke alarm with the battery out.
-  rule {
-    source_labels = ["__journal__systemd_unit", "__journal_priority_keyword"]
-    separator     = ";"
-    regex         = "alloy\\.service;(info|debug)"
-    action        = "drop"
-  }
+  // Alloy is by far the noisiest unit on these hosts (~83k lines a day of it narrating its own scrape
+  // loop), so its info and debug lines are dropped — in loki.process "journal" below, NOT here. This
+  // used to be a relabel rule on journald's PRIORITY, and that silently dropped everything: Alloy writes
+  // every line at priority 6 (info) and puts the real level only in the text, `level=warn|error`
+  // (k8s-south-node-2, 2026-10-07: 1 error, 10 warn, 28 info, all priority 6). So its warnings and
+  // errors — how we would learn that shipping broke — never reached Loki. Found while chasing a
+  // dropped remote_write batch that only the host's own journal could explain.
 
   // Collapse transient per-login units into one stream. systemd names each SSH session
   // `session-<N>.scope` with an ever-increasing N, so left alone `unit` is an UNBOUNDED label and
@@ -172,13 +166,38 @@ loki.relabel "journal" {
 }
 
 loki.source.journal "journal" {
-  forward_to    = [loki.write.grafana_cloud.receiver]
+  forward_to    = [loki.process.journal.receiver]
   relabel_rules = loki.relabel.journal.rules
   max_age       = "{{ alloy_journal_max_age }}"
 
   labels = {
     job      = "journal",
     instance = "{{ inventory_hostname }}",
+  }
+}
+
+// Alloy's own lines: read the level from the TEXT (journald says "info" for all of them), label the
+// line with it, and drop info/debug. Warnings and errors go through — the smoke alarm, with a battery.
+// Every other unit passes untouched.
+loki.process "journal" {
+  forward_to = [loki.write.grafana_cloud.receiver]
+
+  stage.match {
+    selector = "{unit=\"alloy.service\"}"
+
+    stage.regex {
+      expression = "level=(?P<alloy_level>[a-z]+)"
+    }
+
+    stage.labels {
+      values = { level = "alloy_level" }
+    }
+
+    stage.drop {
+      source              = "alloy_level"
+      expression          = "^(info|debug)$"
+      drop_counter_reason = "alloy_self_info_debug"
+    }
   }
 }
 
