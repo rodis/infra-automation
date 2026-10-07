@@ -105,6 +105,20 @@
         quiet: true
       no_log: true
 
+    # A reader's token must never also be a writer's. On 2026-10-07 the readers credential was first
+    # created with the WRITERS type — same shape, one dropdown away — which would have installed the
+    # watcher's read-only token as a writer. Caught by reading the credential's type before launching;
+    # this makes the play itself refuse it.
+    - name: Refuse a token that is both a writer and a reader
+      ansible.builtin.assert:
+        that:
+          - (monitoring_writers | map(attribute='token') | list) | intersect(monitoring_readers | map(attribute='token') | list) | length == 0
+        fail_msg: >-
+          A token appears as both writer and reader. Check the credential TYPES attached to the
+          job: "VictoriaMetrics readers" must be of type "VictoriaMetrics readers", not "... writers".
+        quiet: true
+      no_log: true
+
     # ---- Layout ----
     - name: Create directories
       ansible.builtin.file:
