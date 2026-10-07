@@ -52,6 +52,11 @@
     monitoring_vm_max_memory_per_query: 256MiB
     monitoring_vmauth_gomemlimit: 128MiB
 
+    # An explicit restart, as a named and logged action rather than an ad-hoc command: a list of
+    # "vmauth" and/or "victoria-metrics" (extra var at launch). Used to prove a plain restart loses no
+    # samples (task alloy-restart-retry) and for upgrades. Handlers keep their order: vmauth first.
+    monitoring_restart: []
+
     # From the AWX credential "VictoriaMetrics writers": a JSON list of {"name", "token"}. Never in a
     # repo, never in a vault the agent reads.
     monitoring_writers: "{{ (monitoring_writers_json | default('[]')) | from_json }}"
@@ -292,6 +297,24 @@
         name: "monitoring: start the stack at boot"
         special_time: reboot
         job: "{{ monitoring_home }}/watchdog.sh"
+
+    - name: Refuse an unknown restart target
+      ansible.builtin.assert:
+        that: (monitoring_restart | difference(['vmauth', 'victoria-metrics'])) | length == 0
+        fail_msg: "monitoring_restart takes 'vmauth' and/or 'victoria-metrics', got {{ monitoring_restart }}"
+        quiet: true
+
+    - name: Restart requested — vmauth
+      ansible.builtin.debug: {msg: "restart requested: vmauth"}
+      when: "'vmauth' in monitoring_restart"
+      changed_when: true
+      notify: Restart vmauth
+
+    - name: Restart requested — victoria-metrics
+      ansible.builtin.debug: {msg: "restart requested: victoria-metrics"}
+      when: "'victoria-metrics' in monitoring_restart"
+      changed_when: true
+      notify: Restart victoria-metrics
 
     - name: Apply pending restarts
       ansible.builtin.meta: flush_handlers
