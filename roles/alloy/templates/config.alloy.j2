@@ -1,7 +1,7 @@
-{#- Every metric pipeline forwards here. Grafana Cloud always; VictoriaMetrics on the watcher VPS too
-    during the self-hosted-metrics trial (alloy_vm_enabled — defaults/main.yml). One list, so a new
+{#- Every metric pipeline forwards here: VictoriaMetrics on the watcher VPS (alloy_vm_enabled), and
+    Grafana Cloud only if alloy_metrics_to_grafana — off since the cutover, 2026-10-08. One list, so a new
     pipeline cannot forget the second sink. -#}
-{%- set metrics_sinks = (['prometheus.remote_write.grafana_cloud.receiver'] + (['prometheus.remote_write.victoriametrics.receiver'] if alloy_vm_enabled | bool else [])) | join(', ') -%}
+{%- set metrics_sinks = ((['prometheus.remote_write.grafana_cloud.receiver'] if alloy_metrics_to_grafana | bool else []) + (['prometheus.remote_write.victoriametrics.receiver'] if alloy_vm_enabled | bool else [])) | join(', ') -%}
 // Managed by playbooks/observability/install_alloy.yml — edits here are overwritten.
 //
 // Host metrics only. PostgreSQL metrics are deliberately absent: they need a dedicated read-only
@@ -54,6 +54,7 @@ prometheus.scrape "host" {
   job_name = "integrations/node_exporter"
 }
 
+{% if alloy_metrics_to_grafana | bool %}
 prometheus.remote_write "grafana_cloud" {
   endpoint {
     url = "{{ alloy_remote_write_url }}"
@@ -74,6 +75,7 @@ prometheus.remote_write "grafana_cloud" {
 
   }
 }
+{% endif %}
 
 {% if alloy_vm_enabled | bool %}
 // ---------------------------------------------------------------------------------------------

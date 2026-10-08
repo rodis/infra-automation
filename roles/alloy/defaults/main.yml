@@ -1,5 +1,10 @@
 ---
-# METRICS. Supplied by the Spacelift `Observability` context; only the token is secret.
+# METRICS TO GRAFANA CLOUD — OFF since the cutover (owner, 2026-10-08, project self-hosted-metrics):
+# VictoriaMetrics on the watcher VPS is the only metrics sink. Logs still go to Grafana Cloud's Loki
+# (below) until VictoriaLogs exists. Set true to send metrics to Grafana Cloud again.
+alloy_metrics_to_grafana: false
+# Supplied by the Spacelift `Observability` context; only the token is secret. Used only when
+# alloy_metrics_to_grafana is true.
 alloy_remote_write_url: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_URL') }}"
 alloy_remote_write_user: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_USER') }}"
 alloy_remote_write_token: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_TOKEN') }}"

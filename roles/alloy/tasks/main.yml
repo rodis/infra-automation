@@ -3,7 +3,20 @@
   # Fail loudly and early rather than installing a collector that silently ships nowhere. A
   # misnamed context variable is the likeliest failure here, and an Alloy that starts, runs, and
   # writes to an empty URL looks healthy from every angle except the one that matters.
+  # After the cutover a metrics sink can be switched off, so "no sink at all" must be impossible: an
+  # Alloy with nowhere to send metrics starts, runs, and looks healthy from every angle but the one
+  # that matters.
+  - name: Refuse a configuration that ships metrics nowhere
+    ansible.builtin.assert:
+      that: (alloy_metrics_to_grafana | bool) or (alloy_vm_enabled | bool)
+      fail_msg: >-
+        No metrics sink: alloy_metrics_to_grafana is false and VM_WRITE_TOKEN_INFRA (VictoriaMetrics)
+        is not set. Check the `observability` context.
+      quiet: true
+    run_once: true
+
   - name: Check the remote_write settings were supplied
+    when: alloy_metrics_to_grafana | bool
     ansible.builtin.assert:
       that:
         - alloy_remote_write_url | length > 0
