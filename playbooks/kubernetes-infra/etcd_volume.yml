@@ -12,8 +12,8 @@
 # formatted XFS and mounted AT /var/lib/etcd — kubeadm's dataDir — so the static-pod manifest and
 # the kubeadm ClusterConfiguration do not change, and an upgrade cannot undo this.
 #
-# THE OUTAGE: etcd is stopped while its data is copied (~12 MB on 2026-10-09: seconds). The API is
-# down for a minute or two; running pods keep running, controllers with leader election restart
+# THE OUTAGE: etcd is stopped while its data is copied and compared — 379 MB of WAL and snapshots
+# around a 12 MB database on 2026-10-09, read off a slow disk. The API is down for a few minutes; running pods keep running, controllers with leader election restart
 # once, as they do in every stall today. AWX's UI and API at infra.rods.me may error meanwhile.
 #
 # SAFETY, in order:
