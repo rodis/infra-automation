@@ -25,31 +25,51 @@ steps:
     command: flock -w 120 {{ watcher_home }}/.pins.lock git -C {{ watcher_home }}/helm-override-files pull --ff-only -q
     continue_on: {failure: true}
 
-  # Always exits 0 so its full report stays readable; the verdict steps below carry the result.
+  # Always exits 0 so its full report stays readable; the verdict steps below carry the result. The
+  # report is also kept in a file, for the notification gate and the alert message.
   # No retry: a retry only repeats a finding and spends 1Password quota (run.sh).
   - id: {{ item.step }}
     depends: [refresh_pins]
     timeout_sec: 1800
-    command: sh -c './run.sh python3 -u checks/{{ item.script }}; echo $? > "/tmp/dagu-verdict-${DAG_RUN_ID}"'
+    command: sh -c './run.sh python3 -u checks/{{ item.script }} > "/tmp/dagu-out-${DAG_RUN_ID}" 2>&1; c=$?; cat "/tmp/dagu-out-${DAG_RUN_ID}"; echo $c > "/tmp/dagu-verdict-${DAG_RUN_ID}"'
 
-  - id: finding
+  # Decides whether this result reaches Telegram: a new or changed finding does, the same one again does
+  # not — except once a day as a reminder. See notify-gate.sh. Fails open (alerts) if it cannot decide.
+  - id: notify_gate
     depends: [{{ item.step }}]
+    command: sh -c './notify-gate.sh {{ item.name }} "$(cat /tmp/dagu-verdict-${DAG_RUN_ID})" "/tmp/dagu-out-${DAG_RUN_ID}" > "/tmp/dagu-gate-${DAG_RUN_ID}" || echo alert > "/tmp/dagu-gate-${DAG_RUN_ID}"; echo "notification -> $(cat /tmp/dagu-gate-${DAG_RUN_ID})"'
+
+  # The verdict steps fail — which is what Dagu notifies on — only when the gate says "alert". Their
+  # stderr carries the failing lines, which Dagu puts in the message as {{ '{{' }}run.error{{ '}}' }}.
+  - id: finding
+    depends: [notify_gate]
     preconditions:
       - condition: 'test "$(cat /tmp/dagu-verdict-${DAG_RUN_ID})" = 1'
-    command: sh -c 'echo "FINDING — a success predicate is false. Read the {{ item.step }} step log."; exit 1'
+      - condition: 'test "$(cat /tmp/dagu-gate-${DAG_RUN_ID})" = alert'
+    command: sh -c 'grep -E "^\s+(FAIL|UNKNOWN)\s|^\s+! " "/tmp/dagu-out-${DAG_RUN_ID}" | sed -E "s/^\s+//; s/  +/ /g" | head -6 >&2; echo "FINDING — a success predicate is false. Read the {{ item.step }} step log."; exit 1'
 
   - id: facts_not_established
-    depends: [{{ item.step }}]
+    depends: [notify_gate]
     preconditions:
       - condition: 'test "$(cat /tmp/dagu-verdict-${DAG_RUN_ID})" = 2'
-    command: sh -c 'echo "FACTS NOT ESTABLISHED — the check could not see (rule 8). Not evidence about the estate."; exit 1'
+      - condition: 'test "$(cat /tmp/dagu-gate-${DAG_RUN_ID})" = alert'
+    command: sh -c 'grep -E "^\s+UNKNOWN\s|FACTS NOT ESTABLISHED" "/tmp/dagu-out-${DAG_RUN_ID}" | sed -E "s/^\s+//; s/  +/ /g" | head -6 >&2; echo "FACTS NOT ESTABLISHED — the check could not see (rule 8). Not evidence about the estate."; exit 1'
 
   - id: check_broken
-    depends: [{{ item.step }}]
+    depends: [notify_gate]
     preconditions:
       - condition: 'test "$(cat /tmp/dagu-verdict-${DAG_RUN_ID})" -gt 2'
-    command: sh -c 'echo "CHECK BROKEN — the checker itself crashed or was not found."; exit 1'
+      - condition: 'test "$(cat /tmp/dagu-gate-${DAG_RUN_ID})" = alert'
+    command: sh -c 'tail -5 "/tmp/dagu-out-${DAG_RUN_ID}" >&2; echo "CHECK BROKEN — the checker itself crashed or was not found."; exit 1'
+
+  # The same finding again, inside the day: recorded here, not sent. Succeeds, so Dagu stays quiet.
+  - id: known_finding
+    depends: [notify_gate]
+    preconditions:
+      - condition: 'test "$(cat /tmp/dagu-verdict-${DAG_RUN_ID})" != 0'
+      - condition: 'test "$(cat /tmp/dagu-gate-${DAG_RUN_ID})" = quiet'
+    command: sh -c 'echo "Known finding, unchanged — not re-sent (a reminder goes out once a day). State file $HOME/watcher/state/{{ item.name }}.state"'
 
 handler_on:
   exit:
-    command: rm -f "/tmp/dagu-verdict-${DAG_RUN_ID}"
+    command: rm -f "/tmp/dagu-verdict-${DAG_RUN_ID}" "/tmp/dagu-out-${DAG_RUN_ID}" "/tmp/dagu-gate-${DAG_RUN_ID}"

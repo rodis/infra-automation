@@ -125,6 +125,8 @@
         # check-result/v1 documents (`--json`), the latest per check. What an agent reads to act on a
         # result; nothing reads them yet.
         - "{{ watcher_home }}/results"
+        # notify-gate.sh's memory: the last result per check, so a known finding is not re-sent hourly.
+        - "{{ watcher_home }}/state"
         - "{{ watcher_home }}/downloads"
         - "{{ watcher_dagu_config_dir }}/dags"
 
@@ -187,6 +189,7 @@
       loop:
         - {name: run.sh, mode: "0700"}
         - {name: watchdog.sh, mode: "0700"}
+        - {name: notify-gate.sh, mode: "0700"}
         - {name: watcher.env, mode: "0600"}
         # Public: the monitoring box's self-signed certificate, pinned by the checks (VM_CA_FILE). The
         # watcher cannot read rods_brain's copy, and should not need to.

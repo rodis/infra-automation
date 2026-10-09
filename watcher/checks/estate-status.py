@@ -235,28 +235,36 @@ for d in down:
 if not down and all(h in seen for h in EXPECTED):
     line("all expected hosts present", "ok")
 
-# ------------------------------------------------------------ 2. alerts -----
+# ------------------------------------------------------- 2. thresholds -----
+# Until 2026-10-08 this section read Grafana Cloud's alert-rule STATES. Metrics left Grafana Cloud that
+# day, its rules lost their data, and three of them (noDataState=Alerting) fired permanently — so this
+# report raised "FIRING" every hour about rules that no longer saw anything. The four rules
+# (infra-automation playbooks/grafana/alerts/management-plane.json) are evaluated here instead, against
+# the metrics backend, with the same thresholds; "for N minutes" becomes the worst value over the
+# window. Ranges over expressions use subqueries WITH a step: Prometheus/Mimir reject them without one.
 if "alerts" in T_["sections"]:
-    section("2. ALERTS  -- evaluating, but NOT deliverable: no contact point exists")
-    try:
-        d = _get("/api/prometheus/grafana/api/v1/rules", {})
-        rules = [r for g in (d.get("data") or {}).get("groups", []) for r in g.get("rules", [])]
-        firing = [r for r in rules if r.get("state") == "firing"]
-        unhealthy = [r for r in rules if r.get("health") != "ok"]
-        line("rules evaluating", f"{len(rules)}")
-        if unhealthy:
-            for r in unhealthy:
-                line(f"  {r.get('name','?')[:30]}", f"health={r.get('health')}", "<- fires nothing")
-                findings.append(("RED", f"alert rule unhealthy: {r.get('name')}"))
-        if firing:
-            for r in firing:
-                line(f"  {r.get('name','?')[:30]}", "FIRING")
-                findings.append(("RED", f"FIRING: {r.get('name')}"))
+    section("2. THRESHOLDS  -- the former Grafana Cloud rules, evaluated here")
+    rules = [
+        ("host not reporting (5m)",       f'max_over_time(up{{{HOST_SEL}}}[5m]) < 1'),
+        ("root filesystem < 10% free (15m)",
+         f'max_over_time((node_filesystem_avail_bytes{{mountpoint="/",{HOST_SEL}}} / node_filesystem_size_bytes{{mountpoint="/",{HOST_SEL}}})[15m:1m]) < 0.1'),
+        ("memory < 10% available (15m)",
+         f'max_over_time((node_memory_MemAvailable_bytes{{{HOST_SEL}}} / node_memory_MemTotal_bytes{{{HOST_SEL}}})[15m:1m]) < 0.1'),
+        ("CPU steal > 5% (10m)",
+         f'min_over_time((sum by (instance) (rate(node_cpu_seconds_total{{mode="steal",{HOST_SEL}}}[5m])))[10m:1m]) > 0.05'),
+    ]
+    for label, expr in rules:
+        r = promq(expr)
+        if isinstance(r, tuple) and r[0] == "ERROR":
+            line(label, "QUERY FAILED", r[1][:40]); findings.append(("RED", f"{label}: query failed"))
+        elif r is NODATA:
+            # The comparison filters: no series means no host breaches. Hosts that are not reporting at
+            # all are the collectors section's job, which runs first and gates everything below it.
+            line(label, "none")
         else:
-            line("firing", "none")
-    except Exception as e:
-        line("alert state", "QUERY FAILED", str(e)[:40])
-        findings.append(("AMBER", "could not read alert state"))
+            hosts = sorted({m.get("instance", "?") for m, _ in r})
+            line(label, ", ".join(hosts), "RED")
+            findings.append(("RED", f"{label}: {', '.join(hosts)}"))
 
 # ------------------------------------------------------------- 3. hosts -----
 section("3. HOSTS")
@@ -398,9 +406,9 @@ else:
 
 print(f"""
    WHAT THIS CANNOT TELL YOU
-     - Whether alerts would reach anyone. They would not: rules evaluate, but no
-       contact point exists, so a firing rule notifies nobody.
-     - Whether the monitoring itself died. Every number here comes from Grafana;
+     - Thresholds between hourly runs. Section 2 evaluates the former alert rules
+       when this runs, not continuously; that is vmalert's job, once it exists.
+     - Whether the monitoring itself died. Every number here comes from the metrics backend;
        if ingestion stopped, this reports the last known values as if current.
        That gap needs a dead-man's switch outside the estate.
      - Anything outside this target. This is {TARGET} only.
