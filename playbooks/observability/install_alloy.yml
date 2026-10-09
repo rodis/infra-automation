@@ -26,6 +26,15 @@
   roles:
     - role: ../../roles/kube_state_metrics
 
+# The cluster scraper (2026-10-09): kubelet/cAdvisor and API-server metrics, which need a ServiceAccount
+# token and therefore run IN the cluster and push to VictoriaMetrics themselves. Same control-plane
+# detection as kube-state-metrics; a no-op where VM_WRITE_TOKEN_INFRA is not set.
+- name: Install the cluster scraper on the control plane
+  hosts: "{{ alloy_hosts | default('all') }}"
+  become: true
+  roles:
+    - role: ../../roles/cluster_scraper
+
 - name: Ship host metrics to Grafana Cloud
   hosts: "{{ alloy_hosts | default('all') }}"
   become: true

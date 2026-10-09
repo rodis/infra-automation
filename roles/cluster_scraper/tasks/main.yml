@@ -1,0 +1,108 @@
+---
+# Same shape as roles/kube_state_metrics: runs on every host, acts only on the control-plane node
+# (found by /etc/kubernetes/admin.conf), and applies from it with the node's own admin.conf — the agent
+# never holds a kubeconfig. Graded on what the scraper reports, not on `kubectl apply` returning 0.
+
+- name: Look for a control-plane kubeconfig
+  ansible.builtin.stat:
+    path: /etc/kubernetes/admin.conf
+  register: cs_admin_conf
+  changed_when: false
+  check_mode: false
+
+- name: Record whether this host drives the cluster
+  ansible.builtin.set_fact:
+    cs_is_control_plane: >-
+      {{ (cs_admin_conf.stat.exists | default(false) | bool)
+         and inventory_hostname == (groups['kube_control_plane'] | default([inventory_hostname]) | sort | first) }}
+
+- name: Install the cluster scraper
+  when: (cs_is_control_plane | bool) and (cs_enabled | bool)
+  vars:
+    kubectl: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, -n, "{{ cs_namespace }}"]
+  block:
+    - name: Write the manifest (holds the writer token, so 0600 and not logged)
+      ansible.builtin.template:
+        src: cluster-scraper.yml.j2
+        dest: /etc/kubernetes/observability-cluster-scraper.yml
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      check_mode: false
+
+    # A server-side dry run first: in check mode (the stack's plan) it is the plan, and in a real run
+    # it rejects a bad manifest before anything is half-applied.
+    - name: Server-side dry run
+      ansible.builtin.command:
+        argv: "{{ kubectl + ['apply', '--dry-run=server', '-f', '/etc/kubernetes/observability-cluster-scraper.yml'] }}"
+      register: cs_dry
+      changed_when: false
+      check_mode: false
+
+    - name: Apply it
+      ansible.builtin.command:
+        argv: "{{ kubectl + ['apply', '-f', '/etc/kubernetes/observability-cluster-scraper.yml'] }}"
+      register: cs_apply
+      changed_when: "'configured' in cs_apply.stdout or 'created' in cs_apply.stdout"
+
+    - name: Report what changed
+      ansible.builtin.debug:
+        msg: "{{ cs_apply.stdout_lines | default([]) }}"
+
+    - name: Wait for the deployment
+      ansible.builtin.command:
+        argv: "{{ kubectl + ['rollout', 'status', 'deployment/cluster-scraper', '--timeout=180s'] }}"
+      changed_when: false
+
+    # The scraper's own metrics, read through the API server's pod proxy with admin.conf: every
+    # target up, samples accepted by vmauth (2xx), none dropped. Two scrape intervals to settle.
+    - name: Read the scraper's own counters
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          pod=$(kubectl --kubeconfig=/etc/kubernetes/admin.conf -n {{ cs_namespace }} get pod
+          -l app.kubernetes.io/name=cluster-scraper --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}');
+          kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw
+          "/api/v1/namespaces/{{ cs_namespace }}/pods/$pod:8429/proxy/metrics"
+          | awk '/^vm_promscrape_targets\{.*status="up"/ {up+=$NF}
+                 /^vm_promscrape_targets\{.*status="down"/ {down+=$NF}
+                 /^vmagent_remotewrite_requests_total\{.*status_code="2/ {ok+=$NF}
+                 /^vmagent_remotewrite_packets_dropped_total/ {dropped+=$NF}
+                 /^vm_promscrape_scraped_samples_sum/ {samples+=$NF}
+                 END {printf "%d %d %d %d %d", up+0, down+0, ok+0, dropped+0, samples+0}'
+        executable: /bin/bash
+      register: cs_counters
+      changed_when: false
+      check_mode: false
+      retries: 12
+      delay: 15
+      until: >-
+        cs_counters.rc == 0
+        and (cs_counters.stdout.split()[0] | int) >= 1
+        and (cs_counters.stdout.split()[2] | int) > 0
+
+    - name: Count the nodes the scraper should reach
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig=/etc/kubernetes/admin.conf, get, nodes, -o, name]
+      register: cs_nodes
+      changed_when: false
+      check_mode: false
+
+    - name: Every target is up and every sample is accepted
+      vars:
+        cs_expected: "{{ 2 * (cs_nodes.stdout_lines | length) + 1 }}"   # kubelet + cAdvisor per node, and the API server
+      ansible.builtin.assert:
+        that:
+          - (cs_counters.stdout.split()[0] | int) == (cs_expected | int)
+          - (cs_counters.stdout.split()[1] | int) == 0
+          - (cs_counters.stdout.split()[3] | int) == 0
+        fail_msg: >-
+          cluster-scraper: targets up/down {{ cs_counters.stdout.split()[0] }}/{{ cs_counters.stdout.split()[1] }}
+          (expected {{ cs_expected }} up), remote-write 2xx {{ cs_counters.stdout.split()[2] }}, dropped
+          {{ cs_counters.stdout.split()[3] }}. A target down with 401/403 is RBAC (nodes/metrics,
+          /metrics); dropped samples are vmauth or the token.
+        success_msg: >-
+          cluster-scraper: {{ cs_counters.stdout.split()[0] }} targets up, 0 down,
+          {{ cs_counters.stdout.split()[2] }} remote-write requests accepted, none dropped,
+          {{ cs_counters.stdout.split()[4] }} samples per scrape round

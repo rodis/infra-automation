@@ -1,0 +1,37 @@
+---
+# The cluster scraper: one vmagent in the `monitoring` namespace that reads what only an
+# authenticated client can — kubelet/cAdvisor (container CPU and memory) and the API server's own
+# /metrics — and pushes it to VictoriaMetrics. Owner, 2026-10-09 (vault task
+# collect-more-after-grafana, item 6); policy infra-observability (infra-objectives/CLAUDE.md).
+#
+# Why IN the cluster, unlike kube-state-metrics' scrape-from-the-host: these endpoints need a
+# ServiceAccount token, and that token must stay inside the cluster. So the pod holds it, and what
+# leaves is metrics pushed through vmauth — never a token on a host.
+
+cs_enabled: "{{ (cs_vm_token | length) > 0 }}"
+cs_namespace: monitoring
+cs_service_account: observability-scraper
+cs_version: v1.153.0          # same release as VictoriaMetrics on the watcher VPS
+cs_image: "victoriametrics/vmagent:{{ cs_version }}"
+
+# The SAME writer token and pinned certificate as the hosts' Alloy (sender "infra"): this is the same
+# estate, and a separate writer would need the AWX credential "VictoriaMetrics writers" rewritten by
+# someone holding every token in it. It lands in a Secret in `monitoring`, readable only by cluster
+# admins — who already hold admin.conf.
+cs_vm_token: "{{ lookup('env', 'VM_WRITE_TOKEN_INFRA') }}"
+cs_vm_url: "https://vps71884.dreamhostps.com:8427/api/v1/write"
+cs_vm_ca: "{{ role_path }}/../alloy/files/victoriametrics-ca.crt"
+cs_cluster: "{{ inventory_hostname | regex_replace('^(k8s-[a-z]+)-.*$', '\\1') }}"
+cs_scrape_interval: 60s
+
+# KEEP-LISTS. No series cap any more, but nothing reads a dashboard either: kept is what a check or
+# the agent will ask. cAdvisor and the API server are the two biggest cardinality sources in Kubernetes.
+cs_cadvisor_keep: >-
+  container_cpu_usage_seconds_total|container_cpu_cfs_(throttled_)?periods_total|container_memory_working_set_bytes|container_memory_rss|container_spec_memory_limit_bytes|container_oom_events_total|container_fs_usage_bytes|container_fs_limit_bytes|container_network_(receive|transmit)_(bytes|packets_dropped)_total|machine_memory_bytes|machine_cpu_cores
+cs_kubelet_keep: >-
+  kubelet_running_pods|kubelet_running_containers|kubelet_volume_stats_(available|capacity|used)_bytes|kubelet_volume_stats_inodes(_used)?|kubelet_evictions|kubelet_pleg_relist_duration_seconds_(bucket|sum|count)|kubelet_runtime_operations_errors_total|kubelet_node_name|kubelet_certificate_manager_client_ttl_seconds|process_resident_memory_bytes|process_cpu_seconds_total|up
+# The API server's latency histograms are kept as _sum/_count only (mean latency per verb/resource);
+# the _bucket series are thousands. etcd_request_duration_seconds is the API server's view of etcd —
+# the number that says whether the etcd volume move held.
+cs_apiserver_keep: >-
+  apiserver_request_total|apiserver_request_duration_seconds_(sum|count)|apiserver_current_inflight_requests|apiserver_flowcontrol_rejected_requests_total|apiserver_storage_objects|apiserver_storage_db_total_size_in_bytes|apiserver_storage_size_bytes|etcd_request_duration_seconds_(sum|count)|etcd_requests_total|etcd_request_errors_total|apiserver_client_certificate_expiration_seconds_(sum|count)|go_goroutines|process_resident_memory_bytes|process_cpu_seconds_total|up

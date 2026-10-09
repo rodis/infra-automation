@@ -1,0 +1,170 @@
+# Managed by rodis/infra-automation, roles/cluster_scraper. Do not edit in the cluster.
+# Namespace `monitoring` is created by roles/kube_state_metrics, which runs first.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ cs_service_account }}
+  namespace: {{ cs_namespace }}
+automountServiceAccountToken: true
+---
+# READ ONLY, and narrower than kube-state-metrics' role: node discovery, the kubelet's metrics
+# subresource, and the /metrics URL. `nodes/metrics` is what the kubelet checks for /metrics and
+# /metrics/cadvisor — NOT `nodes/proxy`, which would also reach the kubelet's exec and log endpoints.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ cs_service_account }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [nodes/metrics]
+    verbs: [get]
+  - nonResourceURLs: [/metrics]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ cs_service_account }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ cs_service_account }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ cs_service_account }}
+    namespace: {{ cs_namespace }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cluster-scraper-remote-write
+  namespace: {{ cs_namespace }}
+type: Opaque
+stringData:
+  token: "{{ cs_vm_token }}"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-scraper
+  namespace: {{ cs_namespace }}
+data:
+  victoriametrics-ca.crt: |
+{{ lookup('file', cs_vm_ca) | indent(4, true) }}
+  scrape.yml: |
+    global:
+      scrape_interval: {{ cs_scrape_interval }}
+    scrape_configs:
+      # Kubelets, reached directly on each node's :10250 rather than through the API server's node
+      # proxy (that path needs nodes/proxy). Their serving certificates are self-signed (kubeadm
+      # without serverTLSBootstrap, read 2026-10-09), so the server certificate is not verified on
+      # THIS hop; the token still authenticates, and the kubelet authorises it by webhook.
+      - job_name: kubelet-cadvisor
+        scheme: https
+        metrics_path: /metrics/cadvisor
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config: {insecure_skip_verify: true}
+        kubernetes_sd_configs: [{role: node}]
+        relabel_configs:
+          - {source_labels: [__meta_kubernetes_node_name], target_label: instance}
+        metric_relabel_configs:
+          - {source_labels: [__name__], regex: "{{ cs_cadvisor_keep }}", action: keep}
+          # A container-less series is the pod sandbox or a cgroup slice — except network, which
+          # cAdvisor only reports per pod.
+          - {source_labels: [__name__, container], regex: "container_(cpu|memory|fs|oom|spec).*;", action: drop}
+          # id and name are cgroup paths and runtime ids: unique per container start, so every
+          # restart would mint new series that answer nothing the pod/container labels do not.
+          - {regex: "id|name", action: labeldrop}
+      - job_name: kubelet
+        scheme: https
+        metrics_path: /metrics
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config: {insecure_skip_verify: true}
+        kubernetes_sd_configs: [{role: node}]
+        relabel_configs:
+          - {source_labels: [__meta_kubernetes_node_name], target_label: instance}
+        metric_relabel_configs:
+          - {source_labels: [__name__], regex: "{{ cs_kubelet_keep }}", action: keep}
+      # The API server through its in-cluster Service, verified against the cluster CA.
+      - job_name: apiserver
+        scheme: https
+        metrics_path: /metrics
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          server_name: kubernetes.default.svc
+        static_configs:
+          - targets: [kubernetes.default.svc:443]
+            labels: {instance: {{ cs_cluster }}}
+        metric_relabel_configs:
+          - {source_labels: [__name__], regex: "{{ cs_apiserver_keep }}", action: keep}
+      # NOT scraped: kube-controller-manager and kube-scheduler bind 127.0.0.1 on master-1 (read
+      # 2026-10-09). Reaching them would need this pod on the control plane with host networking —
+      # more privilege than their metrics are worth while their restarts and logs are already seen.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-scraper
+  namespace: {{ cs_namespace }}
+  labels:
+    app.kubernetes.io/name: cluster-scraper
+spec:
+  replicas: 1
+  strategy: {type: Recreate}   # never two scrapers at once: every sample would be sent twice
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cluster-scraper
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cluster-scraper
+      annotations:
+        # Changes when the scrape config does, so `kubectl apply` restarts the pod for it.
+        infra-automation/config-hash: "{{ (cs_cadvisor_keep ~ cs_kubelet_keep ~ cs_apiserver_keep ~ cs_scrape_interval ~ cs_vm_url) | hash('sha256') | truncate(16, True, '') }}"
+    spec:
+      serviceAccountName: {{ cs_service_account }}
+      # No tolerations: it runs on a worker, never on the control plane.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534           # so the 0440 Secret file is readable by the non-root user
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: vmagent
+          image: {{ cs_image }}
+          args:
+            - -promscrape.config=/config/scrape.yml
+            - -remoteWrite.url={{ cs_vm_url }}
+            - -remoteWrite.bearerTokenFile=/secret/token
+            - -remoteWrite.tlsCAFile=/config/victoriametrics-ca.crt
+            - -remoteWrite.label=cluster={{ cs_cluster }}
+            - -remoteWrite.tmpDataPath=/buffer
+            - -remoteWrite.maxDiskUsagePerURL=256MB
+            - -httpListenAddr=:8429
+          ports:
+            - {name: http, containerPort: 8429}
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: secret, mountPath: /secret, readOnly: true}
+            - {name: buffer, mountPath: /buffer}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+      volumes:
+        - name: config
+          configMap: {name: cluster-scraper}
+        - name: secret
+          secret: {secretName: cluster-scraper-remote-write, defaultMode: 0440}
+        - name: buffer
+          emptyDir: {sizeLimit: 300Mi}
