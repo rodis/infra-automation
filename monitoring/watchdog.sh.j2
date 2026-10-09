@@ -45,6 +45,9 @@ fi
 
 # VictoriaLogs (2026-10-09): loopback only, its own password, the same pattern as VictoriaMetrics.
 # -retention.maxDiskSpaceUsageBytes is a safety cap so a log flood cannot fill the shared disk.
+# -loki.disableMessageParsing keeps each pushed line whole in _msg, as Loki does. Without it a JSON line
+# (etcd, cert-manager) is split into fields with no _msg at all, so a check that matches text in the
+# line would match nothing (found on the first day, 2026-10-09).
 if ! pgrep -u "$(id -u)" -f "$B/[v]ictoria-logs-prod" >/dev/null; then
   httpAuth_username=vmauth httpAuth_password="$(cat "$H/config/vl-password")" TZ="" \
   GOMEMLIMIT={{ monitoring_vl_gomemlimit }} nohup "$B/victoria-logs-prod" \
@@ -53,6 +56,7 @@ if ! pgrep -u "$(id -u)" -f "$B/[v]ictoria-logs-prod" >/dev/null; then
     -retentionPeriod={{ monitoring_vl_retention }} \
     -retention.maxDiskSpaceUsageBytes={{ monitoring_vl_max_disk }} \
     -httpListenAddr=127.0.0.1:{{ monitoring_vl_port }} \
+    -loki.disableMessageParsing \
     -memory.allowedBytes={{ monitoring_vl_cache_bytes }} \
     -search.maxConcurrentRequests={{ monitoring_vl_max_concurrent_queries }} \
     -search.maxQueryDuration={{ monitoring_vl_max_query_duration }} \
