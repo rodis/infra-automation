@@ -20,7 +20,8 @@ Three rules it tries hard to honour, all of them learned the hard way in this re
 import json, os, sys, time, urllib.error, urllib.parse, urllib.request
 
 from grafana_wake import wake
-import metrics   # where METRICS come from (Grafana Cloud or VictoriaMetrics); Loki stays on Grafana
+import metrics   # where METRICS come from (Grafana Cloud or VictoriaMetrics)
+import logs      # where LOGS come from (Grafana Cloud's Loki or VictoriaLogs), 2026-10-09
 
 GRAFANA = (os.environ.get("GRAFANA_URL") or "").rstrip("/")
 TOKEN   = os.environ.get("GRAFANA_TOKEN") or ""
@@ -28,7 +29,6 @@ AWX     = (os.environ.get("CONTROLLER_HOST") or "").rstrip("/")
 AWXTOK  = os.environ.get("CONTROLLER_OAUTH_TOKEN") or ""
 
 PROM = "/api/datasources/proxy/uid/grafanacloud-prom/api/v1"
-LOKI = "/api/datasources/proxy/uid/grafanacloud-logs/loki/api/v1"
 
 # TARGETS. One sweep per cluster: `estate-status.py` is south (the default, as it always was);
 # `estate-status.py production` is the production cluster (2026-09-28). Every cluster-level or
@@ -107,16 +107,12 @@ def scalar(expr):
     return r[0][1]
 
 
-def logq(expr):
-    r = promq.__wrapped__(expr) if hasattr(promq, "__wrapped__") else None
+def logq(stream, line_re, window):
+    """Matching lines over `window` from the logs backend (logs.py). 0 = none; a failure is ERROR."""
     try:
-        d = _get(LOKI + "/query", {"query": expr})
+        return logs.count(stream, line_re, window)
     except Exception as e:
         return ("ERROR", str(e)[:80])
-    res = (d.get("data") or {}).get("result") or []
-    if not res:
-        return NODATA
-    return sum(float(s["value"][1]) for s in res)
 
 
 def fmt(v, unit="", nd=2):
@@ -197,6 +193,7 @@ if not GRAFANA or not TOKEN:
 print("=" * 70)
 print(f"  ESTATE STATUS: {TARGET}  (read-only; mutates nothing)")
 print(f"  metrics from: {metrics.describe()}")
+print(f"  logs from:    {logs.describe()}")
 print("=" * 70)
 
 # ------------------------------------------------- 1. can we see at all? -----
@@ -359,20 +356,26 @@ section("8. LOGS  -- graded on the last 5m; longer windows are context only")
 # short one says whether it is STILL happening, and only the second is actionable. Without the
 # pair, every deliberate change -- a restart, a fix that stopped an error -- reads as a fresh
 # problem for hours afterwards, which is exactly how a status report trains you to ignore it.
+#
+# Each query is DATA — stream matchers plus an optional line regex — rendered for whichever backend
+# LOGS_BACKEND names (logs.py), so the LogQL and LogsQL forms cannot drift apart. Compared on both
+# backends on 2026-10-09 before switching (task victorialogs).
+HOSTS = ("instance", "=~", T_["hosts"])
+PGI   = ("instance", "=", "k8s-south-postgresql")
 LOG_CHECKS = [
-    ("kernel lockups / OOM", f'{{job="journal",{HOST_SEL}}} |~ "(?i)watchdog|soft lockup|hard lockup|oom-kill|blocked for more than"', 1, None),
-    *([("postgres FATAL/PANIC", f'{{job="postgresql",{PG_HOST},level=~"FATAL|PANIC"}}', 100, 1),
-    ("postgres rejected logins", f'{{job="postgresql",{PG_HOST}}} |~ "no pg_hba.conf entry"', None, 1)] if "postgres" in T_["sections"] else []),
-    ("apiserver etcd timeouts", f'{{job="pods",{HOST_SEL},container="kube-apiserver"}} |~ "etcdserver: request timed out"', 50, 5),
-    *([("AWX db errors", f'{{job="pods",{HOST_SEL},namespace="awx"}} |~ "OperationalError|remaining connection"', 20, 1)] if "awx" in T_["sections"] else []),
+    ("kernel lockups / OOM", [("job", "=", "journal"), HOSTS], "(?i)watchdog|soft lockup|hard lockup|oom-kill|blocked for more than", 1, None),
+    *([("postgres FATAL/PANIC", [("job", "=", "postgresql"), PGI, ("level", "=~", "FATAL|PANIC")], None, 100, 1),
+    ("postgres rejected logins", [("job", "=", "postgresql"), PGI], "no pg_hba.conf entry", None, 1)] if "postgres" in T_["sections"] else []),
+    ("apiserver etcd timeouts", [("job", "=", "pods"), HOSTS, ("container", "=", "kube-apiserver")], "etcdserver: request timed out", 50, 5),
+    *([("AWX db errors", [("job", "=", "pods"), HOSTS, ("namespace", "=", "awx")], "OperationalError|remaining connection", 20, 1)] if "awx" in T_["sections"] else []),
 ]
-for label, sel, red, amber in LOG_CHECKS:
-    six  = logq(f"sum(count_over_time({sel} [6h]))")
-    half = logq(f"sum(count_over_time({sel} [30m]))")
-    now  = logq(f"sum(count_over_time({sel} [5m]))")
-    six  = 0.0 if six  is NODATA or isinstance(six,  tuple) else six
-    half = 0.0 if half is NODATA or isinstance(half, tuple) else half
-    now  = 0.0 if now  is NODATA or isinstance(now,  tuple) else now
+for label, stream, line_re, red, amber in LOG_CHECKS:
+    six, half, now = (logq(stream, line_re, w) for w in ("6h", "30m", "5m"))
+    # A failed query is not a quiet log (rule 8). This used to read as 0 — "quiet" — on any error.
+    failed = next((v for v in (now, half, six) if isinstance(v, tuple)), None)
+    if failed:
+        check(label, failed)
+        continue
 
     # Three windows, because two were not enough. Grading on 30m called a 19-SECOND burst
     # "ONGOING" half an hour after it ended -- that was the PostgreSQL restart on 2026-08-24

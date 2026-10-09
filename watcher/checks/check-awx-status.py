@@ -24,7 +24,8 @@ import datetime, json, os, re, socket, ssl, sys, time
 import urllib.error, urllib.parse, urllib.request
 
 from grafana_wake import wake
-import metrics   # where METRICS come from (Grafana Cloud or VictoriaMetrics); Loki stays on Grafana
+import metrics   # where METRICS come from (Grafana Cloud or VictoriaMetrics)
+import logs      # where LOGS come from (Grafana Cloud's Loki or VictoriaLogs), 2026-10-09
 
 GRAFANA = (os.environ.get("GRAFANA_URL") or "").rstrip("/")
 GRAFANA = GRAFANA if GRAFANA.startswith("http") or not GRAFANA else "https://" + GRAFANA
@@ -33,7 +34,6 @@ AWX     = (os.environ.get("CONTROLLER_HOST") or "").rstrip("/")
 AWXTOK  = os.environ.get("CONTROLLER_OAUTH_TOKEN") or ""
 
 PROM = "/api/datasources/proxy/uid/grafanacloud-prom/api/v1"
-LOKI = "/api/datasources/proxy/uid/grafanacloud-logs/loki/api/v1"
 
 PG_NODE  = "k8s-south-postgresql"
 # Every PostgreSQL series and log stream is scoped to AWX's database VM, so another cluster's series in
@@ -87,12 +87,6 @@ def prom(expr):
     return float(res[0]["value"][1]) if res else None
 
 
-def loki_count(expr):
-    now = int(time.time())
-    d = http_json(f"{GRAFANA}{LOKI}/query?" + urllib.parse.urlencode({"query": expr, "time": now * 10**9}),
-                  {"Authorization": "Bearer " + GTOKEN})
-    res = d["data"]["result"]
-    return sum(float(r["value"][1]) for r in res)   # no series over the window = no matching lines
 
 
 def guarded(name, fn):
@@ -108,8 +102,8 @@ def section(title):
 
 
 # ------------------------------------------------------------------------------------------------
-print(f"awx-healthy — {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M UTC} — metrics from {metrics.describe()}")
-if not (metrics.configured()[0] and GRAFANA and GTOKEN and AWX and AWXTOK):
+print(f"awx-healthy — {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M UTC} — metrics from {metrics.describe()}, logs from {logs.describe()}")
+if not (metrics.configured()[0] and logs.configured()[0] and GRAFANA and GTOKEN and AWX and AWXTOK):
     print("missing GRAFANA_* or CONTROLLER_* — run through ./agent/run.sh")
     sys.exit(2)
 
@@ -189,9 +183,11 @@ def _disk():
 guarded("root filesystem > 20% free", _disk)
 
 def _logs():
-    slots = loki_count(f'sum(count_over_time({{job="postgresql",{PGSEL}}} |~ "remaining connection slots|too many clients" [15m]))')
-    panic = loki_count(f'sum(count_over_time({{job="postgresql",{PGSEL},level="PANIC"}} [15m]))')
-    lines = loki_count(f'sum(count_over_time({{job="postgresql",{PGSEL}}} [15m]))')
+    # logs.count raises when the backend cannot answer, so guarded() reports "could not evaluate".
+    pg = [("job", "=", "postgresql"), ("instance", "=", PG_NODE)]
+    slots = logs.count(pg, "remaining connection slots|too many clients", "15m")
+    panic = logs.count(pg + [("level", "=", "PANIC")], None, "15m")
+    lines = logs.count(pg, None, "15m")
     if lines == 0:
         # Zero lines of any kind is a blind collector, not a quiet database (CLAUDE.md, PostgreSQL logs).
         verdict("no slot exhaustion / PANIC in 15m", None, "no postgresql log lines at all in 15m — collector blind?")

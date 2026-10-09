@@ -1,5 +1,5 @@
-"""Where the checks read METRICS from: Grafana Cloud, or our own VictoriaMetrics. Logs are not here —
-they stay on Grafana Cloud's Loki whichever backend serves metrics (project self-hosted-metrics).
+"""Where the checks read METRICS from: Grafana Cloud, or our own VictoriaMetrics. Logs are in logs.py,
+chosen the same way by LOGS_BACKEND (project self-hosted-metrics).
 
 Chosen by the environment, so a check needs no code change to move, and both backends can be graded
 side by side during the dual-write:
