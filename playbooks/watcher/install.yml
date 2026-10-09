@@ -84,6 +84,17 @@
         description: "Evaluates objective gmail-healthy — does the 'Gmail account' OAuth credential the invoice gates and the Gmail connectors use still work. Calls a canary that lists labels and answers only a count."
     watcher_workspaces: [infra, production, development]
 
+    # Telegram routing, one forum topic per workspace (owner, 2026-10-09: "I don't have access to the Dagu
+    # UI on purpose, I don't want to manage it"). Applied by watcher/dagu/notifications.py; the bot token
+    # is copied ENCRYPTED from the template channel on the box and never handled. development has no
+    # route of its own, so it falls back to the global route (the infra topic).
+    watcher_notifications:
+      template_channel: "Pinky and the Brain"
+      events: [dag.run.failed, dag.run.aborted, dag.run.rejected]
+      workspaces:
+        infra: {channel: "Pinky and the Brain", topic: "2"}
+        production: {channel: "Pinky and the Brain — Production", topic: "287"}
+
   handlers:
     # "[d]agu": as a regex it still matches Dagu, but not the literal text in this handler's own
     # command line. Without the brackets, pkill -f matched and killed the handler (rc -15, job 3733).
@@ -275,6 +286,19 @@
         name: "watcher: start dagu at boot"
         special_time: reboot
         job: "{{ watcher_home }}/watchdog.sh"
+
+    - name: Install the notification-routing script
+      ansible.builtin.copy:
+        src: "{{ watcher_src }}/dagu/notifications.py"
+        dest: "{{ watcher_home }}/dagu/notifications.py"
+        mode: "0700"
+
+    - name: Telegram routing matches the playbook (a channel per topic, a route per workspace)
+      ansible.builtin.command:
+        argv: [python3, "{{ watcher_home }}/dagu/notifications.py", "{{ watcher_notifications | to_json }}"]
+      register: watcher_notify_routing
+      changed_when: watcher_notify_routing.stdout == "changed"
+      notify: Restart dagu
 
     - name: Apply pending restarts
       ansible.builtin.meta: flush_handlers
