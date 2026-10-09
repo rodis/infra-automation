@@ -43,6 +43,23 @@ if ! pgrep -u "$(id -u)" -f "$B/[v]ictoria-metrics-prod" >/dev/null; then
   note "started victoria-metrics (pid $!)"
 fi
 
+# VictoriaLogs (2026-10-09): loopback only, its own password, the same pattern as VictoriaMetrics.
+# -retention.maxDiskSpaceUsageBytes is a safety cap so a log flood cannot fill the shared disk.
+if ! pgrep -u "$(id -u)" -f "$B/[v]ictoria-logs-prod" >/dev/null; then
+  httpAuth_username=vmauth httpAuth_password="$(cat "$H/config/vl-password")" TZ="" \
+  GOMEMLIMIT={{ monitoring_vl_gomemlimit }} nohup "$B/victoria-logs-prod" \
+    -envflag.enable \
+    -storageDataPath="$H/data/victoria-logs" \
+    -retentionPeriod={{ monitoring_vl_retention }} \
+    -retention.maxDiskSpaceUsageBytes={{ monitoring_vl_max_disk }} \
+    -httpListenAddr=127.0.0.1:{{ monitoring_vl_port }} \
+    -memory.allowedBytes={{ monitoring_vl_cache_bytes }} \
+    -search.maxConcurrentRequests={{ monitoring_vl_max_concurrent_queries }} \
+    -search.maxQueryDuration={{ monitoring_vl_max_query_duration }} \
+    >>"$L/victoria-logs.log" 2>&1 &
+  note "started victoria-logs (pid $!)"
+fi
+
 # vmauth: the ONLY process on this box that listens publicly. TLS, a bearer token per sender, each
 # token routed only to the write path. Its own /metrics and /health are moved to loopback with
 # -httpInternalListenAddr, so the public port serves nothing without a token.

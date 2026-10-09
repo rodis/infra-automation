@@ -55,8 +55,25 @@
     monitoring_vm_max_memory_per_query: 256MiB
     monitoring_vmauth_gomemlimit: 128MiB
 
+    # LOGS (2026-10-09): VictoriaLogs replaces Grafana Cloud's Loki. Its own release line and repo
+    # (VictoriaMetrics/VictoriaLogs); checksum computed from the download AND matched against the
+    # published *_checksums.txt, 2026-10-09. Senders push Loki's format to /insert/loki/api/v1/push
+    # through vmauth, with the SAME per-sender token they write metrics with.
+    monitoring_vl_version: "v1.53.0"
+    monitoring_vl_sha256: "55feba89713cafa952673f91b8b38e7701bb0290989263da671b47a0de16edd3"
+    monitoring_vl_port: 9428               # loopback only
+    monitoring_vl_retention: 180d          # same as metrics (owner, 2026-10-07)
+    # A SAFETY CAP, not a retention choice: past it VictoriaLogs drops the oldest days first, so a log
+    # flood cannot fill the disk the watcher and VictoriaMetrics share. Measured volume (~15 MB/day
+    # from south, 2026-08-23) puts 180 days near 3 GB, far under it.
+    monitoring_vl_max_disk: 20GiB
+    monitoring_vl_gomemlimit: 768MiB
+    monitoring_vl_cache_bytes: 384MiB
+    monitoring_vl_max_concurrent_queries: 4
+    monitoring_vl_max_query_duration: 60s
+
     # An explicit restart, as a named and logged action rather than an ad-hoc command: a list of
-    # "vmauth" and/or "victoria-metrics" (extra var at launch). Used to prove a plain restart loses no
+    # "vmauth", "victoria-metrics" and/or "victoria-logs" (extra var at launch). Used to prove a plain restart loses no
     # samples (task alloy-restart-retry) and for upgrades. Handlers keep their order: vmauth first.
     monitoring_restart: []
 
@@ -91,6 +108,15 @@
       ansible.builtin.shell: |
         pkill -u "$(id -u)" -f "{{ monitoring_bin }}/[v]ictoria-metrics-prod" || true
         for i in $(seq 1 30); do pgrep -u "$(id -u)" -f "{{ monitoring_bin }}/[v]ictoria-metrics-prod" >/dev/null || break; sleep 1; done
+        {{ monitoring_home }}/watchdog.sh
+      changed_when: true
+
+    # After vmauth, for the same reason as VictoriaMetrics: its password must already be in vmauth's
+    # header when VictoriaLogs starts demanding it.
+    - name: Restart victoria-logs
+      ansible.builtin.shell: |
+        pkill -u "$(id -u)" -f "{{ monitoring_bin }}/[v]ictoria-logs-prod" || true
+        for i in $(seq 1 30); do pgrep -u "$(id -u)" -f "{{ monitoring_bin }}/[v]ictoria-logs-prod" >/dev/null || break; sleep 1; done
         {{ monitoring_home }}/watchdog.sh
       changed_when: true
 
@@ -149,6 +175,8 @@
         - "{{ monitoring_home }}/downloads/{{ monitoring_vm_version }}"
         - "{{ monitoring_home }}/data"
         - "{{ monitoring_home }}/data/victoria-metrics"
+        - "{{ monitoring_home }}/downloads/vl-{{ monitoring_vl_version }}"
+        - "{{ monitoring_home }}/data/victoria-logs"
 
     # ---- Binaries ----
     - name: Download VictoriaMetrics {{ monitoring_vm_version }}
@@ -190,6 +218,29 @@
         remote_src: true
         mode: "0755"
       notify: Restart vmauth
+
+    - name: Download VictoriaLogs {{ monitoring_vl_version }}
+      ansible.builtin.get_url:
+        url: "https://github.com/VictoriaMetrics/VictoriaLogs/releases/download/{{ monitoring_vl_version }}/victoria-logs-linux-amd64-{{ monitoring_vl_version }}.tar.gz"
+        dest: "{{ monitoring_home }}/downloads/victoria-logs-linux-amd64-{{ monitoring_vl_version }}.tar.gz"
+        checksum: "sha256:{{ monitoring_vl_sha256 }}"
+        mode: "0600"
+
+    - name: Unpack it into its per-version directory
+      ansible.builtin.unarchive:
+        src: "{{ monitoring_home }}/downloads/victoria-logs-linux-amd64-{{ monitoring_vl_version }}.tar.gz"
+        dest: "{{ monitoring_home }}/downloads/vl-{{ monitoring_vl_version }}"
+        remote_src: true
+        include: [victoria-logs-prod]
+        creates: "{{ monitoring_home }}/downloads/vl-{{ monitoring_vl_version }}/victoria-logs-prod"
+
+    - name: Install victoria-logs into ~/bin
+      ansible.builtin.copy:
+        src: "{{ monitoring_home }}/downloads/vl-{{ monitoring_vl_version }}/victoria-logs-prod"
+        dest: "{{ monitoring_bin }}/victoria-logs-prod"
+        remote_src: true
+        mode: "0755"
+      notify: Restart victoria-logs
 
     # ---- TLS (trial: self-signed, pinned by the senders) ----
     - name: Generate vmauth's key and self-signed certificate, once
@@ -245,6 +296,25 @@
         monitoring_vm_basic_auth: "{{ ('vmauth:' ~ (monitoring_vm_pw.content | b64decode)) | b64encode }}"
       no_log: true
 
+    # VictoriaLogs gets its OWN password, for the same reason and in the same way: generated once on
+    # the box, 600, presented only by vmauth. Separate, so neither backend's secret opens the other.
+    - name: Generate VictoriaLogs' password, once
+      ansible.builtin.shell: umask 077 && openssl rand -base64 33 | tr -d '\n' > "{{ monitoring_home }}/config/vl-password"
+      args:
+        creates: "{{ monitoring_home }}/config/vl-password"
+      notify: Restart victoria-logs
+
+    - name: Read it, to build the header vmauth presents to VictoriaLogs
+      ansible.builtin.slurp:
+        src: "{{ monitoring_home }}/config/vl-password"
+      register: monitoring_vl_pw
+      no_log: true
+
+    - name: The Basic-auth value for vmauth's VictoriaLogs header
+      ansible.builtin.set_fact:
+        monitoring_vl_basic_auth: "{{ ('vmauth:' ~ (monitoring_vl_pw.content | b64decode)) | b64encode }}"
+      no_log: true
+
     # ---- Configuration ----
     - name: vmauth configuration (holds every writer token)
       ansible.builtin.template:
@@ -267,6 +337,7 @@
       notify:
         - Restart victoria-metrics
         - Restart vmauth
+        - Restart victoria-logs
 
     # ---- The agent's read access: logs and the public certificate, nothing else ----
     - name: Let {{ monitoring_reader }} traverse to the logs and the certificate
@@ -303,8 +374,8 @@
 
     - name: Refuse an unknown restart target
       ansible.builtin.assert:
-        that: (monitoring_restart | difference(['vmauth', 'victoria-metrics'])) | length == 0
-        fail_msg: "monitoring_restart takes 'vmauth' and/or 'victoria-metrics', got {{ monitoring_restart }}"
+        that: (monitoring_restart | difference(['vmauth', 'victoria-metrics', 'victoria-logs'])) | length == 0
+        fail_msg: "monitoring_restart takes 'vmauth', 'victoria-metrics' and/or 'victoria-logs', got {{ monitoring_restart }}"
         quiet: true
 
     - name: Restart requested — vmauth
@@ -318,6 +389,12 @@
       when: "'victoria-metrics' in monitoring_restart"
       changed_when: true
       notify: Restart victoria-metrics
+
+    - name: Restart requested — victoria-logs
+      ansible.builtin.debug: {msg: "restart requested: victoria-logs"}
+      when: "'victoria-logs' in monitoring_restart"
+      changed_when: true
+      notify: Restart victoria-logs
 
     - name: Apply pending restarts
       ansible.builtin.meta: flush_handlers
@@ -337,6 +414,17 @@
       retries: 12
       delay: 5
       until: monitoring_vm_health.status == 200 and 'OK' in monitoring_vm_health.content
+
+    - name: VictoriaLogs answers on loopback, with its password
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ monitoring_vl_port }}/health"
+        headers: {Authorization: "Basic {{ monitoring_vl_basic_auth }}"}
+        return_content: true
+      no_log: true
+      register: monitoring_vl_health
+      retries: 12
+      delay: 5
+      until: monitoring_vl_health.status == 200 and 'OK' in monitoring_vl_health.content
 
     # vmauth applies -tls to its internal listener too (job 4285: plain HTTP got "Client sent an HTTP
     # request to an HTTPS server"). The certificate names the public hostname, not 127.0.0.1, so it
@@ -360,16 +448,17 @@
     # Each ss line has TWO address columns, local and peer, and every listener's peer reads "0.0.0.0:*"
     # — so a pattern over the whole line calls a loopback listener public (job 4288). Match the LOCAL
     # column only (field 4: State Recv-Q Send-Q Local Peer). And the kernel truncates process names to
-    # 15 characters: VictoriaMetrics appears as "victoria-metric", so match that, or a public
-    # VictoriaMetrics would slip through unnoticed.
+    # 15 characters: VictoriaMetrics appears as "victoria-metric" and VictoriaLogs as
+    # "victoria-logs-p", so match those, or a public one would slip through unnoticed.
     - name: Exactly one public listener of ours, and it is vmauth on its port
       vars:
         local_re: '^LISTEN\s+\d+\s+\d+\s+'
-        ours: 'users:\(\("(victoria-metric|vmauth-prod)"'
+        ours: 'users:\(\("(victoria-metric|victoria-logs-p|vmauth-prod)"'
       ansible.builtin.assert:
         that:
           - monitoring_listen.stdout_lines | select('search', local_re ~ '127\.0\.0\.1:' ~ monitoring_vm_port ~ '\s') | list | length == 1
           - monitoring_listen.stdout_lines | select('search', local_re ~ '127\.0\.0\.1:' ~ monitoring_vmauth_internal_port ~ '\s') | list | length == 1
+          - monitoring_listen.stdout_lines | select('search', local_re ~ '127\.0\.0\.1:' ~ monitoring_vl_port ~ '\s') | list | length == 1
           - monitoring_listen.stdout_lines | select('search', local_re ~ '0\.0\.0\.0:' ~ monitoring_vmauth_port ~ '\s') | list | length == 1
           # every listener of ours whose LOCAL address is a wildcard must be vmauth's public port
           - >-
@@ -395,12 +484,48 @@
         status_code: [401]
       changed_when: false
 
+    - name: VictoriaLogs' loopback refuses a push and a query without its password
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ monitoring_vl_port }}{{ item.path }}"
+        method: "{{ item.method }}"
+        body: ""
+        status_code: [401]
+      loop:
+        - {path: /insert/loki/api/v1/push, method: POST}
+        - {path: "/select/logsql/query?query=*&limit=1", method: GET}
+      loop_control: {label: "{{ item.method }} {{ item.path }}"}
+      changed_when: false
+
     - name: A reader token can query
       ansible.builtin.uri:
         url: "https://{{ monitoring_hostname }}:{{ monitoring_vmauth_port }}/api/v1/query?query=vector(1)"
         headers: {Authorization: "Bearer {{ item.token }}"}
         ca_path: "{{ monitoring_home }}/tls/vmauth.crt"
         status_code: [200]
+      loop: "{{ monitoring_readers }}"
+      loop_control: {label: "{{ item.name }}"}
+      changed_when: false
+      no_log: true
+
+    - name: A reader token can query logs
+      ansible.builtin.uri:
+        url: "https://{{ monitoring_hostname }}:{{ monitoring_vmauth_port }}/select/logsql/query?query=*&limit=1"
+        headers: {Authorization: "Bearer {{ item.token }}"}
+        ca_path: "{{ monitoring_home }}/tls/vmauth.crt"
+        status_code: [200]
+      loop: "{{ monitoring_readers }}"
+      loop_control: {label: "{{ item.name }}"}
+      changed_when: false
+      no_log: true
+
+    - name: A reader token cannot push logs
+      ansible.builtin.uri:
+        url: "https://{{ monitoring_hostname }}:{{ monitoring_vmauth_port }}/insert/loki/api/v1/push"
+        method: POST
+        body: ""
+        headers: {Authorization: "Bearer {{ item.token }}"}
+        ca_path: "{{ monitoring_home }}/tls/vmauth.crt"
+        status_code: [400, 401, 403, 404]
       loop: "{{ monitoring_readers }}"
       loop_control: {label: "{{ item.name }}"}
       changed_when: false
@@ -437,6 +562,15 @@
       changed_when: false
       no_log: true
 
+    - name: A writer token cannot query logs either
+      ansible.builtin.uri:
+        url: "https://{{ monitoring_hostname }}:{{ monitoring_vmauth_port }}/select/logsql/query?query=*&limit=1"
+        headers: {Authorization: "Bearer {{ monitoring_writers[0].token }}"}
+        ca_path: "{{ monitoring_home }}/tls/vmauth.crt"
+        status_code: [400, 401, 403, 404]
+      changed_when: false
+      no_log: true
+
     - name: Read the certificate senders must pin
       ansible.builtin.command:
         argv: [openssl, x509, -in, "{{ monitoring_home }}/tls/vmauth.crt", -noout, -fingerprint, -sha256, -enddate]
@@ -448,6 +582,7 @@
         msg:
           - "VictoriaMetrics {{ monitoring_vm_version }} on 127.0.0.1:{{ monitoring_vm_port }}, retention {{ monitoring_vm_retention }}"
           - "vmauth on 0.0.0.0:{{ monitoring_vmauth_port }} (TLS 1.3), {{ monitoring_writers | length }} writer(s): {{ monitoring_writers | map(attribute='name') | join(', ') }}; {{ monitoring_readers | length }} reader(s): {{ monitoring_readers | map(attribute='name') | join(', ') }}"
-          - "VictoriaMetrics requires its password on loopback: no local user can read or write it without vmauth"
+          - "VictoriaLogs {{ monitoring_vl_version }} on 127.0.0.1:{{ monitoring_vl_port }}, retention {{ monitoring_vl_retention }}, disk cap {{ monitoring_vl_max_disk }}"
+          - "VictoriaMetrics and VictoriaLogs require their passwords on loopback: no local user can read or write either without vmauth"
           - "certificate to pin: {{ monitoring_cert.stdout_lines | join(' | ') }}"
           - "public certificate readable by {{ monitoring_reader }} at {{ monitoring_home }}/tls/vmauth.crt"
