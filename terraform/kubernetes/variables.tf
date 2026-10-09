@@ -33,6 +33,8 @@ variable "NODES" {
 variable "ETCD" {
   description = "Number of etcd nodes"
   type = number
+  # 0 for south, which predates the variable and stacks etcd on its master (2026-10-09).
+  default = 0
 }
 # Opt-in etcd settings (2026-10-02). Unset, they leave a stack exactly as it was — east, north and
 # west share this project root. See etcd.tf.
@@ -62,4 +64,12 @@ variable "MASTER_ANTI_AFFINITY" {
   description = "Spread masters across hypervisors with a soft-anti-affinity server group"
   type        = bool
   default     = false
+}
+# South runs flannel, not calico (2026-10-09). The calico group admits UDP 4789 from anywhere, so a
+# cluster without calico must not wear it. The group itself is still created — making it
+# conditional would change its address and replace it on every calico stack.
+variable "CALICO_SECURITY_GROUP" {
+  description = "Attach the Calico Node security group to masters and nodes"
+  type        = bool
+  default     = true
 }

@@ -1,0 +1,311 @@
+---
+# Move south's etcd onto its own volume (owner, 2026-10-09).
+#
+# WHY: south's etcd is a single static-pod member on master-1's root disk, and that disk freezes —
+# a 121s fsync on west's root disk on 2026-10-01, while an XFS volume on the same host never went
+# over 6.9s in 47h (vault task etcd-volume-fsync-probe). Each freeze times the API server out and
+# every controller with leader election exits: cert-manager, the AWX and Doppler operators, KCM,
+# the scheduler. Development has run etcd on volumes since 2026-10-03 with no apiserver etcd
+# timeouts at all (etcd-three-member-soak).
+#
+# WHAT: the volume terraform/kubernetes/master.tf attaches when MASTER_ETCD_VOLUME_SIZE > 0 is
+# formatted XFS and mounted AT /var/lib/etcd — kubeadm's dataDir — so the static-pod manifest and
+# the kubeadm ClusterConfiguration do not change, and an upgrade cannot undo this.
+#
+# THE OUTAGE: etcd is stopped while its data is copied (~12 MB on 2026-10-09: seconds). The API is
+# down for a minute or two; running pods keep running, controllers with leader election restart
+# once, as they do in every stall today. AWX's UI and API at infra.rods.me may error meanwhile.
+#
+# SAFETY, in order:
+#   - nothing changes until etcd is healthy, the volume is found BY ID and is blank, and an etcd
+#     snapshot has been saved to the root disk;
+#   - the old data directory is RENAMED, not deleted (/var/lib/etcd.pre-volume) — the rollback;
+#   - any failure after etcd is stopped puts the old directory back and restarts etcd on it;
+#   - the empty mountpoint on the root disk is made immutable, so if the volume ever fails to
+#     mount, etcd fails to start instead of starting an EMPTY cluster (which would read as AWX's
+#     whole cluster state being gone). fstab has nofail so the host still boots and stays
+#     reachable over SSH; kubelet is ordered after the mount.
+#
+# HOW TO RUN IT. Not part of main.yml. It cannot run from AWX: AWX runs in this cluster, and its
+# job would lose the API it runs through halfway. Like etcd_tuning.yml it is a Spacelift TASK on
+# the "Ansible: south: Install Kube" stack, at a tracked commit that contains this file:
+#
+#   spacectl stack task --id emoji-gear-ansible-install-kubernetes-on-dev-cluster --tail \
+#     "chmod 600 /mnt/workspace/key; ansible-playbook etcd_volume.yml --limit kube_control_plane \
+#      -e etcd_volume_id=<volume id> \
+#      --ssh-extra-args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'"
+#
+# (chmod / StrictHostKeyChecking / --limit: see etcd_tuning.yml for why each is needed.) The
+# volume id comes from the Terraform stack's resources: k8s-south-master-1-etcd.
+#
+# Re-running is safe: when /var/lib/etcd is already the volume it verifies and changes nothing.
+# /var/lib/etcd.pre-volume and the snapshot are left for a later, separate cleanup.
+
+- name: Move etcd onto its own volume
+  hosts: "{{ etcd_volume_hosts | default('kube_control_plane') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    etcd_dir: /var/lib/etcd
+    etcd_old_dir: /var/lib/etcd.pre-volume
+    etcd_staging: /mnt/etcd-volume-staging
+    etcd_manifest: /etc/kubernetes/manifests/etcd.yaml
+    etcd_manifest_parked: /etc/kubernetes/etcd.yaml.parked-for-volume-move
+    etcd_snapshot: /var/backups/etcd-pre-volume.db
+    etcd_health_url: http://127.0.0.1:2381/health
+    etcd_volume_dev: "/dev/disk/by-id/virtio-{{ etcd_volume_id[:20] }}"
+    kubectl: kubectl --kubeconfig /etc/kubernetes/admin.conf
+
+  tasks:
+
+    - name: Require the volume id
+      ansible.builtin.assert:
+        that: (etcd_volume_id | default('')) | length >= 20
+        fail_msg: "Pass -e etcd_volume_id=<id of k8s-south-master-1-etcd>"
+
+    # ---------------------------------------------------------------- preflight: reads only
+
+    - name: Is /var/lib/etcd already a mountpoint?
+      ansible.builtin.command: findmnt -no SOURCE,FSTYPE {{ etcd_dir }}
+      register: etcd_mounted
+      changed_when: false
+      failed_when: false
+
+    - name: Already done — verify and stop here
+      when: etcd_mounted.rc == 0
+      block:
+        - name: Confirm it is XFS on the volume and etcd is healthy
+          ansible.builtin.assert:
+            that: "'xfs' in etcd_mounted.stdout"
+            fail_msg: "{{ etcd_dir }} is mounted from {{ etcd_mounted.stdout }}, not the XFS volume"
+        - name: etcd health
+          ansible.builtin.uri:
+            url: "{{ etcd_health_url }}"
+            return_content: true
+          register: etcd_health_done
+          failed_when: "'\"health\":\"true\"' not in (etcd_health_done.content | replace(' ', ''))"
+        - name: Nothing to do
+          ansible.builtin.meta: end_host
+
+    - name: The static-pod manifest uses /var/lib/etcd as a hostPath
+      ansible.builtin.command:
+        argv: [grep, -c, "path: {{ etcd_dir }}$", "{{ etcd_manifest }}"]
+      register: etcd_manifest_path
+      changed_when: false
+      failed_when: (etcd_manifest_path.stdout | int) < 1
+
+    - name: etcd is healthy before anything changes
+      ansible.builtin.uri:
+        url: "{{ etcd_health_url }}"
+        return_content: true
+      register: etcd_health_before
+      failed_when: "'\"health\":\"true\"' not in (etcd_health_before.content | replace(' ', ''))"
+
+    - name: The volume is attached (found by volume id, not device name)
+      ansible.builtin.wait_for:
+        path: "{{ etcd_volume_dev }}"
+        timeout: 120
+
+    - name: Read the volume's filesystem type, if any
+      ansible.builtin.command: blkid -o value -s TYPE {{ etcd_volume_dev }}
+      register: etcd_volume_fstype
+      changed_when: false
+      failed_when: etcd_volume_fstype.rc not in [0, 2]   # 2: no filesystem
+
+    - name: Refuse a volume that is not blank
+      ansible.builtin.assert:
+        that: etcd_volume_fstype.stdout == ''
+        fail_msg: "{{ etcd_volume_dev }} already holds {{ etcd_volume_fstype.stdout }} — not formatting over it"
+
+    - name: Refuse if a previous attempt left its rollback copy behind
+      ansible.builtin.stat:
+        path: "{{ etcd_old_dir }}"
+      register: etcd_old_stat
+      failed_when: etcd_old_stat.stat.exists
+
+    - name: Size of the data to copy
+      ansible.builtin.command: du -sh {{ etcd_dir }}
+      register: etcd_du
+      changed_when: false
+
+    # ---------------------------------------------------------------- prepare: etcd still running
+
+    - name: Install xfsprogs
+      ansible.builtin.apt:
+        name: xfsprogs
+        state: present
+        lock_timeout: 600
+
+    - name: Find the running etcd container
+      ansible.builtin.command: crictl ps --name '^etcd$' --state running -q
+      register: etcd_container
+      changed_when: false
+      failed_when: etcd_container.stdout_lines | length != 1
+
+    # Written inside the container to its data dir (the only host path it can write), then moved
+    # to the root disk. A failed snapshot stops the play here, before anything has changed.
+    - name: Snapshot etcd
+      ansible.builtin.command:
+        argv: [crictl, exec, "{{ etcd_container.stdout | trim }}", etcdctl,
+               --endpoints=https://127.0.0.1:2379,
+               --cacert=/etc/kubernetes/pki/etcd/ca.crt,
+               --cert=/etc/kubernetes/pki/etcd/server.crt,
+               --key=/etc/kubernetes/pki/etcd/server.key,
+               snapshot, save, "{{ etcd_dir }}/pre-volume-snapshot.db"]
+
+    - name: Keep the snapshot on the root disk, outside the data dir
+      ansible.builtin.command: mv {{ etcd_dir }}/pre-volume-snapshot.db {{ etcd_snapshot }}
+
+    - name: Format the volume as XFS
+      ansible.builtin.command: mkfs.xfs -L etcd-data {{ etcd_volume_dev }}
+
+    - name: Read the volume's UUID
+      ansible.builtin.command: blkid -o value -s UUID {{ etcd_volume_dev }}
+      register: etcd_volume_uuid
+      changed_when: false
+
+    - name: Mount it at a staging path
+      ansible.builtin.shell: mkdir -p {{ etcd_staging }} && mount {{ etcd_volume_dev }} {{ etcd_staging }}
+
+    # ---------------------------------------------------------------- the outage
+
+    - name: Move etcd
+      block:
+        - name: Stop etcd (kubelet stops a static pod whose manifest disappears)
+          ansible.builtin.command: mv {{ etcd_manifest }} {{ etcd_manifest_parked }}
+
+        - name: Wait until no etcd process is left
+          ansible.builtin.command: pgrep -x etcd
+          register: etcd_gone
+          until: etcd_gone.rc == 1
+          retries: 30
+          delay: 5
+          changed_when: false
+          failed_when: etcd_gone.rc not in [0, 1]
+
+        - name: Copy the data onto the volume
+          ansible.builtin.command: cp -a {{ etcd_dir }}/. {{ etcd_staging }}/
+
+        - name: Verify the copy is identical
+          ansible.builtin.command: diff -r {{ etcd_dir }} {{ etcd_staging }}
+          changed_when: false
+
+        - name: Unmount the staging path
+          ansible.builtin.command: umount {{ etcd_staging }}
+
+        - name: Keep the old directory as the rollback
+          ansible.builtin.command: mv {{ etcd_dir }} {{ etcd_old_dir }}
+
+        - name: Create the mountpoint and make it immutable while unmounted
+          ansible.builtin.shell: mkdir -m 0700 {{ etcd_dir }} && chattr +i {{ etcd_dir }}
+
+        # nofail: a missing volume must not stop the host booting — it stays reachable over SSH,
+        # and the immutable mountpoint is what keeps etcd from starting empty.
+        - name: Mount /var/lib/etcd from the volume at boot
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: '^\S+\s+{{ etcd_dir }}\s'
+            line: "UUID={{ etcd_volume_uuid.stdout }} {{ etcd_dir }} xfs noatime,nofail 0 0"
+
+        - name: Mount it
+          ansible.builtin.shell: systemctl daemon-reload && mount {{ etcd_dir }} && chmod 0700 {{ etcd_dir }}
+
+        - name: Confirm /var/lib/etcd is the XFS volume and holds etcd's member directory
+          ansible.builtin.shell: findmnt -no FSTYPE {{ etcd_dir }} | grep -qx xfs && test -d {{ etcd_dir }}/member
+          changed_when: false
+
+        - name: Start etcd
+          ansible.builtin.command: mv {{ etcd_manifest_parked }} {{ etcd_manifest }}
+
+        - name: Wait for etcd to be healthy
+          ansible.builtin.uri:
+            url: "{{ etcd_health_url }}"
+            return_content: true
+            timeout: 5
+          register: etcd_health_after
+          until: "'\"health\":\"true\"' in (etcd_health_after.content | default('') | replace(' ', ''))"
+          retries: 36
+          delay: 10
+
+        # The decisive check: an etcd that started EMPTY is healthy too. Only the old data has the
+        # awx namespace.
+        - name: The API serves the cluster's own data
+          ansible.builtin.command: "{{ kubectl }} get namespace awx -o name"
+          register: etcd_api_check
+          until: etcd_api_check.rc == 0
+          retries: 30
+          delay: 10
+          changed_when: false
+
+      rescue:
+        - name: ROLLBACK — stop etcd if it is running
+          ansible.builtin.shell: |
+            [ -f {{ etcd_manifest }} ] && mv {{ etcd_manifest }} {{ etcd_manifest_parked }}
+            for i in $(seq 30); do pgrep -x etcd >/dev/null || exit 0; sleep 5; done; exit 1
+
+        - name: ROLLBACK — put the old data directory back
+          ansible.builtin.shell: |
+            set -e
+            umount {{ etcd_staging }} 2>/dev/null || true
+            if [ -d {{ etcd_old_dir }} ]; then
+              umount {{ etcd_dir }} 2>/dev/null || true
+              chattr -i {{ etcd_dir }} 2>/dev/null || true
+              rmdir {{ etcd_dir }} 2>/dev/null || true
+              mv {{ etcd_old_dir }} {{ etcd_dir }}
+            fi
+            sed -i '\#^\S\+\s\+{{ etcd_dir }}\s#d' /etc/fstab
+            systemctl daemon-reload
+
+        - name: ROLLBACK — start etcd on its old data
+          ansible.builtin.shell: |
+            [ -f {{ etcd_manifest }} ] || mv {{ etcd_manifest_parked }} {{ etcd_manifest }}
+
+        - name: ROLLBACK — wait for etcd
+          ansible.builtin.uri:
+            url: "{{ etcd_health_url }}"
+            return_content: true
+            timeout: 5
+          register: etcd_health_rollback
+          until: "'\"health\":\"true\"' in (etcd_health_rollback.content | default('') | replace(' ', ''))"
+          retries: 36
+          delay: 10
+
+        - name: ROLLBACK — report
+          ansible.builtin.fail:
+            msg: >-
+              The move failed at "{{ ansible_failed_task.name }}" and was rolled back: etcd is
+              running on its original data in {{ etcd_dir }} on the root disk. The volume is left
+              formatted; the snapshot is {{ etcd_snapshot }}. Error: {{ ansible_failed_result.msg | default('') }}
+
+    # ---------------------------------------------------------------- after
+
+    - name: Create kubelet's systemd drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Order kubelet after the etcd mount at boot
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kubelet.service.d/20-etcd-volume.conf
+        mode: "0644"
+        content: |
+          # Written by playbooks/kubernetes-infra/etcd_volume.yml. Ordering only: if the volume is
+          # missing, kubelet still starts and etcd fails on the immutable empty mountpoint.
+          [Unit]
+          After=var-lib-etcd.mount
+      register: kubelet_dropin
+
+    - name: Reload systemd for the drop-in
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: kubelet_dropin.changed
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: etcd ({{ etcd_du.stdout.split() | first }}) now runs from
+          {{ etcd_volume_dev }} at {{ etcd_dir }} (XFS, UUID {{ etcd_volume_uuid.stdout }}); the API
+          serves the cluster's data. Rollback copy {{ etcd_old_dir }} and snapshot {{ etcd_snapshot }}
+          are left in place.

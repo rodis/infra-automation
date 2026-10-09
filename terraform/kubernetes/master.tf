@@ -9,7 +9,11 @@
 # No security group is added for etcd: every instance is in `default`, which admits all traffic
 # between its members, so master-to-master 2379/2380 already flows.
 #
-# EVERYTHING HERE IS OPT-IN. This project root is shared by west's, east's and north's stacks; with
+# SOUTH (2026-10-09) sets MASTER_ETCD_VOLUME_SIZE too, for its single kubeadm master: etcd there is
+# already stacked (a static pod), so `etcd` in groups is simply true, and the data is moved onto the
+# volume by playbooks/kubernetes-infra/etcd_volume.yml rather than by the kubespray prep playbook.
+#
+# EVERYTHING HERE IS OPT-IN. This project root is shared by west's, east's, north's and south's stacks; with
 # the defaults in variables.tf, a stack that sets none of the MASTER_* variables plans no change.
 
 resource "openstack_compute_servergroup_v2" "master" {
@@ -31,13 +35,12 @@ resource "openstack_compute_instance_v2" "master" {
   image_id = var.IMAGE_UUID
   flavor_name = var.master_flavor_name
   key_pair = var.key_pair
-  security_groups = [
+  security_groups = concat([
     "default",
     openstack_networking_secgroup_v2.kube_api_server_sec_group.name,
     openstack_networking_secgroup_v2.kubelet_sec_group.name,
     openstack_networking_secgroup_v2.nginx_controller_sec_group.name,
-    openstack_networking_secgroup_v2.calico_node_sec_group.name,
-  ]
+  ], var.CALICO_SECURITY_GROUP ? [openstack_networking_secgroup_v2.calico_node_sec_group.name] : [])
 
   network {
     name = var.network
