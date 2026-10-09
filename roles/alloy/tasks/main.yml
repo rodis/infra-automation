@@ -15,6 +15,16 @@
       quiet: true
     run_once: true
 
+  - name: Refuse a configuration that ships logs nowhere
+    ansible.builtin.assert:
+      that: (alloy_logs_to_grafana | bool) or (alloy_logs_to_victorialogs | bool)
+      fail_msg: >-
+        alloy_ship_logs is true but there is no log sink: alloy_logs_to_grafana is false and
+        VictoriaLogs is off (it needs VM_WRITE_TOKEN_INFRA). Check the `observability` context.
+      quiet: true
+    run_once: true
+    when: alloy_ship_logs | bool
+
   - name: Check the remote_write settings were supplied
     when: alloy_metrics_to_grafana | bool
     ansible.builtin.assert:
@@ -43,7 +53,7 @@
         well as metrics:write; otherwise set GRAFANA_LOKI_TOKEN.
       success_msg: "log shipping settings present"
     run_once: true
-    when: alloy_ship_logs | bool
+    when: (alloy_ship_logs | bool) and (alloy_logs_to_grafana | bool)
 
   - name: Check the VictoriaMetrics trial token, when it is supplied
     ansible.builtin.assert:
@@ -333,7 +343,7 @@
       owner: root
       group: alloy
       mode: "0644"
-    when: alloy_vm_enabled | bool
+    when: (alloy_vm_enabled | bool) or (alloy_logs_to_victorialogs | bool)
     notify: Restart alloy
 
   - name: Write the candidate Alloy configuration
@@ -441,7 +451,9 @@
                /^prometheus_remote_storage_samples_failed_total/ {f=$NF}
                /^loki_write_sent_entries_total/ {le+=$NF}
                /^loki_write_dropped_entries_total/ {ld+=$NF}
-               END {printf "%d %d %d %d", s+0, f+0, le+0, ld+0}'
+               /^loki_write_sent_entries_total\{.*victorialogs/ {vs+=$NF}
+               /^loki_write_dropped_entries_total\{.*victorialogs/ {vd+=$NF}
+               END {printf "%d %d %d %d %d %d", s+0, f+0, le+0, ld+0, vs+0, vd+0}'
       executable: /bin/bash
     changed_when: false
     failed_when: false
@@ -454,6 +466,8 @@
       (alloy_counters.stdout.split()[0] | default(0) | int) > 0
       and (not (alloy_ship_logs | bool)
            or (alloy_counters.stdout.split()[2] | default(0) | int) > 0)
+      and (not (alloy_ship_logs | bool) or not (alloy_logs_to_victorialogs | bool)
+           or (alloy_counters.stdout.split()[4] | default(0) | int) > 0)
 
   - name: Report
     ansible.builtin.debug:
@@ -463,6 +477,8 @@
         {{ alloy_counters.stdout.split()[1] | default('?') }} rejected,
         logs {{ alloy_counters.stdout.split()[2] | default('0') }} sent /
         {{ alloy_counters.stdout.split()[3] | default('?') }} dropped
+        (of which VictoriaLogs {{ alloy_counters.stdout.split()[4] | default('0') }} sent /
+        {{ alloy_counters.stdout.split()[5] | default('?') }} dropped)
 
   - name: Check Alloy is running and its samples are being accepted
     ansible.builtin.assert:
@@ -474,6 +490,8 @@
         # host logs something within a minute.
         - not (alloy_ship_logs | bool) or (alloy_counters.stdout.split()[2] | default(0) | int) > 0
         - (alloy_counters.stdout.split()[3] | default(0) | int) == 0
+        # VictoriaLogs on its own: a sum over both log writers would hide one that sends nothing.
+        - not (alloy_ship_logs | bool) or not (alloy_logs_to_victorialogs | bool) or (alloy_counters.stdout.split()[4] | default(0) | int) > 0
       fail_msg: >-
         Alloy is not shipping cleanly on {{ inventory_hostname }} — service is
         '{{ alloy_active.stdout }}', {{ alloy_counters.stdout | default('no counters') }}

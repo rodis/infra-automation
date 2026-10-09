@@ -1,6 +1,9 @@
 {#- Every metric pipeline forwards here: VictoriaMetrics on the watcher VPS (alloy_vm_enabled), and
     Grafana Cloud only if alloy_metrics_to_grafana — off since the cutover, 2026-10-08. One list, so a new
     pipeline cannot forget the second sink. -#}
+{#- Every log pipeline forwards here, by the same reasoning: Grafana Cloud's Loki while
+    alloy_logs_to_grafana, VictoriaLogs when alloy_logs_to_victorialogs. -#}
+{%- set logs_sinks = ((['loki.write.grafana_cloud.receiver'] if alloy_logs_to_grafana | bool else []) + (['loki.write.victorialogs.receiver'] if alloy_logs_to_victorialogs | bool else [])) | join(', ') -%}
 {%- set metrics_sinks = ((['prometheus.remote_write.grafana_cloud.receiver'] if alloy_metrics_to_grafana | bool else []) + (['prometheus.remote_write.victoriametrics.receiver'] if alloy_vm_enabled | bool else [])) | join(', ') -%}
 // Managed by playbooks/observability/install_alloy.yml — edits here are overwritten.
 //
@@ -182,7 +185,7 @@ loki.source.journal "journal" {
 // line with it, and drop info/debug. Warnings and errors go through — the smoke alarm, with a battery.
 // Every other unit passes untouched.
 loki.process "journal" {
-  forward_to = [loki.write.grafana_cloud.receiver]
+  forward_to = [{{ logs_sinks }}]
 
   stage.match {
     selector = "{unit=\"alloy.service\"}"
@@ -203,6 +206,7 @@ loki.process "journal" {
   }
 }
 
+{% if alloy_logs_to_grafana | bool %}
 loki.write "grafana_cloud" {
   endpoint {
     url = "{{ alloy_loki_url }}"
@@ -213,6 +217,23 @@ loki.write "grafana_cloud" {
     }
   }
 }
+{% endif %}
+{% if alloy_logs_to_victorialogs | bool %}
+
+// VictoriaLogs on the watcher VPS (2026-10-09). Loki's push format, through vmauth with the SAME
+// token and pinned certificate as the metrics; Loki labels become VictoriaLogs stream fields.
+loki.write "victorialogs" {
+  endpoint {
+    url          = "{{ alloy_vl_url }}"
+    bearer_token = "{{ alloy_vm_token }}"
+
+    tls_config {
+      ca_file     = "{{ alloy_vm_ca_file }}"
+      min_version = "TLS13"
+    }
+  }
+}
+{% endif %}
 {% endif %}
 
 {% if alloy_scrape_awx %}
@@ -464,7 +485,7 @@ loki.process "postgresql" {
     values = { level = "" }
   }
 
-  forward_to = [loki.write.grafana_cloud.receiver]
+  forward_to = [{{ logs_sinks }}]
 }
 {% endif %}
 {% if alloy_ship_logs and alloy_ship_pod_logs and alloy_has_pod_logs | default(false) %}
@@ -542,7 +563,7 @@ loki.process "pods" {
 }
 
 loki.relabel "pods" {
-  forward_to = [loki.write.grafana_cloud.receiver]
+  forward_to = [{{ logs_sinks }}]
 
   // A pod directory is <namespace>_<pod>_<uid>. Neither a namespace nor a pod name may contain an
   // underscore (RFC 1123), so splitting on "_" is exact rather than a guess.
