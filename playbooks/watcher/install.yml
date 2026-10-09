@@ -39,8 +39,11 @@
     # Pinned, with checksums verified against the published checksums.txt (Dagu) and computed from the
     # official download (op, which publishes signatures rather than a checksum file), 2026-09-27.
     # Same versions as the Mac.
-    watcher_dagu_version: "2.17.2"
-    watcher_dagu_sha256: "404f61946d57896f0c8aa90a95d925d32de33beaae0492a744473bc11de2b463"
+    # 2.18.2 (2026-10-09): 2.18.0 added run.error from failed steps (#2894) — on 2.17.2 the Telegram message
+    # was only "DAG <name> failed:", with nothing about what failed. Checksum computed from the download
+    # and matched against the published checksums.txt.
+    watcher_dagu_version: "2.18.2"
+    watcher_dagu_sha256: "5a84c093b9ba9d02b7a60e106bb91d46f9383fd01c62bd51560e41193f05792b"
     watcher_op_version: "2.35.0"
     watcher_op_sha256: "4457ade59850b852c64c77164235b34dd0b984ef7826eb0ccd32f1fd78a2ceb7"
 
@@ -148,17 +151,26 @@
         checksum: "sha256:{{ watcher_dagu_sha256 }}"
         mode: "0600"
 
+    # Per-version directory. It used to unpack to downloads/dagu with `creates:` on that path — so once
+    # any version had been unpacked, an upgrade skipped the unpack and re-installed the OLD binary,
+    # reporting success. Found on the first upgrade (2.17.2 -> 2.18.2), before it ran.
+    - name: Per-version directory for Dagu
+      ansible.builtin.file:
+        path: "{{ watcher_home }}/downloads/dagu-{{ watcher_dagu_version }}"
+        state: directory
+        mode: "0700"
+
     - name: Unpack Dagu
       ansible.builtin.unarchive:
         src: "{{ watcher_home }}/downloads/dagu_{{ watcher_dagu_version }}.tar.gz"
-        dest: "{{ watcher_home }}/downloads"
+        dest: "{{ watcher_home }}/downloads/dagu-{{ watcher_dagu_version }}"
         remote_src: true
         include: [dagu]
-        creates: "{{ watcher_home }}/downloads/dagu"
+        creates: "{{ watcher_home }}/downloads/dagu-{{ watcher_dagu_version }}/dagu"
 
     - name: Install Dagu into ~/bin
       ansible.builtin.copy:
-        src: "{{ watcher_home }}/downloads/dagu"
+        src: "{{ watcher_home }}/downloads/dagu-{{ watcher_dagu_version }}/dagu"
         dest: "{{ watcher_bin }}/dagu"
         remote_src: true
         mode: "0755"
@@ -329,6 +341,13 @@
           - watcher_listen.stdout is not search('(0\.0\.0\.0|\*|\[::\]):' ~ watcher_dagu_port ~ '\s')
         fail_msg: "Dagu must listen on 127.0.0.1:{{ watcher_dagu_port }} and nowhere else — this box has no firewall."
         quiet: true
+
+    - name: The installed Dagu is the pinned version
+      ansible.builtin.command:
+        argv: ["{{ watcher_bin }}/dagu", "version"]
+      register: watcher_dagu_installed
+      changed_when: false
+      failed_when: watcher_dagu_version not in watcher_dagu_installed.stdout
 
     - name: List the DAGs Dagu sees
       ansible.builtin.command:
