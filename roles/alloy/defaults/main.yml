@@ -26,11 +26,13 @@ alloy_vm_ca_file: /etc/alloy/victoriametrics-ca.crt
 # separate tenants. The token is shared only if the access policy behind it carries logs:write as
 # well as metrics:write; GRAFANA_LOKI_TOKEN overrides when they are separate policies.
 alloy_ship_logs: true
-# LOG SINKS (2026-10-09, project self-hosted-metrics, task victorialogs). Logs go to Grafana Cloud's
-# Loki AND to VictoriaLogs on the watcher VPS until the checks' log queries read VictoriaLogs; then
-# alloy_logs_to_grafana goes false, as alloy_metrics_to_grafana did. VictoriaLogs takes Loki's push
-# format through vmauth with the same token and pinned certificate as the metrics.
-alloy_logs_to_grafana: true
+# LOGS TO GRAFANA CLOUD — OFF since the logs cutover (owner, 2026-10-10, task victorialogs):
+# VictoriaLogs on the watcher VPS is the only log store. Before it, 11 hours of dual-write matched
+# line for line per job and host (116,089 vs 116,091 lines), and the watcher had read logs from
+# VictoriaLogs for 24 runs without a failed query. VictoriaLogs takes Loki's push format through
+# vmauth with the same token and pinned certificate as the metrics. Set true to send logs to Grafana
+# Cloud again (the Loki settings below are still read only then).
+alloy_logs_to_grafana: false
 alloy_logs_to_victorialogs: "{{ alloy_vm_enabled }}"
 alloy_vl_url: "https://vps71884.dreamhostps.com:8427/insert/loki/api/v1/push"
 alloy_loki_url: "{{ lookup('env', 'GRAFANA_LOKI_URL') }}"
