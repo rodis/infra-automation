@@ -103,10 +103,12 @@ alloy_postgres_log_glob: /var/log/postgresql/postgresql-*-main.log
 # -- the role installs `acl` and sets a DEFAULT acl, which kubelet's newly created pod directories
 # inherit.
 alloy_ship_pod_logs: true
+#
+# ALL NAMESPACES since 2026-10-10 (owner; task collect-more-after-grafana). The trim above was for
+# the free tier's 50 GB/month; cert-manager, traefik and the Doppler operator were left out, and
+# their own logs were missing when their restarts were investigated on 2026-10-09. A glob per entry.
 alloy_pod_log_namespaces:
-  - awx
-  - kube-system
-  - kube-flannel
+  - "*"
 
 # KUBE-STATE-METRICS (level 2). Scraped over the NodePort that roles/kube_state_metrics publishes,
 # so the collector needs no kubeconfig and no ServiceAccount token: the RBAC is consumed by
