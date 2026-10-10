@@ -107,4 +107,4 @@
         success_msg: >-
           cluster-scraper: {{ cs_counters.stdout.split()[0] }} targets up, 0 down,
           {{ cs_counters.stdout.split()[2] }} remote-write requests accepted, none dropped,
-          {{ cs_counters.stdout.split()[4] }} samples per scrape round
+          {{ cs_counters.stdout.split()[4] }} samples scraped since the pod started
