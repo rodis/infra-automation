@@ -239,7 +239,8 @@ print("\n== recovery — every leader-elected controller holds its lease again")
 guarded("platform leases", lambda: _rows(recovery.leases(T["ksm"], [
     ("cert-manager", "kube-system", "cert-manager-controller"),
     ("cainjector", "kube-system", "cert-manager-cainjector-leader-election"),
-    ("Doppler operator", "doppler-operator-system", None),   # found by namespace, never typed
+    # Not the Doppler operator: leader election is OFF by design (helm-override-files 5f6f83f), so it
+    # holds no lease — its leftover one stopped renewing ~2026-09-26 (owner's amendment, 2026-10-11).
 ])))
 print("\n== recovery — the API server is serving")
 guarded("API server serving", lambda: _rows(recovery.apiserver(T["ksm"], T["hosts"])))
