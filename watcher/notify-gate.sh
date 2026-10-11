@@ -2,7 +2,7 @@
 # Decide whether a check's result should reach Telegram. Called by every check DAG between the check
 # and its verdict steps (dagu/check-dag.yaml.j2):
 #
-#   notify-gate.sh <dag-name> <exit-code> <check-output-file>  ->  prints "alert" or "quiet"
+#   notify-gate.sh <dag-name> <exit-code> <check-output-file>  ->  prints "alert", "quiet" or "resolved"
 #
 # Why (2026-10-09): Dagu notifies on EVERY failed run, so a known finding — the cert-manager restarts,
 # Grafana's no-data rules after the metrics cutover — sent the same message every hour, 24 a day, and
@@ -10,7 +10,9 @@
 # deduplicate, but only for PagerDuty and SolarWinds, not Telegram.
 #
 # The rule: alert when the result is NEW or CHANGED, and once a day while it persists (a reminder that
-# it is still there). A passing run clears the state and records when the problem ended. The signature
+# it is still there). A passing run clears the state, records when the problem ended, and — since
+# 2026-10-11 (owner) — says "resolved", so the DAG sends one short "recovered" message: a storage stall
+# then reads as two messages, the finding and its recovery, instead of an alert with no ending. The signature
 # is the exit code plus the failing lines with every number removed, so "2.19/day" becoming "2.18/day"
 # is not a change, but a different predicate failing is.
 #
@@ -27,8 +29,11 @@ mkdir -p "$state_dir" 2>/dev/null || { echo alert; exit 0; }
 if [ "$code" = 0 ]; then
   if [ -f "$state" ]; then
     first=$(sed -n 's/^first=//p' "$state")
-    echo "$(date -u +%FT%TZ) $dag resolved (failing since $(date -u -d "@${first:-$now}" +%FT%TZ))" >> "$state_dir/history.log"
+    since=$(date -u -d "@${first:-$now}" +%FT%TZ)
+    echo "$(date -u +%FT%TZ) $dag resolved (failing since $since)" >> "$state_dir/history.log"
+    echo "$since" > "$state_dir/$dag.resolved-since"   # for the message; the DAG removes it
     rm -f "$state"
+    echo resolved; exit 0
   fi
   echo quiet; exit 0
 fi

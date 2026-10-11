@@ -34,6 +34,10 @@ ksm_resources:
   # Grafana rather than over SSH (infra-objectives CLAUDE.md, "Unattended checks never use SSH").
   - ingresses
   - ingressclasses
+  # 2026-10-11: leader-election Leases, for the recovery predicates (platform-healthy, awx-healthy):
+  # kube_lease_renew_time says whether a controller holds its lease again after a storage stall. A
+  # Lease holds a holder name and timestamps, nothing secret.
+  - leases
 
 # Object labels KSM exports as `kube_<kind>_labels`. Only these two, and only because
 # platform-healthy compares them with the pins in helm-override-files: the Traefik chart version and

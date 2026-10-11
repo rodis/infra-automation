@@ -26,6 +26,7 @@ import urllib.error, urllib.parse, urllib.request
 from grafana_wake import wake
 import metrics   # where METRICS come from (Grafana Cloud or VictoriaMetrics)
 import logs      # where LOGS come from (Grafana Cloud's Loki or VictoriaLogs), 2026-10-09
+import recovery  # recovery after a storage stall, shared with check-platform-status.py (2026-10-11)
 
 GRAFANA = (os.environ.get("GRAFANA_URL") or "").rstrip("/")
 GRAFANA = GRAFANA if GRAFANA.startswith("http") or not GRAFANA else "https://" + GRAFANA
@@ -252,6 +253,21 @@ def _canary():
     verdict("canary: 3 x runner_on_ok on localhost", None, f"did not run after 3 attempts: {last_err}")
 guarded("canary", _canary)
 
+# RECOVERY (owner, 2026-10-11): the AWX operator and the control plane's own controllers restart in
+# every storage stall, like cert-manager. Graded the same way — did they come back — never on how often.
+KSM, HOSTS = "k8s-south", "k8s-south-.*"
+section("5. recovery — the AWX operator and the control plane after a storage stall")
+def _recovery_rows(rows):
+    for name, ok, detail in rows: verdict(name, ok, detail)
+guarded("AWX operator recovered", lambda: _recovery_rows(recovery.containers(KSM, "awx", pod_re="awx-operator-controller-manager-.*")))
+guarded("controller-manager / scheduler recovered", lambda: _recovery_rows(recovery.containers(KSM, "kube-system", pod_re="kube-(controller-manager|scheduler)-.*")))
+guarded("leases", lambda: _recovery_rows(recovery.leases(KSM, [
+    ("kube-controller-manager", "kube-system", "kube-controller-manager"),
+    ("kube-scheduler", "kube-system", "kube-scheduler"),
+    ("AWX operator", "awx", None),            # found by namespace, never typed
+])))
+guarded("API server serving", lambda: _recovery_rows(recovery.apiserver(KSM, HOSTS)))
+
 section("reported — never gating")
 def _backup():
     # Not observable without SSH until a backup system exists to report on; the facts below were
@@ -284,6 +300,14 @@ for name, expr, fmt in (
         report(name, "UNKNOWN" if v is None else flag, "no series" if v is None else fmt.format(v))
     except Exception as e:
         report(name, "UNKNOWN", str(e)[:120])
+
+# Restarts of the operator and the control plane, as information: what each storage stall cost.
+try:
+    for name, flag, detail in recovery.restart_history(KSM, "awx|kube-system"):
+        if "awx-operator" in name or "kube-controller-manager" in name or "kube-scheduler" in name or "kube-apiserver" in name or name.startswith("restarts"):
+            report(name, flag, detail)
+except Exception as e:
+    report("restart history", "UNKNOWN", str(e)[:120])
 
 # ------------------------------------------------------------------------------------------------
 fails = [r for r in results if r[0] == FAIL]

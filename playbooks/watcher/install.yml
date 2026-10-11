@@ -93,7 +93,9 @@
     # route of its own, so it falls back to the global route (the infra topic).
     watcher_notifications:
       template_channel: "Pinky and the Brain"
-      events: [dag.run.failed, dag.run.aborted, dag.run.rejected]
+      # partially_succeeded (2026-10-11) is the "recovered" message: only the `resolved` step of a check
+      # DAG produces it (watcher/dagu/check-dag.yaml.j2).
+      events: [dag.run.failed, dag.run.aborted, dag.run.rejected, dag.run.partially_succeeded]
       workspaces:
         infra: {channel: "Pinky and the Brain", topic: "2"}
         production: {channel: "Pinky and the Brain — Production", topic: "287"}

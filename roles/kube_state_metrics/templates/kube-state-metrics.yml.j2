@@ -34,6 +34,10 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: [ingresses, ingressclasses]
     verbs: [get, list, watch]
+  # Added 2026-10-11 for the recovery predicates: still get/list/watch only.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: [leases]
+    verbs: [get, list, watch]
   - apiGroups: ["cert-manager.io"]
     resources: [certificates, clusterissuers]
     verbs: [get, list, watch]

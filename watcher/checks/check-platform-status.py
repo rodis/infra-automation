@@ -18,15 +18,16 @@ than grant `list secrets`, which returns the values.
 import datetime, json, os, re, ssl, sys, urllib.error, urllib.parse, urllib.request
 
 import metrics   # where METRICS come from: Grafana Cloud or VictoriaMetrics
+import recovery  # recovery after a storage stall, shared with check-awx-status.py (2026-10-11)
 
 # infra reads south's kube-state-metrics in Grafana. production, when added, reads through AWX jobs
 # (task production-cluster-check) — never SSH.
 # ksm: the `instance` label kube-state-metrics series carry for that cluster — every query is scoped to
 # it, because several clusters share one Grafana stack.
 TARGETS = {
-    "infra": {"ksm": "k8s-south"},
+    "infra": {"ksm": "k8s-south", "hosts": "k8s-south-.*"},
     # Same approved predicates (owner's standing approval, 2026-09-28: production copies infra's).
-    "production": {"ksm": "k8s-production"},
+    "production": {"ksm": "k8s-production", "hosts": "k8s-(east|north)-.*"},
 }
 # The pins live in helm-override-files. On the VPS they must be shipped with the checker.
 HOF = os.environ.get("HELM_OVERRIDE_FILES", os.path.expanduser("~/Development/personal/helm-override-files"))
@@ -77,7 +78,6 @@ def pin(path, pattern):
 #   certs               [{name, ready: bool, not_after: dt, renewal: dt}]
 #   doppler             {ready: bool, images: [image, ...]}  or None when missing
 #   dsecrets            [{name, sync: bool}]
-#   containers          [{pod, container, restarts, started: dt, crashloop: bool}]
 # ------------------------------------------------------------------------------------------------
 
 def facts_from_grafana(ksm):
@@ -134,12 +134,6 @@ def facts_from_grafana(ksm):
     f["dsecrets"] = [{"name": f'{r["metric"]["name"]} -> {r["metric"]["namespace"]}', "sync": float(r["value"][1]) == 1}
                      for r in q(f'kube_customresource_dopplersecret_condition{{{sel},type="secrets.doppler.com/SecretSyncReady"}}')]
 
-    nsre = "|".join(sorted(PLATFORM_NS))
-    started = {r["metric"]["pod"]: from_epoch(float(r["value"][1])) for r in q(f'kube_pod_start_time{{{sel},namespace=~"{nsre}"}}')}
-    crash = {(r["metric"]["pod"], r["metric"]["container"]) for r in q(f'kube_pod_container_status_waiting_reason{{{sel},namespace=~"{nsre}",reason="CrashLoopBackOff"}} == 1')}
-    f["containers"] = [{"pod": r["metric"]["pod"], "container": r["metric"]["container"], "restarts": int(float(r["value"][1])),
-                        "started": started.get(r["metric"]["pod"]), "crashloop": (r["metric"]["pod"], r["metric"]["container"]) in crash}
-                       for r in q(f'kube_pod_container_status_restarts_total{{{sel},namespace=~"{nsre}"}}')]
     return f
 
 
@@ -230,18 +224,31 @@ for s in F["dsecrets"]:
 if not F["dsecrets"]:
     report("DopplerSecrets", "info", "none in the cluster")
 
-print("\n== restarts — an app that keeps restarting is not healthy")
-for c in F["containers"]:
-    def _restarts(c=c):
-        if not c["started"]:
-            verdict(f"{c['pod'][:40]}/{c['container']} restarts", None, "no pod start time"); return
-        age_d = max((NOW - c["started"]).total_seconds() / 86400, 1e-6)
-        if age_d < 1:
-            ok, rate = c["restarts"] <= 1, f"{c['restarts']} in {age_d*24:.1f}h (young pod: at most 1)"
-        else:
-            ok, rate = c["restarts"] / age_d < 1, f"{c['restarts'] / age_d:.2f}/day ({c['restarts']} in {age_d:.0f}d)"
-        verdict(f"{c['pod'][:40]}/{c['container']} restarts", ok and not c["crashloop"], rate + (", CrashLoopBackOff" if c["crashloop"] else ""))
-    guarded(f"{c['pod']} restarts", _restarts)
+# RECOVERY (owner, 2026-10-11) replaced "fewer than 1 restart a day over the pod's life". Storage
+# stalls restart every leader-elected controller and cannot be prevented here; what is graded is
+# whether each one came back. See recovery.py and the objective.
+T = TARGETS[target]
+def _rows(rows):
+    for name, ok, detail in rows: verdict(name, ok, detail)
+def _reports(rows):
+    for name, flag, detail in rows: report(name, flag, detail)
+
+print("\n== recovery — running, ready, no longer restarting")
+guarded("platform containers recovered", lambda: _rows(recovery.containers(T["ksm"], "|".join(sorted(PLATFORM_NS)))))
+print("\n== recovery — every leader-elected controller holds its lease again")
+guarded("platform leases", lambda: _rows(recovery.leases(T["ksm"], [
+    ("cert-manager", "kube-system", "cert-manager-controller"),
+    ("cainjector", "kube-system", "cert-manager-cainjector-leader-election"),
+    ("Doppler operator", "doppler-operator-system", None),   # found by namespace, never typed
+])))
+print("\n== recovery — the API server is serving")
+guarded("API server serving", lambda: _rows(recovery.apiserver(T["ksm"], T["hosts"])))
+
+print("\n== reported, not graded — restart history and storage stalls")
+for name, fn in (("restart history", lambda: recovery.restart_history(T["ksm"], "|".join(sorted(PLATFORM_NS)))),
+                 ("storage stalls", lambda: recovery.storage_stalls(T["hosts"]))):
+    try: _reports(fn())
+    except Exception as e: report(name, "UNKNOWN", f"{type(e).__name__}: {str(e)[:100]}")
 
 # ------------------------------------------------------------------------------------------------
 fails = [r for r in results if r[0] == "FAIL"]; unknown = [r for r in results if r[0] == "UNKNOWN"]
