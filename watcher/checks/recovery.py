@@ -60,20 +60,29 @@ def leases(ksm, wanted):
     """wanted: [(label, namespace, lease name or None = every lease in that namespace)].
     Each must have been renewed within LEASE_FRESH_S. A renewal means a live holder that is working:
     a controller that lost its lease and never re-acquired it is running and doing nothing."""
-    renew = {(r["metric"]["namespace"], r["metric"]["lease"]): float(r["value"][1])
-             for r in _q(f'kube_lease_renew_time{{instance="{ksm}"}}')}
-    if not renew:
+    # Age AT THE SCRAPE (sample timestamp minus renewTime), not against now: the 60 s scrape interval
+    # and VictoriaMetrics' 30 s latency offset otherwise count as lease age — the first run read 91 s
+    # for a lease cert-manager renews every 15 s. A stale scrape is a different fact, and is caught:
+    # the series' own timestamp must be recent too.
+    age_at_scrape = {(r["metric"]["namespace"], r["metric"]["lease"]): float(r["value"][1])
+                     for r in _q(f'timestamp(kube_lease_renew_time{{instance="{ksm}"}}) - kube_lease_renew_time{{instance="{ksm}"}}')}
+    scraped_ago = {(r["metric"]["namespace"], r["metric"]["lease"]): float(r["value"][1])
+                   for r in _q(f'time() - timestamp(kube_lease_renew_time{{instance="{ksm}"}})')}
+    if not age_at_scrape:
         return [("leader-election leases", None, "no kube_lease_renew_time series — kube-state-metrics is not exporting leases")]
-    now, rows = time.time(), []
+    rows = []
     for label, ns, name in wanted:
-        found = {k: v for k, v in renew.items() if k[0] == ns and (name is None or k[1] == name)}
+        found = {k: v for k, v in age_at_scrape.items() if k[0] == ns and (name is None or k[1] == name)}
         if not found:
             rows.append((f"{label} lease renewed < {LEASE_FRESH_S}s", False, f"no lease {ns}/{name or '*'}"))
             continue
-        ages = {f"{k[0]}/{k[1]}": now - v for k, v in found.items()}
+        if any(scraped_ago.get(k, 1e9) > 300 for k in found):
+            rows.append((f"{label} lease renewed < {LEASE_FRESH_S}s", None, "lease data not scraped in 5 min — cannot tell"))
+            continue
+        ages = {f"{k[0]}/{k[1]}": v for k, v in found.items()}
         stale = {k: a for k, a in ages.items() if a > LEASE_FRESH_S}
         rows.append((f"{label} lease renewed < {LEASE_FRESH_S}s", not stale,
-                     ", ".join(f"{k} {a:.0f}s ago" for k, a in ages.items())))
+                     ", ".join(f"{k} {a:.0f}s before last scrape" for k, a in ages.items())))
     return rows
 
 
