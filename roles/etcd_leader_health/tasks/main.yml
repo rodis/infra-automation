@@ -65,7 +65,9 @@
 
 - name: Read the run's journal line
   when: not ansible_check_mode
-  ansible.builtin.command: journalctl -u etcd-leader-health.service -n 1 -o cat --no-pager
+  # -t (the script's SyslogIdentifier), not -u: the unit's journal ends with systemd's own
+  # "Deactivated successfully" / "Finished ..." lines, which are not the script's output.
+  ansible.builtin.command: journalctl -t etcd-leader-health -n 1 -o cat --no-pager
   register: etcd_leader_health_last
   changed_when: false
   check_mode: false   # a read
