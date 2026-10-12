@@ -81,4 +81,4 @@
       - (etcd_leader_health_last.stdout | from_json).local is not none
       - (etcd_leader_health_last.stdout | from_json).armed == (etcd_leader_health_armed | bool)
     fail_msg: "etcd-leader-health did not read the cluster: {{ etcd_leader_health_last.stdout }}"
-    success_msg: "{{ (etcd_leader_health_last.stdout | from_json) | dict2items | selectattr('key', 'in', ['host', 'armed', 'leader', 'local', 'action', 'reason']) | items2dict }}"
+    success_msg: "{{ (etcd_leader_health_last.stdout | from_json) | dict2items | selectattr('key', 'in', ['host', 'armed', 'leader', 'local', 'action', 'reason']) | items2dict | to_json }}"

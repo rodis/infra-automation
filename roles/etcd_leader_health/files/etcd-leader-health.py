@@ -54,7 +54,10 @@ def log(**kw):
 def etcdctl(*args, endpoint="https://127.0.0.1:2379"):
     cmd = [ETCDCTL, f"--endpoints={endpoint}", f"--cacert={CA}", f"--cert={CERT}", f"--key={KEY}",
            f"--command-timeout={TIMEOUT}s", *args]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT * 3, check=True).stdout
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT * 3)
+    if r.returncode != 0:   # etcdctl's own words, not the command line, are what explain a failure
+        raise RuntimeError(f"etcdctl {args[0]} exited {r.returncode}: {r.stderr.strip()[-250:]}")
+    return r.stdout
 
 
 def cluster():
