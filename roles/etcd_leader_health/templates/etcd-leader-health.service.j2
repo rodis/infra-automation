@@ -1,0 +1,12 @@
+# {{ ansible_managed }} — roles/etcd_leader_health
+[Unit]
+Description=Move etcd leadership off a member whose disk is going bad
+After=etcd.service
+Requires=etcd.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/etcd-leader-health.env
+ExecStart=/usr/bin/python3 /usr/local/bin/etcd-leader-health.py
+SyslogIdentifier=etcd-leader-health
+TimeoutStartSec=50

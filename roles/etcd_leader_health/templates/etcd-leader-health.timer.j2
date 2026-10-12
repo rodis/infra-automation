@@ -1,0 +1,11 @@
+# {{ ansible_managed }} — roles/etcd_leader_health
+[Unit]
+Description=Check etcd leader health every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

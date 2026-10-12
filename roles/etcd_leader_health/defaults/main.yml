@@ -1,0 +1,12 @@
+---
+# LOG-ONLY until armed. Armed means the leader moves itself; arm only after its journal has been
+# compared with the stalls that followed (infra-objectives task etcd-stacked-on-masters).
+etcd_leader_health_armed: false
+# ">= slow_count WAL fsyncs over `bucket` seconds within `window`" marks the leader degraded.
+# Chosen from agent/stall-predict.py on 2026-10-12 (rule >= 3 in 2 min: ~60% of a degraded
+# member's >4s stalls caught, a sub-second handover every 1.5-3 h).
+etcd_leader_health_slow_count: 3
+etcd_leader_health_window: 120
+etcd_leader_health_bucket: "1.024"        # a histogram edge: etcd's buckets are powers of two
+etcd_leader_health_quiet_window: 600      # target = follower with fewest slow syncs over this
+etcd_leader_health_cooldown: 600          # no move if leadership changed within this

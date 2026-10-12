@@ -1,0 +1,17 @@
+---
+# Install etcd-leader-health on every etcd member: once a minute, if this member leads and its disk
+# has turned slow, hand leadership to the cleanest follower (etcdctl move-leader). LOG-ONLY unless
+# etcd_leader_health_armed=true. Logic and rationale: roles/etcd_leader_health.
+#
+#   AWX template "General: Kubernetes: Cluster: etcd leader health", launched with the cluster's
+#   inventory and a machine credential; extra var etcd_leader_health_armed (default false).
+#
+# Role referenced by relative path, as playbooks/openstack/dead_ports.yml does and for the same
+# reason.
+
+- name: Install etcd-leader-health on the etcd members
+  hosts: etcd
+  become: true
+  gather_facts: false
+  roles:
+    - role: ../../roles/etcd_leader_health
