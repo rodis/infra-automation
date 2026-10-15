@@ -192,6 +192,54 @@
           kubeadm-config has no etcd.local.extraArgs timings. Run etcd_timings.yml first, or this
           member joins with kubeadm's 1s election timeout while master-1 runs something else.
 
+    - name: The API server's kubelet client must be authorised to reach kubelets
+      # WHY THIS EXISTS. kubeadm generates apiserver-kubelet-client.crt LOCALLY on each joining
+      # node -- the kubeadm-certs Secret carries only CAs -- and that certificate's Organization
+      # becomes the caller's GROUP when an API server talks to a kubelet. master-1, built
+      # 2026-01, got `O=kubeadm:cluster-admins`, which is bound to cluster-admin, so its API
+      # server may do anything to a kubelet. master-2, joined 2026-10-15 with kubeadm 1.33.13, got
+      # a certificate with NO Organization at all, so its API server authenticated as a bare user
+      # with no RBAC whatsoever and every kubelet-backed call routed to it answered:
+      #
+      #   Forbidden (user=kube-apiserver-kubelet-client, verb=get, resource=nodes,
+      #              subresource(s)=[proxy])
+      #
+      # That breaks `kubectl logs`, `exec`, `attach` and `port-forward` -- and AWX, whose receptor
+      # streams a job pod's output exactly that way. In-cluster clients reach the API through the
+      # `kubernetes` Service, which balances across every API server, so it failed roughly half
+      # the time. AWX ran no job for three hours before anyone noticed.
+      #
+      # `system:kubelet-api-admin` is the upstream-documented grant for precisely this, and it is
+      # STRICTLY NARROWER than the cluster-admin master-1 already gets from its group. Binding the
+      # user rather than re-issuing the certificate is deliberate: `kubeadm certs renew`
+      # regenerates from the same spec that produced the problem, so a re-issued certificate would
+      # not survive the next join. This way every present and future master is covered.
+      #
+      # Idempotent: `kubectl apply` of an unchanged binding reports `unchanged`.
+      ansible.builtin.shell:
+        cmd: |
+          cat <<'MANIFEST' | {{ kubectl_remote }} apply -f -
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: kubeadm:kubelet-api-admin
+            annotations:
+              managed-by: playbooks/kubernetes-infra/master_join.yml
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: system:kubelet-api-admin
+          subjects:
+            - apiGroup: rbac.authorization.k8s.io
+              kind: User
+              name: kube-apiserver-kubelet-client
+          MANIFEST
+        executable: /bin/bash
+      delegate_to: "{{ join_from }}"
+      register: mj_kubelet_rbac
+      changed_when: "'unchanged' not in mj_kubelet_rbac.stdout"
+      check_mode: false
+
     # ------------------------------------------------------------------ the etcd volume
 
     - name: Find this host's etcd volume id in its own OpenStack metadata
@@ -498,6 +546,28 @@
       changed_when: false
       check_mode: false
       failed_when: mj_local_etcd.stdout | trim != '1'
+
+    - name: This API server can actually REACH a kubelet
+      # The check that was missing on 2026-10-15. Everything was verified through master-1, whose
+      # API server worked, while master-2's was refused by every kubelet for three hours -- and
+      # nothing noticed, because admin.conf points at the controlPlaneEndpoint and that name
+      # resolved only to master-1. A verification path that avoids the broken half proves nothing,
+      # so this one addresses THIS host's API server by address and makes it do a kubelet-backed
+      # call (pod logs goes API server -> kubelet, which is what AWX needs).
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          POD=$({{ kubectl_remote }} -n kube-system get pods -l k8s-app=kube-dns \
+                  -o jsonpath='{.items[0].metadata.name}')
+          {{ kubectl_remote }} --server=https://{{ ansible_default_ipv4.address }}:6443 \
+            --tls-server-name={{ (mj_cc.stdout | from_yaml).controlPlaneEndpoint | regex_replace(':.*$', '') }} \
+            -n kube-system logs "$POD" --tail=1 >/dev/null
+        executable: /bin/bash
+      delegate_to: "{{ join_from }}"
+      register: mj_kubelet_reach
+      changed_when: false
+      failed_when: mj_kubelet_reach.rc != 0
+      check_mode: false
 
     - name: Remove the control-plane taint -- on south every master runs pods
       ansible.builtin.command: >-
