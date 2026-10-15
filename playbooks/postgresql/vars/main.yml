@@ -67,16 +67,34 @@ postgresql_hba_entries:
   #   destroy and recreate       new instance, new port, new address.  This list goes stale and AWX
   #     (terraform -replace)     loses its database until somebody updates it.
   #
-  # The second is rung 3 of the escalation ladder in infra-objectives, and it is exactly what
-  # rule 7 forbids absolutely in `south`: never destroy a VM there, on any occasion. So hardcoding
-  # addresses is defensible in THIS tenant because the operation that would invalidate them is
-  # already prohibited -- not because addresses are inherently stable.
+  # THE PREMISE THAT MADE THE SECOND CASE SAFE IS GONE, AND IT COST AN OUTAGE (2026-10-15).
+  # This comment used to argue that hardcoding addresses is defensible in `south` because rule 7
+  # forbids destroying a VM there on any occasion, so the invalidating operation could not happen.
+  # The owner then granted a bounded exception for the three-masters project (task vault:
+  # south-three-masters) and south's workers were destroyed and replaced by control-plane nodes.
+  # k8s-south-master-2 came up on a NEW address, was not on this list, and every AWX pod scheduled
+  # there connected, was refused at authentication, and hung in `wait-for-migrations` forever --
+  # 25 minutes of AWX 503 before the pods were moved back. Had the last allowlisted worker been
+  # destroyed first, AWX could not have come back at all, and AWX is the hands for every cluster.
+  #
+  # So the rule is now explicit rather than implied: THIS LIST IS PART OF ADDING OR REPLACING A
+  # SOUTH MACHINE. Add the new address here and apply this stack BEFORE any AWX pod can schedule
+  # on it -- in practice, between Terraform creating the instance and the node being made
+  # schedulable. A node that is Ready and untainted but missing from this list is a trap that
+  # presents as a hanging pod with no error anywhere.
+  #
+  # Removed 2026-10-15: 208.113.130.17, which was k8s-south-node-2, destroyed that day. Addresses
+  # here are public and are returned to the provider's pool, so a stale entry is not merely
+  # untidy -- it can come to name a machine belonging to somebody else, and as this file notes
+  # above, the only thing between the internet and the AWX database is one password.
+  #
+  # Still to add: k8s-south-master-3, once window C creates it.
   #
   # Do not copy this pattern to west, east or north. Those tenants are rebuilt routinely, by
   # design, and an allowlist of instance addresses there would be a trap rather than a control.
-  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.131.96/32', auth_method: "{{ postgresql_auth_method }}"}
-  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.135.15/32', auth_method: "{{ postgresql_auth_method }}"}
-  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.130.17/32', auth_method: "{{ postgresql_auth_method }}"}
+  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.131.96/32', auth_method: "{{ postgresql_auth_method }}"}  # k8s-south-master-1
+  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.135.15/32', auth_method: "{{ postgresql_auth_method }}"}  # k8s-south-node-1
+  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.130.50/32', auth_method: "{{ postgresql_auth_method }}"}  # k8s-south-master-2
 postgresql_privs:
   - db: "{{ lookup('env', 'DB_NAME') }}"
     roles: "{{ lookup('env', 'DB_USER') }}"
