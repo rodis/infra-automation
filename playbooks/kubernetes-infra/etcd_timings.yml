@@ -565,14 +565,18 @@
       check_mode: false
 
     - name: Done
+      # Plain strings. The first version of this built the summary with
+      # `default({'stdout': ...}).stdout`, which is not valid Jinja -- you cannot attribute-access a
+      # filter's result without parentheses -- so the whole run reported FAILED after every
+      # substantive task had already passed and nothing had been rolled back. A summary line that
+      # can fail the run it is summarising is worse than no summary.
       ansible.builtin.debug:
-        msg: >-
-          {{ [ 'timings: ' ~ (etcd_timings | dict2items | map(attribute='key')
-                 | zip(etcd_timings | dict2items | map(attribute='value'))
-                 | map('join', '=') | join(' ')),
-               'raft index ' ~ (et_raft_pre.stdout | trim) ~ ' -> ' ~ (et_raft_post.stdout | trim),
-               'etcd container ' ~ (et_cid_pre.stdout | trim | truncate(13, true, ''))
-                 ~ ' -> ' ~ (et_cid_post.stdout | default({'stdout': 'unchanged'}).stdout | trim | truncate(13, true, '')),
-               et_agree.stdout | default(''),
-               'backups in ' ~ etcd_backup ~ ', snapshot at ' ~ etcd_snapshot ]
-             + (et_dryrun.stdout_lines | default([])) }}
+        msg: "{{ et_report }}"
+      vars:
+        et_report: >-
+          {{ ['timings: ' ~ et_wanted_args | join(' '),
+              'raft index ' ~ et_raft_pre.stdout | trim ~ ' -> ' ~ et_raft_post.stdout | trim,
+              'etcd container restarted: ' ~ et_cid_pre.stdout | trim | truncate(13, true, ''),
+              et_agree.stdout,
+              'backups in ' ~ etcd_backup ~ ', snapshot at ' ~ etcd_snapshot]
+             + et_dryrun.stdout_lines | default([]) }}
