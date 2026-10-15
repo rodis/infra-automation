@@ -205,8 +205,15 @@
       check_mode: false
 
     - name: Use it
+      # NOT `etcd_volume_id | default(<the metadata lookup>)`. Jinja's default() is a function call,
+      # so its argument is evaluated EAGERLY -- when etcd_volume_id IS passed the metadata task is
+      # skipped, mj_meta is undefined, and the argument raises before default() can pick the value
+      # that was supplied. An `if/else` expression is lazy and takes the branch actually wanted.
+      # This is the same shape as the `default({...}).stdout` bug fixed in d514f81, and it bit for
+      # the same reason: the branch only taken in the unusual case had never been run. Needed on
+      # 2026-10-15, when DreamHost's metadata service was returning 500 on every south host.
       ansible.builtin.set_fact:
-        mj_volume_id: "{{ etcd_volume_id | default((mj_meta.content | from_json).meta.etcd_volume) }}"
+        mj_volume_id: "{{ etcd_volume_id if etcd_volume_id is defined else (mj_meta.content | from_json).meta.etcd_volume }}"
 
     - name: There must be a volume to put etcd on
       ansible.builtin.assert:
