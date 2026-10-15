@@ -81,8 +81,14 @@
     # ------------------------------------------------------------------ preflight: reads only
 
     - name: The prerequisites kube-dependencies.yml installs are present
-      ansible.builtin.command: "{{ item }} --version"
-      loop: [kubeadm, kubelet, crictl]
+      # `kubeadm --version` is not a thing -- kubeadm takes a `version` SUBCOMMAND, and the wrong
+      # spelling failed this preflight on a host that was perfectly well prepared (2026-10-15).
+      ansible.builtin.command: "{{ item.cmd }}"
+      loop:
+        - {name: kubeadm, cmd: kubeadm version -o short}
+        - {name: kubelet, cmd: kubelet --version}
+      loop_control:
+        label: "{{ item.name }}"
       register: mj_bins
       changed_when: false
       check_mode: false
@@ -91,6 +97,16 @@
       ansible.builtin.assert:
         that: "'1.33.' in (mj_bins.results[0].stdout)"
         fail_msg: "kubeadm here is {{ mj_bins.results[0].stdout }}; south runs 1.33.7."
+
+    - name: crictl answers on the host we join FROM, which is where this playbook uses it
+      # It was checked on the TARGET, and that was wrong in both directions: kube-dependencies.yml
+      # does not install crictl, so it failed a good host -- and every crictl call in this file is
+      # `delegate_to: join_from`, so the check could have passed while the host that actually needs
+      # the binary could not answer. Found 2026-10-15 joining master-2.
+      ansible.builtin.command: crictl --version
+      delegate_to: "{{ join_from }}"
+      changed_when: false
+      check_mode: false
 
     - name: python3 can read YAML (the checks below need it)
       ansible.builtin.command: python3 -c "import yaml"
