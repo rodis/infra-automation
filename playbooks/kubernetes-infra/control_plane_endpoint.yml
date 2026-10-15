@@ -1,0 +1,506 @@
+---
+# Give south's cluster a stable controlPlaneEndpoint (owner approved 2026-10-15).
+#
+# WHY: kubeadm refuses to add a control-plane node to a cluster that has no controlPlaneEndpoint
+# ("unable to add a new control plane instance to a cluster that doesn't have a stable
+# controlPlaneEndpoint address"). south was built by playbooks/kubernetes-infra/master.yml, whose
+# ClusterConfiguration sets podSubnet and nothing else, so it has none. This is the precondition for
+# turning south into three masters with stacked etcd (vault task south-three-masters).
+#
+# WHAT IT ACTUALLY CHANGES, which is less than it sounds:
+#   1. `controlPlaneEndpoint` and an extra `apiServer.certSANs` entry in the kubeadm-config ConfigMap;
+#   2. the API server's serving certificate, re-issued so the new name is a SAN;
+#   3. the `kubeconfig` in the kube-public `cluster-info` ConfigMap, which is what `kubeadm join`
+#      reads to discover where the control plane is.
+#
+# WHAT IT DELIBERATELY DOES NOT CHANGE, and why each one is safe to leave:
+#   - Every kubeconfig on every host. They say https://<master-1 IP>:6443 today. The re-issued
+#     certificate KEEPS that IP as a SAN, so they keep working untouched -- including both workers',
+#     which is what lets this run without a rolling restart of anything on them.
+#   - master-1's controller-manager.conf / scheduler.conf / kubelet.conf. The instinct is to point a
+#     master's own components at its local API server, and they ALREADY are: on a single-master
+#     cluster the control-plane endpoint and the local API server are the same address. Note that
+#     pointing them at https://127.0.0.1:6443 would NOT work -- 127.0.0.1 is not in the API server's
+#     SANs (checked 2026-10-15) and never is on kubeadm. kubeadm's own ControlPlaneKubeletLocalMode
+#     uses the node's advertise address for the same reason, not loopback.
+#   - The kube-proxy ConfigMap. Its kubeconfig also points at master-1's IP, which stays valid
+#     (master-1 is never replaced by this project). Changing it would cost a rolling restart of a
+#     DaemonSet on the management plane for no behaviour change today. `cpe_update_kube_proxy: true`
+#     does it anyway, for whoever eventually wants the IP out of there.
+#   - super-admin.conf. It stays on the IP on purpose: it is the break-glass credential and should
+#     depend on as little as possible, DNS included. admin.conf DOES move to the name, because that
+#     is the one that pays off once there are three API servers to fail over between.
+#
+# THE OUTAGE: one restart of the kube-apiserver static pod, a few seconds. etcd is not touched.
+# Controllers holding a leader-election lease may exit once and come back, as they do in every
+# stall. An etcd snapshot is taken first anyway, because the ConfigMap edit is a write to etcd.
+#
+# HOW TO RUN IT. Not part of main.yml. It cannot run from AWX: AWX runs in this cluster. Like
+# etcd_volume.yml it is a Spacelift TASK on the "Ansible: south: Install Kube" stack, at a tracked
+# commit that contains this file:
+#
+#   spacectl stack task --id emoji-gear-ansible-install-kubernetes-on-dev-cluster --tail \
+#     "chmod 600 /mnt/workspace/key; ansible-playbook control_plane_endpoint.yml \
+#      --limit k8s-south-master-1 -e cpe_name=k8s-south.rods.me \
+#      --ssh-extra-args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'"
+#
+# Re-running is safe: if kubeadm-config already carries this endpoint and the certificate already
+# has the SAN, it verifies and changes nothing.
+#
+# ROLLBACK is automatic on failure after the first write, and restores the certificate, the
+# kubeconfigs it touched and both ConfigMaps from /var/backups/control-plane-endpoint/.
+
+- name: Set a stable controlPlaneEndpoint
+  hosts: "{{ cpe_hosts | default('kube_control_plane') }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  vars:
+    cpe_port: 6443
+    cpe_endpoint: "{{ cpe_name }}:{{ cpe_port }}"
+    cpe_backup: /var/backups/control-plane-endpoint
+    cpe_snapshot: /var/backups/etcd-pre-endpoint.db
+    cpe_update_kube_proxy: false
+    cpe_update_admin_conf: true
+    pki: /etc/kubernetes/pki
+    manifests: /etc/kubernetes/manifests
+    kubectl: kubectl --kubeconfig /etc/kubernetes/admin.conf
+    etcd_health_url: http://127.0.0.1:2381/health
+    etcdctl_env: >-
+      --cacert=/etc/kubernetes/pki/etcd/ca.crt
+      --cert=/etc/kubernetes/pki/etcd/server.crt
+      --key=/etc/kubernetes/pki/etcd/server.key
+
+  tasks:
+
+    - name: Require the endpoint name
+      ansible.builtin.assert:
+        that:
+          - (cpe_name | default('')) | length > 0
+          - "'/' not in cpe_name"
+          - "':' not in cpe_name"
+        fail_msg: "Pass -e cpe_name=<dns name>, e.g. k8s-south.rods.me (no scheme, no port)"
+
+    # ------------------------------------------------------------------ preflight: reads only
+
+    - name: Resolve the endpoint name on this host
+      # It must resolve HERE, not just from wherever the playbook was launched. A name that only the
+      # runner can see would pass every check in this file and fail at the first join.
+      ansible.builtin.command: getent hosts {{ cpe_name }}
+      register: cpe_resolved
+      changed_when: false
+      check_mode: false
+
+    - name: Read this API server's advertise address
+      # Taken from the running manifest rather than assumed, because it is what the re-issued
+      # certificate's IP SAN has to keep, and what kubeadm will use for localAPIEndpoint.
+      ansible.builtin.shell:
+        cmd: >-
+          grep -oE -- '--advertise-address=[0-9.]+' {{ manifests }}/kube-apiserver.yaml
+          | head -1 | cut -d= -f2
+      register: cpe_advertise
+      changed_when: false
+      check_mode: false
+
+    - name: The name must resolve to this API server
+      ansible.builtin.assert:
+        that: cpe_advertise.stdout | trim in cpe_resolved.stdout
+        fail_msg: >-
+          {{ cpe_name }} resolves to '{{ cpe_resolved.stdout | trim }}' but this API server
+          advertises {{ cpe_advertise.stdout | trim }}. Fix DNS before running this.
+
+    - name: Read the live kubeadm-config
+      ansible.builtin.command: >-
+        {{ kubectl }} -n kube-system get cm kubeadm-config
+        -o jsonpath={.data.ClusterConfiguration}
+      register: cpe_cc_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Parse it
+      ansible.builtin.set_fact:
+        cpe_cc: "{{ cpe_cc_raw.stdout | from_yaml }}"
+
+    - name: Read the certificate's current SANs
+      ansible.builtin.command: openssl x509 -in {{ pki }}/apiserver.crt -noout -text
+      register: cpe_cert_before
+      changed_when: false
+      check_mode: false
+
+    - name: etcd is healthy before we write anything to it
+      ansible.builtin.uri:
+        url: "{{ etcd_health_url }}"
+        return_content: true
+      register: cpe_etcd_pre
+      failed_when: "'\"health\":\"true\"' not in (cpe_etcd_pre.content | replace(' ', ''))"
+      check_mode: false
+
+    - name: Every node is Ready before we start
+      # Grading the change needs a clean "before". Starting from a degraded cluster would make the
+      # verification below unreadable either way.
+      ansible.builtin.shell:
+        cmd: >-
+          {{ kubectl }} get nodes --no-headers
+          | awk '$2 != "Ready" {print $1}'
+      register: cpe_nodes_pre
+      changed_when: false
+      check_mode: false
+      failed_when: cpe_nodes_pre.stdout | trim | length > 0
+
+    - name: Already done -- verify and stop here
+      when:
+        - cpe_cc.controlPlaneEndpoint is defined
+        - cpe_cc.controlPlaneEndpoint == cpe_endpoint
+        - "('DNS:' ~ cpe_name) in cpe_cert_before.stdout"
+      block:
+        - name: Nothing to do
+          ansible.builtin.debug:
+            msg: >-
+              controlPlaneEndpoint is already {{ cpe_endpoint }} and the certificate already carries
+              DNS:{{ cpe_name }}. No change.
+        - name: End
+          ansible.builtin.meta: end_host
+
+    - name: Refuse a DIFFERENT endpoint that is already set
+      # Changing an endpoint a cluster already has is a different, larger operation (every existing
+      # node's kubeconfig points at the old one). This playbook only adds the first.
+      ansible.builtin.assert:
+        that: cpe_cc.controlPlaneEndpoint is not defined or cpe_cc.controlPlaneEndpoint == cpe_endpoint
+        fail_msg: >-
+          controlPlaneEndpoint is already '{{ cpe_cc.controlPlaneEndpoint | default("") }}', not
+          '{{ cpe_endpoint }}'. Changing an existing endpoint is not what this playbook does.
+
+    # ------------------------------------------------------------------ backup, then change
+
+    - name: Create the backup directory
+      ansible.builtin.file:
+        path: "{{ cpe_backup }}"
+        state: directory
+        mode: "0700"
+
+    - name: Back up the certificate and the kubeconfigs this could touch
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ cpe_backup }}/{{ item | basename }}"
+        remote_src: true
+        mode: preserve
+        force: false      # never overwrite a backup from an earlier attempt
+      loop:
+        - "{{ pki }}/apiserver.crt"
+        - "{{ pki }}/apiserver.key"
+        - /etc/kubernetes/admin.conf
+
+    - name: Back up the two ConfigMap VALUES
+      # The value of the one key, not `get -o yaml` of the whole object. A dump carries a
+      # resourceVersion, and restoring one with `kubectl apply` can fail on a conflict -- a rollback
+      # path that only works when nothing else has touched the object is not a rollback path.
+      # Restoring a single key by merge patch has no such failure mode.
+      ansible.builtin.shell:
+        cmd: >-
+          {{ kubectl }} -n {{ item.ns }} get cm {{ item.name }} -o jsonpath={.data.{{ item.key }}}
+          > {{ cpe_backup }}/{{ item.name }}.{{ item.key }}
+        creates: "{{ cpe_backup }}/{{ item.name }}.{{ item.key }}"
+      loop:
+        - { ns: kube-system, name: kubeadm-config, key: ClusterConfiguration }
+        - { ns: kube-public, name: cluster-info, key: kubeconfig }
+
+    - name: The backups are not empty
+      # An empty backup restores an empty ConfigMap, which is worse than not restoring at all.
+      ansible.builtin.stat:
+        path: "{{ cpe_backup }}/{{ item.name }}.{{ item.key }}"
+      register: cpe_bk
+      failed_when: not cpe_bk.stat.exists or cpe_bk.stat.size < 50
+      loop:
+        - { ns: kube-system, name: kubeadm-config, key: ClusterConfiguration }
+        - { ns: kube-public, name: cluster-info, key: kubeconfig }
+
+    - name: Snapshot etcd
+      # The ConfigMap edit is a write to etcd, so this is the real restore point for the whole run.
+      ansible.builtin.shell:
+        cmd: >-
+          C=$(crictl ps --name '^etcd$' --state running -q) &&
+          crictl exec "$C" etcdctl --endpoints=https://127.0.0.1:2379 {{ etcdctl_env }}
+          snapshot save /var/lib/etcd/snapshot-pre-endpoint.db &&
+          cp /var/lib/etcd/snapshot-pre-endpoint.db {{ cpe_snapshot }} &&
+          rm -f /var/lib/etcd/snapshot-pre-endpoint.db
+        creates: "{{ cpe_snapshot }}"
+
+    - name: Confirm the snapshot is a real one
+      ansible.builtin.stat:
+        path: "{{ cpe_snapshot }}"
+      register: cpe_snap
+      failed_when: not cpe_snap.stat.exists or cpe_snap.stat.size < 1000000
+
+    - name: Change it
+      block:
+
+        - name: Build the kubeadm configuration to upload
+          # Two documents: the ClusterConfiguration we are editing, and an InitConfiguration that
+          # pins localAPIEndpoint. Without the second, `kubeadm init phase certs` picks the advertise
+          # address from the host's default route -- right today, and not something to leave to luck
+          # on a machine with several addresses.
+          ansible.builtin.copy:
+            dest: /etc/kubernetes/kubeadm-endpoint.yaml
+            mode: "0600"
+            content: |
+              {{ cpe_cc | combine({
+                   'controlPlaneEndpoint': cpe_endpoint,
+                   'apiServer': (cpe_cc.apiServer | default({})) | combine({
+                     'certSANs': ((cpe_cc.apiServer | default({})).certSANs | default([]))
+                                 | union([cpe_name, inventory_hostname, cpe_advertise.stdout | trim])
+                   })
+                 }) | to_nice_yaml(indent=2) }}
+              ---
+              apiVersion: kubeadm.k8s.io/v1beta4
+              kind: InitConfiguration
+              localAPIEndpoint:
+                advertiseAddress: {{ cpe_advertise.stdout | trim }}
+                bindPort: {{ cpe_port }}
+              nodeRegistration:
+                name: {{ inventory_hostname }}
+
+        - name: Upload the new ClusterConfiguration
+          ansible.builtin.command: >-
+            kubeadm init phase upload-config kubeadm
+            --config /etc/kubernetes/kubeadm-endpoint.yaml
+          register: cpe_upload
+          changed_when: true
+
+        - name: Remove the old API server certificate so kubeadm issues a new one
+          # kubeadm leaves an existing certificate alone if it considers it usable, which it would
+          # here -- the SANs it is missing are the whole point of the change.
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ pki }}/apiserver.crt"
+            - "{{ pki }}/apiserver.key"
+
+        - name: Issue the API server certificate with the new SANs
+          ansible.builtin.command: >-
+            kubeadm init phase certs apiserver
+            --config /etc/kubernetes/kubeadm-endpoint.yaml
+          changed_when: true
+
+        - name: Read the new certificate
+          ansible.builtin.command: openssl x509 -in {{ pki }}/apiserver.crt -noout -text
+          register: cpe_cert_after
+          changed_when: false
+          check_mode: false
+
+        - name: The new certificate has the name AND still has the old IP
+          # The second half is what lets every existing kubeconfig, on both workers, keep working.
+          # Losing it would take the cluster apart while reporting success.
+          ansible.builtin.assert:
+            that:
+              - "('DNS:' ~ cpe_name) in cpe_cert_after.stdout"
+              - "('IP Address:' ~ (cpe_advertise.stdout | trim)) in cpe_cert_after.stdout"
+              - "('DNS:' ~ inventory_hostname) in cpe_cert_after.stdout"
+              - "'DNS:kubernetes.default.svc.cluster.local' in cpe_cert_after.stdout"
+            fail_msg: "The re-issued certificate is missing a SAN it must have; rolling back."
+
+        - name: Restart the API server
+          ansible.builtin.shell:
+            cmd: >-
+              C=$(crictl ps --name '^kube-apiserver$' --state running -q) &&
+              crictl stop --timeout 30 "$C"
+          changed_when: true
+
+        - name: Wait for the API server to serve on the NEW NAME with the new certificate
+          # Through the name and validated against the cluster CA -- so this proves the SAN, the
+          # DNS record and the restart all at once, which three separate checks would not.
+          ansible.builtin.uri:
+            url: "https://{{ cpe_name }}:{{ cpe_port }}/readyz"
+            ca_path: "{{ pki }}/ca.crt"
+            return_content: true
+            status_code: [200, 401, 403]
+          register: cpe_readyz
+          until: cpe_readyz is succeeded
+          retries: 30
+          delay: 5
+
+        - name: And still serves on the old address, which every kubeconfig still uses
+          ansible.builtin.uri:
+            url: "https://{{ cpe_advertise.stdout | trim }}:{{ cpe_port }}/readyz"
+            ca_path: "{{ pki }}/ca.crt"
+            return_content: true
+            status_code: [200, 401, 403]
+          register: cpe_readyz_ip
+          until: cpe_readyz_ip is succeeded
+          retries: 12
+          delay: 5
+
+        - name: Point cluster-info at the endpoint
+          # This is what `kubeadm join` reads to find the control plane, so it has to carry the name
+          # before any master joins. Only the kubeconfig key is patched: the jws-kubeconfig-* keys
+          # beside it are bootstrap-token signatures that kube-controller-manager re-signs itself,
+          # and replacing the whole ConfigMap would drop them.
+          ansible.builtin.shell:
+            cmd: >-
+              set -o pipefail;
+              {{ kubectl }} -n kube-public get cm cluster-info -o jsonpath={.data.kubeconfig}
+              | sed -E 's#(^[[:space:]]*server:[[:space:]]*).*#\1https://{{ cpe_endpoint }}#'
+              > /tmp/cluster-info-kubeconfig &&
+              test -s /tmp/cluster-info-kubeconfig &&
+              grep -q 'server: https://{{ cpe_endpoint }}' /tmp/cluster-info-kubeconfig &&
+              {{ kubectl }} -n kube-public patch cm cluster-info --type merge -p
+              "$(python3 -c 'import json,sys; print(json.dumps({"data": {"kubeconfig": open("/tmp/cluster-info-kubeconfig").read()}}))')"
+            executable: /bin/bash
+          changed_when: true
+
+        - name: Point admin.conf at the endpoint
+          # The one kubeconfig worth moving: once there are three API servers it can reach another
+          # one. super-admin.conf stays on the IP deliberately -- break-glass should not need DNS.
+          when: cpe_update_admin_conf | bool
+          ansible.builtin.replace:
+            path: /etc/kubernetes/admin.conf
+            regexp: '^(\s*server:\s*).*$'
+            replace: '\1https://{{ cpe_endpoint }}'
+
+        - name: Point kube-proxy at the endpoint
+          when: cpe_update_kube_proxy | bool
+          ansible.builtin.shell:
+            cmd: >-
+              set -o pipefail;
+              {{ kubectl }} -n kube-system get cm kube-proxy -o jsonpath='{.data.kubeconfig\.conf}'
+              | sed -E 's#(^[[:space:]]*server:[[:space:]]*).*#\1https://{{ cpe_endpoint }}#'
+              > /tmp/kube-proxy-kubeconfig &&
+              test -s /tmp/kube-proxy-kubeconfig &&
+              grep -q 'server: https://{{ cpe_endpoint }}' /tmp/kube-proxy-kubeconfig &&
+              {{ kubectl }} -n kube-system patch cm kube-proxy --type merge -p
+              "$(python3 -c 'import json,sys; print(json.dumps({"data": {"kubeconfig.conf": open("/tmp/kube-proxy-kubeconfig").read()}}))')" &&
+              {{ kubectl }} -n kube-system rollout restart ds kube-proxy &&
+              {{ kubectl }} -n kube-system rollout status ds kube-proxy --timeout=180s
+            executable: /bin/bash
+          changed_when: true
+
+      rescue:
+
+        - name: ROLLBACK -- restore the certificate and admin.conf
+          ansible.builtin.copy:
+            src: "{{ cpe_backup }}/{{ item | basename }}"
+            dest: "{{ item }}"
+            remote_src: true
+            mode: preserve
+          loop:
+            - "{{ pki }}/apiserver.crt"
+            - "{{ pki }}/apiserver.key"
+            - /etc/kubernetes/admin.conf
+          ignore_errors: true
+
+        - name: ROLLBACK -- restore both ConfigMap values by merge patch
+          ansible.builtin.shell:
+            cmd: >-
+              test -s {{ cpe_backup }}/{{ item.name }}.{{ item.key }} &&
+              {{ kubectl }} -n {{ item.ns }} patch cm {{ item.name }} --type merge -p
+              "$(python3 -c 'import json,sys; print(json.dumps({"data": {sys.argv[1]: open(sys.argv[2]).read()}}))'
+                 {{ item.key }} {{ cpe_backup }}/{{ item.name }}.{{ item.key }})"
+            executable: /bin/bash
+          loop:
+            - { ns: kube-system, name: kubeadm-config, key: ClusterConfiguration }
+            - { ns: kube-public, name: cluster-info, key: kubeconfig }
+          ignore_errors: true
+
+        - name: ROLLBACK -- restart the API server on the restored certificate
+          ansible.builtin.shell:
+            cmd: >-
+              C=$(crictl ps --name '^kube-apiserver$' --state running -q) &&
+              crictl stop --timeout 30 "$C" || true
+          ignore_errors: true
+
+        - name: ROLLBACK -- wait for it to come back on the old address
+          ansible.builtin.uri:
+            url: "https://{{ cpe_advertise.stdout | trim }}:{{ cpe_port }}/readyz"
+            ca_path: "{{ pki }}/ca.crt"
+            status_code: [200, 401, 403]
+          register: cpe_rb
+          until: cpe_rb is succeeded
+          retries: 30
+          delay: 5
+          ignore_errors: true
+
+        - name: Stop, having rolled back
+          ansible.builtin.fail:
+            msg: >-
+              control_plane_endpoint.yml failed and rolled back. The certificate, admin.conf,
+              kubeadm-config and cluster-info were restored from {{ cpe_backup }}. The etcd snapshot
+              at {{ cpe_snapshot }} was NOT used and is still there. Read the failed task above
+              before re-running.
+
+    # ------------------------------------------------------------------ grade the installed thing
+
+    - name: kubeadm-config carries the endpoint
+      ansible.builtin.command: >-
+        {{ kubectl }} -n kube-system get cm kubeadm-config
+        -o jsonpath={.data.ClusterConfiguration}
+      register: cpe_cc_after
+      changed_when: false
+      check_mode: false
+      failed_when: (cpe_cc_after.stdout | from_yaml).controlPlaneEndpoint | default('') != cpe_endpoint
+
+    - name: cluster-info carries the endpoint
+      ansible.builtin.command: >-
+        {{ kubectl }} -n kube-public get cm cluster-info -o jsonpath={.data.kubeconfig}
+      register: cpe_ci_after
+      changed_when: false
+      check_mode: false
+      failed_when: "('server: https://' ~ cpe_endpoint) not in cpe_ci_after.stdout"
+
+    - name: Every node is still Ready -- including the workers, whose kubeconfigs were not touched
+      ansible.builtin.shell:
+        cmd: >-
+          {{ kubectl }} get nodes --no-headers
+          | awk '$2 != "Ready" {print $1}'
+      register: cpe_nodes_post
+      changed_when: false
+      check_mode: false
+      failed_when: cpe_nodes_post.stdout | trim | length > 0
+      retries: 12
+      delay: 10
+      until: cpe_nodes_post.stdout | trim | length == 0
+
+    - name: No pod anywhere outside Running or Completed
+      ansible.builtin.shell:
+        cmd: >-
+          {{ kubectl }} get pods -A --no-headers
+          | grep -v -E 'Running|Completed' || true
+      register: cpe_pods
+      changed_when: false
+      check_mode: false
+      failed_when: cpe_pods.stdout | trim | length > 0
+      retries: 12
+      delay: 10
+      until: cpe_pods.stdout | trim | length == 0
+
+    - name: etcd is still healthy
+      ansible.builtin.uri:
+        url: "{{ etcd_health_url }}"
+        return_content: true
+      register: cpe_etcd_post
+      failed_when: "'\"health\":\"true\"' not in (cpe_etcd_post.content | replace(' ', ''))"
+      check_mode: false
+
+    - name: AWX is still there
+      # The reason this cluster exists. A control-plane change that leaves AWX down is a failure
+      # however green the API looks.
+      ansible.builtin.shell:
+        cmd: >-
+          {{ kubectl }} -n awx get pods --no-headers
+          | awk '$3 != "Running" {print $1}'
+      register: cpe_awx
+      changed_when: false
+      check_mode: false
+      failed_when: cpe_awx.stdout | trim | length > 0
+      retries: 12
+      delay: 10
+      until: cpe_awx.stdout | trim | length == 0
+
+    - name: Done
+      ansible.builtin.debug:
+        msg:
+          - "controlPlaneEndpoint: {{ cpe_endpoint }}"
+          - "certificate SANs now include DNS:{{ cpe_name }} and still IP:{{ cpe_advertise.stdout | trim }}"
+          - "cluster-info updated; admin.conf {{ 'updated' if cpe_update_admin_conf | bool else 'left on the IP' }}"
+          - "kube-proxy {{ 'updated' if cpe_update_kube_proxy | bool else 'left on the IP (deliberate)' }}"
+          - "backups in {{ cpe_backup }}, etcd snapshot at {{ cpe_snapshot }}"

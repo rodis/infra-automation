@@ -1,0 +1,517 @@
+---
+# Join a new control-plane node to south, with its etcd member on a dedicated volume.
+# (Owner approved the plan 2026-10-15; vault task south-three-masters.)
+#
+# WHY: south is one master with one etcd member. The plan is three machines that are all control
+# plane and all run pods, so that a stall on one host's storage stops being an outage of the whole
+# management plane. This is the verb that adds each of the other two.
+#
+# WHAT IT DOES, on ONE new host:
+#   1. mounts that host's dedicated Cinder volume at /var/lib/etcd BEFORE anything creates etcd data
+#      there, so the member is never on the root disk even briefly;
+#   2. asks an existing master for a join token and a certificate key;
+#   3. `kubeadm join --control-plane`, which adds the etcd member as a LEARNER and promotes it once
+#      it has caught up (kubeadm 1.33: the EtcdLearnerMode gate went GA in 1.32 and was REMOVED in
+#      1.33, so this is unconditional and there is no gate to set);
+#   4. removes the control-plane taint, because on south every master runs pods;
+#   5. grades the result on the installed thing -- including that the new member's timings match
+#      what kubeadm-config says, which is the property etcd_timings.yml exists to guarantee.
+#
+# IT INSTALLS NOTHING. containerd, kubelet and kubeadm must already be on the host --
+# kube-dependencies.yml does that, and it MUST be run with `--limit <this host>`: it restarts
+# containerd unconditionally and would take etcd and the API server down on master-1, and it reboots
+# any host with /var/run/reboot-required, which as of 2026-10-15 is all of them.
+#
+# THERE IS NO AUTOMATIC ROLLBACK, AND THAT IS DELIBERATE. The rollback for a failed join is
+# `etcdctl member remove` plus `kubeadm reset`, and removing an etcd member changes quorum. During
+# this project there is a window where the cluster has two voting members, and an automatic rescue
+# that fired on a transient check failure -- after a join that actually worked -- would remove a
+# healthy member from a two-member cluster. So on failure this playbook STOPS, reads whether a
+# member for this host exists, and prints the exact commands. A human decides.
+#
+# HOW TO RUN IT. A Spacelift TASK on "Ansible: south: Install Kube":
+#
+#   spacectl stack task --id emoji-gear-ansible-install-kubernetes-on-dev-cluster --tail \
+#     "chmod 600 /mnt/workspace/key; ansible-playbook master_join.yml \
+#      --limit k8s-south-master-2 -e join_from=k8s-south-master-1 \
+#      --ssh-extra-args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'"
+#
+# Re-running against a host that has already joined verifies and changes nothing.
+
+- name: Join a control-plane node with stacked etcd on its own volume
+  # Narrowed by --limit to exactly one host; the assert below refuses anything else. `omit` does
+  # not mean "no hosts" here, so the default is the group a new master's OpenStack metadata puts it
+  # in, and the one-host assert is what actually protects this.
+  hosts: "{{ join_hosts | default('kube_control_plane') }}"
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+
+  vars:
+    join_from: k8s-south-master-1
+    etcd_dir: /var/lib/etcd
+    kubelet_dropin: /etc/systemd/system/kubelet.service.d/20-etcd-volume.conf
+    kubectl_remote: kubectl --kubeconfig /etc/kubernetes/admin.conf
+    etcdctl_env: >-
+      --cacert=/etc/kubernetes/pki/etcd/ca.crt
+      --cert=/etc/kubernetes/pki/etcd/server.crt
+      --key=/etc/kubernetes/pki/etcd/server.key
+
+  tasks:
+
+    - name: This must not be the host we are joining FROM
+      # The whole playbook is destructive-ish on its target (it formats a disk). Pointing it at
+      # master-1 by a slip of --limit must not be survivable.
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname != join_from
+          - (join_from | default('')) | length > 0
+        fail_msg: "inventory_hostname and join_from are both '{{ inventory_hostname }}'. Refusing."
+
+    - name: Only one host at a time
+      # etcd members are added one at a time, and a learner must be promoted before the next join.
+      # A --limit that matched two hosts would race them.
+      ansible.builtin.assert:
+        that: ansible_play_hosts | length == 1
+        fail_msg: >-
+          This play matched {{ ansible_play_hosts | length }} hosts ({{ ansible_play_hosts | join(', ') }}).
+          Use --limit to name exactly one.
+      run_once: true
+
+    # ------------------------------------------------------------------ preflight: reads only
+
+    - name: The prerequisites kube-dependencies.yml installs are present
+      ansible.builtin.command: "{{ item }} --version"
+      loop: [kubeadm, kubelet, crictl]
+      register: mj_bins
+      changed_when: false
+      check_mode: false
+
+    - name: kubeadm matches the cluster
+      ansible.builtin.assert:
+        that: "'1.33.' in (mj_bins.results[0].stdout)"
+        fail_msg: "kubeadm here is {{ mj_bins.results[0].stdout }}; south runs 1.33.7."
+
+    - name: python3 can read YAML (the checks below need it)
+      ansible.builtin.command: python3 -c "import yaml"
+      changed_when: false
+      check_mode: false
+
+    - name: Swap is off, as kubeadm requires
+      ansible.builtin.command: swapon --noheadings --show
+      register: mj_swap
+      changed_when: false
+      check_mode: false
+      failed_when: mj_swap.stdout | trim | length > 0
+
+    - name: Is this host already a node in the cluster?
+      ansible.builtin.command: >-
+        {{ kubectl_remote }} get node {{ inventory_hostname }} -o name
+      delegate_to: "{{ join_from }}"
+      register: mj_already
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Read the existing cluster's etcd members
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          C=$(crictl ps --name '^etcd$' --state running -q) &&
+          crictl exec "$C" etcdctl --endpoints=https://127.0.0.1:2379 {{ etcdctl_env }}
+          member list -w json 2>/dev/null
+        executable: /bin/bash
+      delegate_to: "{{ join_from }}"
+      register: mj_members_pre
+      changed_when: false
+      check_mode: false
+
+    - name: Say what the cluster looks like now
+      ansible.builtin.debug:
+        msg: >-
+          {{ (mj_members_pre.stdout | from_json).members
+             | map(attribute='name') | list }} are the current etcd members;
+          joining {{ inventory_hostname }} makes
+          {{ ((mj_members_pre.stdout | from_json).members | length) + 1 }}.
+
+    - name: Warn plainly about the two-voter window
+      # Not a gate -- the plan accepts this window. It is printed so that whoever reads the run log
+      # knows which state the cluster is in if the next step fails.
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: this join makes the cluster
+          {{ ((mj_members_pre.stdout | from_json).members | length) + 1 }} voting members. At two,
+          quorum is 2 of 2 and a stall on EITHER member halts every write -- worse than one member.
+          Do not stop here; continue to three.
+      when: (mj_members_pre.stdout | from_json).members | length == 1
+
+    - name: The existing control plane is healthy before we touch it
+      ansible.builtin.shell:
+        cmd: "{{ kubectl_remote }} get nodes --no-headers | awk '$2 != \"Ready\" {print $1}'"
+      delegate_to: "{{ join_from }}"
+      register: mj_nodes_pre
+      changed_when: false
+      check_mode: false
+      failed_when: mj_nodes_pre.stdout | trim | length > 0
+
+    - name: kubeadm-config has a controlPlaneEndpoint -- without one, kubeadm refuses this join
+      ansible.builtin.command: >-
+        {{ kubectl_remote }} -n kube-system get cm kubeadm-config
+        -o jsonpath={.data.ClusterConfiguration}
+      delegate_to: "{{ join_from }}"
+      register: mj_cc
+      changed_when: false
+      check_mode: false
+      failed_when: (mj_cc.stdout | from_yaml).controlPlaneEndpoint | default('') | length == 0
+
+    - name: kubeadm-config carries etcd timings -- without them this member would differ from the others
+      # The fault etcd_timings.yml exists to prevent, checked at the only moment it can still be
+      # cheaply fixed: before the member exists.
+      ansible.builtin.assert:
+        that:
+          - ((mj_cc.stdout | from_yaml).etcd | default({})).local | default({}) | length > 0
+          - (((mj_cc.stdout | from_yaml).etcd).local.extraArgs | default([])
+             | map(attribute='name') | list) is superset(['heartbeat-interval', 'election-timeout'])
+        fail_msg: >-
+          kubeadm-config has no etcd.local.extraArgs timings. Run etcd_timings.yml first, or this
+          member joins with kubeadm's 1s election timeout while master-1 runs something else.
+
+    # ------------------------------------------------------------------ the etcd volume
+
+    - name: Find this host's etcd volume id in its own OpenStack metadata
+      # Read from the host rather than from the inventory: the instance knows what is attached to
+      # it, and that does not depend on an inventory source being fresh.
+      ansible.builtin.uri:
+        url: http://169.254.169.254/openstack/latest/meta_data.json
+        return_content: true
+      register: mj_meta
+      when: etcd_volume_id is not defined
+      check_mode: false
+
+    - name: Use it
+      ansible.builtin.set_fact:
+        mj_volume_id: "{{ etcd_volume_id | default((mj_meta.content | from_json).meta.etcd_volume) }}"
+
+    - name: There must be a volume to put etcd on
+      ansible.builtin.assert:
+        that: mj_volume_id | length >= 20
+        fail_msg: >-
+          No etcd_volume in this instance's metadata. Terraform sets it when
+          MASTER_ETCD_VOLUME_SIZE > 0; check the instance was created with it.
+
+    - name: Find the device by volume id
+      ansible.builtin.stat:
+        path: "/dev/disk/by-id/virtio-{{ mj_volume_id[:20] }}"
+        follow: true
+      register: mj_dev
+      failed_when: not mj_dev.stat.exists
+
+    - name: Is /var/lib/etcd already the volume?
+      ansible.builtin.command: findmnt -no SOURCE,FSTYPE {{ etcd_dir }}
+      register: mj_mounted
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Mount it, if it is not already
+      when: mj_mounted.rc != 0
+      block:
+
+        - name: Refuse to format a disk that already holds something
+          ansible.builtin.command: blkid {{ mj_dev.stat.path }}
+          register: mj_blkid
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: It must be blank, or already XFS from an earlier attempt
+          ansible.builtin.assert:
+            that: mj_blkid.rc != 0 or 'TYPE="xfs"' in mj_blkid.stdout
+            fail_msg: >-
+              {{ mj_dev.stat.path }} already holds {{ mj_blkid.stdout }}. Refusing to format it.
+
+        - name: Refuse to mount over existing etcd data
+          # If this host somehow already has a member's data on its root disk, mounting over it
+          # would hide it and start an empty member -- which reads as the cluster's state being gone.
+          ansible.builtin.find:
+            paths: "{{ etcd_dir }}"
+            file_type: any
+          register: mj_existing
+          failed_when: mj_existing.matched | default(0) > 0
+
+        - name: Format it XFS
+          when: mj_blkid.rc != 0
+          ansible.builtin.filesystem:
+            fstype: xfs
+            dev: "{{ mj_dev.stat.path }}"
+
+        - name: Read its UUID
+          ansible.builtin.command: blkid -s UUID -o value {{ mj_dev.stat.path }}
+          register: mj_uuid
+          changed_when: false
+          check_mode: false
+
+        - name: Create the mountpoint
+          ansible.builtin.file:
+            path: "{{ etcd_dir }}"
+            state: directory
+            mode: "0700"
+
+        - name: Make the empty mountpoint immutable
+          # So that if the volume ever fails to mount, etcd fails to START rather than starting an
+          # empty cluster on the root disk. The same trick etcd_volume.yml used on master-1 on
+          # 2026-10-09, and for the same reason: an empty etcd looks exactly like lost state.
+          ansible.builtin.command: chattr +i {{ etcd_dir }}
+          changed_when: true
+
+        - name: Put it in fstab by UUID, with nofail
+          # nofail so a volume problem does not stop the host booting and going unreachable --
+          # a dark host is harder to fix than a stopped etcd.
+          ansible.builtin.mount:
+            path: "{{ etcd_dir }}"
+            src: "UUID={{ mj_uuid.stdout | trim }}"
+            fstype: xfs
+            opts: defaults,noatime,nofail
+            state: mounted
+
+        - name: Order kubelet after the mount
+          ansible.builtin.copy:
+            dest: "{{ kubelet_dropin }}"
+            mode: "0644"
+            content: |
+              # Managed by playbooks/kubernetes-infra/master_join.yml
+              # etcd runs as a static pod here, so kubelet is what starts it; it must not do so
+              # before /var/lib/etcd is the volume.
+              [Unit]
+              RequiresMountsFor={{ etcd_dir }}
+          notify: Reload systemd
+
+        - name: Apply the drop-in now
+          ansible.builtin.meta: flush_handlers
+
+    - name: Confirm /var/lib/etcd is XFS on the volume BEFORE anything writes etcd data there
+      ansible.builtin.command: findmnt -no SOURCE,FSTYPE {{ etcd_dir }}
+      register: mj_mounted_now
+      changed_when: false
+      check_mode: false
+      failed_when: "'xfs' not in mj_mounted_now.stdout"
+
+    # ------------------------------------------------------------------ the join
+
+    - name: Join, if this host is not already a node
+      when: mj_already.rc != 0
+      block:
+
+        - name: Mint a certificate key on the existing master
+          # Valid for 2 hours. This re-encrypts the control-plane certificates into a Secret so the
+          # joining node can fetch them; it is a write, hence not run when nothing needs joining.
+          ansible.builtin.command: kubeadm init phase upload-certs --upload-certs
+          delegate_to: "{{ join_from }}"
+          register: mj_certkey
+          changed_when: true
+          no_log: true
+
+        - name: Mint a join token on the existing master
+          ansible.builtin.command: kubeadm token create --print-join-command
+          delegate_to: "{{ join_from }}"
+          register: mj_token
+          changed_when: true
+          no_log: true
+
+        - name: Join as a control-plane node
+          # --apiserver-advertise-address is explicit: the default is the interface of the default
+          # route, which is right here and is not a thing to leave to inference on a host whose
+          # certificate SANs depend on it.
+          ansible.builtin.command: >-
+            {{ mj_token.stdout_lines | select('search', '^kubeadm join') | first }}
+            --control-plane
+            --certificate-key {{ mj_certkey.stdout_lines | last | trim }}
+            --apiserver-advertise-address {{ ansible_default_ipv4.address }}
+          register: mj_join
+          changed_when: true
+          no_log: true
+
+        - name: Say that it joined
+          ansible.builtin.debug:
+            msg: "kubeadm join returned {{ mj_join.rc }} ({{ mj_join.stdout_lines | default([]) | length }} lines, not logged -- it carries the certificate key)"
+
+      rescue:
+
+        - name: Read whether an etcd member was created before the failure
+          ansible.builtin.shell:
+            cmd: >-
+              set -o pipefail;
+              C=$(crictl ps --name '^etcd$' --state running -q) &&
+              crictl exec "$C" etcdctl --endpoints=https://127.0.0.1:2379 {{ etcdctl_env }}
+              member list -w json 2>/dev/null
+            executable: /bin/bash
+          delegate_to: "{{ join_from }}"
+          register: mj_members_fail
+          changed_when: false
+          failed_when: false
+
+        - name: Stop. Do not roll this back automatically.
+          ansible.builtin.fail:
+            msg: >-
+              kubeadm join FAILED on {{ inventory_hostname }}.
+              Members now: {{ (mj_members_fail.stdout | default('{"members":[]}') | from_json).members
+                               | map(attribute='name') | list }}.
+              NOTHING HAS BEEN UNDONE -- removing an etcd member changes quorum and is not something
+              this playbook decides. To roll back, on {{ join_from }}:
+              `etcdctl member remove <id of {{ inventory_hostname }}>` (only if it is listed above),
+              then on {{ inventory_hostname }}: `kubeadm reset -f`.
+              Read the failed task, and rule 3: the same failure twice is systematic -- stop.
+
+    # ------------------------------------------------------------------ grade the installed thing
+
+    - name: Wait for the node to be Ready
+      ansible.builtin.shell:
+        cmd: >-
+          {{ kubectl_remote }} get node {{ inventory_hostname }}
+          --no-headers -o custom-columns=S:.status.conditions[-1].type
+      delegate_to: "{{ join_from }}"
+      register: mj_ready
+      changed_when: false
+      until: mj_ready.rc == 0 and 'Ready' in mj_ready.stdout
+      retries: 40
+      delay: 15
+
+    - name: Wait for the etcd member to be promoted out of learner
+      # A learner does not vote and does not count for quorum. Reporting success while it is still
+      # a learner would claim a resilience this cluster does not yet have.
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          C=$(crictl ps --name '^etcd$' --state running -q) &&
+          crictl exec "$C" etcdctl --endpoints=https://127.0.0.1:2379 {{ etcdctl_env }}
+          member list -w json 2>/dev/null
+          | python3 -c 'import json,sys;
+          m=[x for x in json.load(sys.stdin)["members"] if x.get("name")=="{{ inventory_hostname }}"];
+          print("MISSING" if not m else ("LEARNER" if m[0].get("isLearner") else "VOTER"))'
+        executable: /bin/bash
+      delegate_to: "{{ join_from }}"
+      register: mj_learner
+      changed_when: false
+      until: mj_learner.stdout | trim == 'VOTER'
+      retries: 40
+      delay: 15
+
+    - name: Every member is at the same raft index, and there is exactly one leader
+      # The python exits non-zero when it is not true yet, so `until: rc == 0` retries while the new
+      # member catches up and Ansible fails the task if it never does. Done this way rather than with
+      # a Jinja regex over the output: a regex that fails to match returns None, and `None | int` is
+      # 0, which would read as a perfect spread and pass.
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          C=$(crictl ps --name '^etcd$' --state running -q) &&
+          crictl exec "$C" etcdctl --endpoints=https://127.0.0.1:2379 {{ etcdctl_env }}
+          endpoint status --cluster -w json 2>/dev/null
+          | python3 -c '
+          import json, sys
+          r = json.load(sys.stdin)
+          idx = [x["Status"]["raftIndex"] for x in r]
+          leaders = {x["Status"]["leader"] for x in r}
+          spread = max(idx) - min(idx)
+          print("members=%d spread=%d leaders=%d" % (len(r), spread, len(leaders)))
+          sys.exit(0 if spread < 10000 and len(leaders) == 1 else 1)'
+        executable: /bin/bash
+      delegate_to: "{{ join_from }}"
+      register: mj_spread
+      changed_when: false
+      failed_when: false
+      until: mj_spread.rc == 0
+      retries: 20
+      delay: 15
+
+    - name: This member's timings match kubeadm-config
+      # The reason etcd_timings.yml writes to the ConfigMap at all. If this fails, the cluster has
+      # members with different election timeouts, which etcd's tuning guide forbids and which stays
+      # invisible until the first stall.
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import sys, yaml
+            cc = yaml.safe_load(sys.argv[1])
+            want = {e["name"]: str(e["value"])
+                    for e in (cc.get("etcd") or {}).get("local", {}).get("extraArgs") or []}
+            cmd = yaml.safe_load(open(sys.argv[2]))["spec"]["containers"][0]["command"]
+            have = dict(a[2:].split("=", 1) for a in cmd if a.startswith("--") and "=" in a)
+            bad = {k: (have.get(k), v) for k, v in want.items() if have.get(k) != v}
+            if bad:
+                sys.exit("this member's etcd flags differ from kubeadm-config: %r" % bad)
+            print("etcd flags match kubeadm-config: " + " ".join("%s=%s" % kv for kv in sorted(want.items())))
+          - "{{ mj_cc.stdout }}"
+          - /etc/kubernetes/manifests/etcd.yaml
+      register: mj_timings
+      changed_when: false
+      check_mode: false
+
+    - name: This API server reads only its OWN etcd member
+      # kubeadm's stacked default, and the property that makes a stall on one host hit only that
+      # host's API server. Checked rather than assumed.
+      ansible.builtin.command: >-
+        grep -c -- '--etcd-servers=https://127.0.0.1:2379'
+        /etc/kubernetes/manifests/kube-apiserver.yaml
+      register: mj_local_etcd
+      changed_when: false
+      check_mode: false
+      failed_when: mj_local_etcd.stdout | trim != '1'
+
+    - name: Remove the control-plane taint -- on south every master runs pods
+      ansible.builtin.command: >-
+        {{ kubectl_remote }} taint nodes {{ inventory_hostname }}
+        node-role.kubernetes.io/control-plane- --overwrite
+      delegate_to: "{{ join_from }}"
+      register: mj_untaint
+      changed_when: "'untainted' in mj_untaint.stdout"
+      failed_when: mj_untaint.rc != 0 and 'not found' not in mj_untaint.stderr
+
+    - name: The node carries no control-plane taint
+      ansible.builtin.shell:
+        cmd: >-
+          {{ kubectl_remote }} get node {{ inventory_hostname }}
+          -o jsonpath='{.spec.taints[*].key}'
+        executable: /bin/bash
+      delegate_to: "{{ join_from }}"
+      register: mj_taints
+      changed_when: false
+      failed_when: "'node-role.kubernetes.io/control-plane' in mj_taints.stdout"
+
+    - name: No pod anywhere outside Running or Completed
+      ansible.builtin.shell:
+        cmd: "{{ kubectl_remote }} get pods -A --no-headers | grep -v -E 'Running|Completed' || true"
+      delegate_to: "{{ join_from }}"
+      register: mj_pods
+      changed_when: false
+      failed_when: mj_pods.stdout | trim | length > 0
+      retries: 24
+      delay: 15
+      until: mj_pods.stdout | trim | length == 0
+
+    - name: AWX is still there
+      ansible.builtin.shell:
+        cmd: "{{ kubectl_remote }} -n awx get pods --no-headers | awk '$3 != \"Running\" {print $1}'"
+      delegate_to: "{{ join_from }}"
+      register: mj_awx
+      changed_when: false
+      failed_when: mj_awx.stdout | trim | length > 0
+      retries: 24
+      delay: 15
+      until: mj_awx.stdout | trim | length == 0
+
+    - name: Done
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }} joined as a control-plane node and is Ready, untainted"
+          - "etcd: {{ mj_learner.stdout | trim }}, {{ mj_spread.stdout | trim }}"
+          - "{{ mj_timings.stdout }}"
+          - "--etcd-servers is local only"
+          - "/var/lib/etcd: {{ mj_mounted_now.stdout }}"
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
