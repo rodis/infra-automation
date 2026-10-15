@@ -297,6 +297,16 @@
             opts: defaults,noatime,nofail
             state: mounted
 
+        - name: Make sure kubelet has a drop-in directory
+          # A fresh 1.33 host has none: the kubeadm deb ships its own drop-in under
+          # /usr/lib/systemd/system/kubelet.service.d, and /etc/systemd/system/kubelet.service.d is
+          # only created by whoever first writes there. master-1 has had one for 273 days, which is
+          # why this was not noticed until the first real run against a new host (2026-10-15).
+          ansible.builtin.file:
+            path: "{{ kubelet_dropin | dirname }}"
+            state: directory
+            mode: "0755"
+
         - name: Order kubelet after the mount
           ansible.builtin.copy:
             dest: "{{ kubelet_dropin }}"
