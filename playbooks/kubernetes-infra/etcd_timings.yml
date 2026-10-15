@@ -312,26 +312,39 @@
         - name: The candidate must carry every wanted flag and have lost nothing
           # The second half is the one that matters: a bad regexp that replaced the wrong line would
           # produce a file that parses perfectly and starts an etcd missing a certificate flag.
-          ansible.builtin.shell:
-            cmd: >-
-              set -o pipefail;
-              python3 - "{{ etcd_manifest }}" "{{ etcd_candidate }}" <<'PY'
-              import sys, yaml
-              want = {{ etcd_timings | to_json }}
-              old = yaml.safe_load(open(sys.argv[1]))["spec"]["containers"][0]["command"]
-              new = yaml.safe_load(open(sys.argv[2]))["spec"]["containers"][0]["command"]
-              def names(cmd):
-                  return {a.split("=", 1)[0] for a in cmd if a.startswith("--")}
-              missing = names(old) - names(new)
-              if missing:
-                  sys.exit("candidate LOST flags: %s" % sorted(missing))
-              have = dict(a[2:].split("=", 1) for a in new if a.startswith("--") and "=" in a)
-              for k, v in want.items():
-                  if have.get(k) != v:
-                      sys.exit("candidate has %s=%r, wanted %r" % (k, have.get(k), v))
-              print("candidate ok: %d flags, none lost, %d set" % (len(names(new)), len(want)))
-              PY
-            executable: /bin/bash
+          #
+          # `command: argv:` with a literal `|` block, NOT `shell: cmd: >-`. A folded scalar joins
+          # lines with spaces, so a heredoc written that way arrives as one line and bash dies on it
+          # -- which is exactly how this task failed on 2026-10-15 at 17:44 UTC. It failed safely,
+          # because the candidate lives outside the manifests directory and etcd was never
+          # restarted, but the lesson is general: never put multi-line anything in a `>-` scalar.
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import json, sys, yaml
+                want = json.loads(sys.argv[1])
+                old = yaml.safe_load(open(sys.argv[2]))["spec"]["containers"][0]["command"]
+                new = yaml.safe_load(open(sys.argv[3]))["spec"]["containers"][0]["command"]
+                def names(cmd):
+                    return {a.split("=", 1)[0] for a in cmd if a.startswith("--")}
+                missing = names(old) - names(new)
+                if missing:
+                    sys.exit("candidate LOST flags: %s" % sorted(missing))
+                dupes = sorted(n for n in names(new)
+                               if sum(1 for a in new if a.split("=", 1)[0] == n) > 1)
+                if dupes:
+                    sys.exit("candidate has DUPLICATE flags: %s" % dupes)
+                have = dict(a[2:].split("=", 1) for a in new if a.startswith("--") and "=" in a)
+                for k, v in want.items():
+                    if have.get(k) != v:
+                        sys.exit("candidate has %s=%r, wanted %r" % (k, have.get(k), v))
+                print("candidate ok: %d flags, none lost, no duplicates, %d set"
+                      % (len(names(new)), len(want)))
+              - "{{ etcd_timings | to_json }}"
+              - "{{ etcd_manifest }}"
+              - "{{ etcd_candidate }}"
           register: et_candidate_check
           changed_when: false
 
@@ -380,14 +393,30 @@
             mode: "0600"
           ignore_errors: true
 
-        - name: ROLLBACK -- restore kubeadm-config by merge patch
-          ansible.builtin.shell:
-            cmd: >-
-              test -s {{ etcd_backup }}/ClusterConfiguration.yaml &&
-              {{ kubectl }} -n kube-system patch cm kubeadm-config --type merge -p
-              "$(python3 -c 'import json,sys; print(json.dumps({"data": {"ClusterConfiguration": open(sys.argv[1]).read()}}))'
-                 {{ etcd_backup }}/ClusterConfiguration.yaml)"
-            executable: /bin/bash
+        # Three small tasks rather than one clever shell line. The clever version was
+        # `patch -p "$(python3 -c ... file)"` inside a `>-` scalar, where the more-indented
+        # continuation line is kept as a literal newline by YAML -- so python got no argument, the
+        # substitution was empty, and the rollback itself failed (2026-10-15 17:45 UTC). A rollback
+        # that only works when its quoting is lucky is not a rollback.
+        - name: ROLLBACK -- read the backed-up ClusterConfiguration
+          ansible.builtin.slurp:
+            src: "{{ etcd_backup }}/ClusterConfiguration.yaml"
+          register: et_rb_value
+          ignore_errors: true
+
+        - name: ROLLBACK -- build the patch
+          ansible.builtin.copy:
+            dest: /tmp/kubeadm-config-rollback.json
+            mode: "0600"
+            content: "{{ {'data': {'ClusterConfiguration': (et_rb_value.content | b64decode)}} | to_json }}"
+          when: et_rb_value.content is defined
+          ignore_errors: true
+
+        - name: ROLLBACK -- restore kubeadm-config
+          ansible.builtin.command: >-
+            {{ kubectl }} -n kube-system patch cm kubeadm-config --type merge
+            --patch-file /tmp/kubeadm-config-rollback.json
+          when: et_rb_value.content is defined
           ignore_errors: true
 
         - name: ROLLBACK -- wait for etcd on the original manifest
@@ -507,21 +536,27 @@
       # Not a gate. It is here so that the day master-1's hand-edited manifest and kubeadm's
       # generated one diverge in some OTHER field, somebody sees it in a run log rather than in an
       # incident. `--dry-run` writes to a temp directory and touches nothing.
+      #
+      # `cmd: |` (literal), not `>-` (folded): a folded scalar keeps a more-indented line's newline
+      # and joins the rest with spaces, which mangles any real shell.
       ansible.builtin.shell:
-        cmd: >-
-          set -o pipefail;
-          D=$(mktemp -d) &&
-          kubeadm init phase etcd local --dry-run --config /etc/kubernetes/kubeadm-etcd-timings.yaml
-          --rootfs / >/dev/null 2>&1;
-          F=$(find /tmp -maxdepth 2 -name etcd.yaml -newermt '-5 minutes' 2>/dev/null | head -1);
-          if [ -n "$F" ]; then
-            echo "generated manifest: $F";
-            diff <(grep -oE -- '--[a-z-]+' "$F" | sort -u) \
-                 <(grep -oE -- '--[a-z-]+' {{ etcd_manifest }} | sort -u) \
-              && echo "same flag NAMES as master-1's manifest" \
-              || echo "^ flags differ between kubeadm's output and master-1's manifest (left=kubeadm)";
+        cmd: |
+          set -uo pipefail
+          kubeadm init phase etcd local --dry-run \
+            --config /etc/kubernetes/kubeadm-etcd-timings.yaml >/dev/null 2>&1
+          F=$(find /tmp /etc/kubernetes/tmp -maxdepth 3 -name etcd.yaml -newermt '-5 minutes' 2>/dev/null | head -1)
+          if [ -z "$F" ]; then
+            echo "no dry-run manifest produced on this kubeadm -- cross-check NOT performed"
+            exit 0
+          fi
+          echo "kubeadm would generate: $F"
+          if diff <(grep -oE -- '--[a-z-]+' "$F" | sort -u) \
+                  <(grep -oE -- '--[a-z-]+' {{ etcd_manifest }} | sort -u) >/dev/null; then
+            echo "same flag NAMES as master-1's manifest"
           else
-            echo "could not produce a dry-run manifest on this kubeadm -- cross-check NOT performed";
+            echo "flags differ between kubeadm's output and master-1's manifest:"
+            diff <(grep -oE -- '--[a-z-]+' "$F" | sort -u) \
+                 <(grep -oE -- '--[a-z-]+' {{ etcd_manifest }} | sort -u) || true
           fi
         executable: /bin/bash
       register: et_dryrun

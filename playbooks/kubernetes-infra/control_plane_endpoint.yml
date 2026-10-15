@@ -389,17 +389,37 @@
             - /etc/kubernetes/admin.conf
           ignore_errors: true
 
-        - name: ROLLBACK -- restore both ConfigMap values by merge patch
-          ansible.builtin.shell:
-            cmd: >-
-              test -s {{ cpe_backup }}/{{ item.name }}.{{ item.key }} &&
-              {{ kubectl }} -n {{ item.ns }} patch cm {{ item.name }} --type merge -p
-              "$(python3 -c 'import json,sys; print(json.dumps({"data": {sys.argv[1]: open(sys.argv[2]).read()}}))'
-                 {{ item.key }} {{ cpe_backup }}/{{ item.name }}.{{ item.key }})"
-            executable: /bin/bash
+        # A patch FILE, built by Ansible, rather than `-p "$(python3 -c ... )"` inside a folded
+        # scalar. The clever version has a more-indented continuation line, which YAML keeps as a
+        # literal newline -- so python gets no argument and the rollback fails. That is exactly how
+        # etcd_timings.yml's rollback failed on 2026-10-15; this one had the same latent bug and had
+        # simply never been reached.
+        - name: ROLLBACK -- read the backed-up values
+          ansible.builtin.slurp:
+            src: "{{ cpe_backup }}/{{ item.name }}.{{ item.key }}"
           loop:
             - { ns: kube-system, name: kubeadm-config, key: ClusterConfiguration }
             - { ns: kube-public, name: cluster-info, key: kubeconfig }
+          register: cpe_rb_values
+          ignore_errors: true
+
+        - name: ROLLBACK -- build the patches
+          ansible.builtin.copy:
+            dest: "/tmp/rollback-{{ item.item.name }}.json"
+            mode: "0600"
+            content: "{{ {'data': {item.item.key: (item.content | b64decode)}} | to_json }}"
+          loop: "{{ cpe_rb_values.results | default([]) | selectattr('content', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+          ignore_errors: true
+
+        - name: ROLLBACK -- restore both ConfigMaps
+          ansible.builtin.command: >-
+            {{ kubectl }} -n {{ item.item.ns }} patch cm {{ item.item.name }} --type merge
+            --patch-file /tmp/rollback-{{ item.item.name }}.json
+          loop: "{{ cpe_rb_values.results | default([]) | selectattr('content', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.item.name }}"
           ignore_errors: true
 
         - name: ROLLBACK -- restart the API server on the restored certificate
