@@ -88,13 +88,16 @@ postgresql_hba_entries:
   # untidy -- it can come to name a machine belonging to somebody else, and as this file notes
   # above, the only thing between the internet and the AWX database is one password.
   #
-  # Still to add: k8s-south-master-3, once window C creates it.
+  # k8s-south-master-3 was added 2026-10-16 at 208.113.130.241. Note that this is its SECOND
+  # address: the first instance came up with the two-IPv4 fault and was replaced with
+  # `terraform apply -replace`, which gave it a new port and a new address. A replacement inside a
+  # build changes this list too -- the coupling is to the ADDRESS, not to the role or the name.
   #
   # Do not copy this pattern to west, east or north. Those tenants are rebuilt routinely, by
   # design, and an allowlist of instance addresses there would be a trap rather than a control.
   - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.131.96/32', auth_method: "{{ postgresql_auth_method }}"}  # k8s-south-master-1
-  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.135.15/32', auth_method: "{{ postgresql_auth_method }}"}  # k8s-south-node-1
   - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.130.50/32', auth_method: "{{ postgresql_auth_method }}"}  # k8s-south-master-2
+  - {type: host, database: "{{ lookup('env', 'DB_NAME') }}", user: "{{ lookup('env', 'DB_USER') }}", address: '208.113.130.241/32', auth_method: "{{ postgresql_auth_method }}"}  # k8s-south-master-3
 postgresql_privs:
   - db: "{{ lookup('env', 'DB_NAME') }}"
     roles: "{{ lookup('env', 'DB_USER') }}"
