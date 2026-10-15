@@ -434,13 +434,19 @@
       # member catches up and Ansible fails the task if it never does. Done this way rather than with
       # a Jinja regex over the output: a regex that fails to match returns None, and `None | int` is
       # 0, which would read as a perfect spread and pass.
+      # `cmd: |`, NOT `cmd: >-`. A folded scalar joins its lines with SPACES, which turned this
+      # python into `import json, sys r = json.load(sys.stdin) idx = ...` -- a SyntaxError, so the
+      # program exited 1, `until: rc == 0` retried it 20 times, and the task reported the cluster
+      # as unconverged while the two members were in fact at an identical raft index with one
+      # leader. Exactly the trap fixed in 4f71a4d during window A, left in this file because the
+      # check above it happens to survive folding (every one of its lines ends in a semicolon).
+      # A broken check is indistinguishable from a real finding; this one cried wolf on 2026-10-15.
       ansible.builtin.shell:
-        cmd: >-
-          set -o pipefail;
-          C=$(crictl ps --name '^etcd$' --state running -q) &&
-          crictl exec "$C" etcdctl --endpoints=https://127.0.0.1:2379 {{ etcdctl_env }}
-          endpoint status --cluster -w json 2>/dev/null
-          | python3 -c '
+        cmd: |
+          set -o pipefail
+          C=$(crictl ps --name '^etcd$' --state running -q)
+          crictl exec "$C" etcdctl --endpoints=https://127.0.0.1:2379 {{ etcdctl_env }} endpoint status --cluster -w json 2>/dev/null |
+          python3 -c '
           import json, sys
           r = json.load(sys.stdin)
           idx = [x["Status"]["raftIndex"] for x in r]
