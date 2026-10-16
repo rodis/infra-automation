@@ -43,9 +43,16 @@ PROM = "/api/datasources/proxy/uid/grafanacloud-prom/api/v1"
 #   platform only, until application checks exist — its app namespaces carry long-standing app
 #   failures that would keep a cluster sweep permanently red (PROPOSED 2026-09-28, owner to approve).
 TARGETS = {
+    # south became THREE control-plane nodes and no workers on 2026-10-15/16 (task vault:
+    # south-three-masters). Until then this listed k8s-south-node-1 and -2, which no longer exist:
+    # the sweep raised two alarms for destroyed machines while being blind to master-2 and master-3,
+    # which is the exact failure this list is supposed to prevent. `control_plane` is 3 now; it is
+    # only read by the apiserver section, which south does not yet enable, but a wrong number that
+    # happens to be unused is a trap for whoever enables it.
     "south": dict(
-        expected=["k8s-south-master-1", "k8s-south-node-1", "k8s-south-node-2", "k8s-south-postgresql"],
-        ksm="k8s-south", hosts="k8s-south-.*", nodes=3, control_plane=1, namespaces=None,
+        expected=["k8s-south-master-1", "k8s-south-master-2", "k8s-south-master-3",
+                  "k8s-south-postgresql"],
+        ksm="k8s-south", hosts="k8s-south-.*", nodes=3, control_plane=3, namespaces=None,
         sections={"alerts", "etcd", "postgres", "awx"}),
     "production": dict(
         expected=["k8s-east-etcd-1", "k8s-east-master-1", "k8s-east-master-2", "k8s-east-node-1",
