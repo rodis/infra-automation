@@ -90,20 +90,25 @@ launch a job. It lives as a stack-level secret on that one stack, deliberately n
 
 | variable | default | |
 | :-- | :-- | :-- |
-| `alloy_remote_write_url` | from `GRAFANA_REMOTE_WRITE_URL` | endpoint, not secret |
-| `alloy_remote_write_user` | from `GRAFANA_REMOTE_WRITE_USER` | numeric instance id, not secret |
-| `alloy_remote_write_token` | from `GRAFANA_REMOTE_WRITE_TOKEN` | **secret** |
 | `alloy_scrape_interval` | `60s` | |
-| `alloy_ship_logs` | `true` | journald → Loki |
-| `alloy_loki_url` | from `GRAFANA_LOKI_URL` | push endpoint, not secret |
-| `alloy_loki_user` | from `GRAFANA_LOKI_USER` | Loki instance id — **not** the Prometheus one |
-| `alloy_loki_token` | `GRAFANA_LOKI_TOKEN`, else the metrics token | works only if that access policy carries `logs:write` |
+| `alloy_ship_logs` | `true` | journald → VictoriaLogs, in Loki's push format |
+| `alloy_vm_token` | from `VM_WRITE_TOKEN_INFRA` | **secret**; carries BOTH metrics and logs |
+| `alloy_vm_enabled` | true when the token is set | the only metrics sink |
+| `alloy_logs_to_victorialogs` | follows `alloy_vm_enabled` | the only log sink |
+| `alloy_vm_url` / `alloy_vl_url` | vmauth on the watcher VPS | endpoints, not secret |
+| `alloy_vm_ca_file` | the pinned self-signed certificate | |
 | `alloy_journal_max_age` | `12h` | how far back to read on first start |
 | `alloy_scrape_awx` | from `ALLOY_SCRAPE_AWX` | enable on ONE host only |
 | `alloy_awx_url` | from `AWX_METRICS_URL` | |
 | `alloy_awx_token` | from `AWX_METRICS_TOKEN` | read-scoped, **secret** |
 
-All three come from the Spacelift `Observability` context. The role asserts they are present before
+**The Grafana Cloud variables are gone (2026-10-17)** — `alloy_remote_write_*` and `alloy_loki_*`,
+with their `GRAFANA_*` context sources. Metrics left Grafana Cloud on 2026-10-08 and logs on
+2026-10-10; the switches stayed, off, until the rest of the Grafana read and write paths were
+removed. Grafana Cloud now watches the monitoring BOX (task `grafana-cloud-exit`), fed by a vmagent
+there rather than by this role.
+
+These come from the Spacelift `Observability` context. The role asserts they are present before
 touching the host, because an Alloy that starts and writes to an empty URL looks healthy from every
 angle except the one that matters.
 

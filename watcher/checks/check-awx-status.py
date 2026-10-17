@@ -23,18 +23,13 @@ read further, stop, report.
 import datetime, json, os, re, socket, ssl, sys, time
 import urllib.error, urllib.parse, urllib.request
 
-from grafana_wake import wake
-import metrics   # where METRICS come from (Grafana Cloud or VictoriaMetrics)
-import logs      # where LOGS come from (Grafana Cloud's Loki or VictoriaLogs), 2026-10-09
+import metrics   # VictoriaMetrics, behind vmauth on the watcher VPS
+import logs      # VictoriaLogs, behind the same vmauth (2026-10-09)
 import recovery  # recovery after a storage stall, shared with check-platform-status.py (2026-10-11)
 
-GRAFANA = (os.environ.get("GRAFANA_URL") or "").rstrip("/")
-GRAFANA = GRAFANA if GRAFANA.startswith("http") or not GRAFANA else "https://" + GRAFANA
-GTOKEN  = os.environ.get("GRAFANA_TOKEN") or ""
 AWX     = (os.environ.get("CONTROLLER_HOST") or "").rstrip("/")
 AWXTOK  = os.environ.get("CONTROLLER_OAUTH_TOKEN") or ""
 
-PROM = "/api/datasources/proxy/uid/grafanacloud-prom/api/v1"
 
 PG_NODE  = "k8s-south-postgresql"
 # Every PostgreSQL series and log stream is scoped to AWX's database VM, so another cluster's series in
@@ -104,13 +99,14 @@ def section(title):
 
 # ------------------------------------------------------------------------------------------------
 print(f"awx-healthy — {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M UTC} — metrics from {metrics.describe()}, logs from {logs.describe()}")
-if not (metrics.configured()[0] and logs.configured()[0] and GRAFANA and GTOKEN and AWX and AWXTOK):
-    print("missing GRAFANA_* or CONTROLLER_* — run through ./agent/run.sh")
+# GRAFANA_URL / GRAFANA_TOKEN were required here until 2026-10-17, long after this check stopped
+# reading Grafana: an expired token would have made it exit 2 — "facts could not be established" —
+# about facts it gets from VictoriaMetrics.
+if not (metrics.configured()[0] and logs.configured()[0] and AWX and AWXTOK):
+    print("missing VM_QUERY_URL or CONTROLLER_* — run through ./agent/run.sh")
     sys.exit(2)
 
 section("1. freshness — nothing below is trusted on stale data")
-if wake(GRAFANA, GTOKEN):
-    print("  grafana stack was asleep and has woken (free tier idles; not a fault)")
 def _fresh():
     ages = {j: prom(f'time() - timestamp({q})') for j, q in (("awx", 'up{job="awx"}'), ("postgres", f"pg_up{{{PGSEL}}}"))}
     missing = [j for j, a in ages.items() if a is None]

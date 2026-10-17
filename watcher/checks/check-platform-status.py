@@ -80,13 +80,11 @@ def pin(path, pattern):
 #   dsecrets            [{name, sync: bool}]
 # ------------------------------------------------------------------------------------------------
 
-def facts_from_grafana(ksm):
+def facts_from_metrics(ksm):
     ok, missing = metrics.configured()
     if not ok:
         raise RuntimeError(f"{missing} not set — run through ./agent/run.sh")
 
-    if metrics.wake_if_needed():
-        print("  grafana stack was asleep and has woken (free tier idles; not a fault)")
     sel = f'instance="{ksm}"'
 
     def q(expr):
@@ -143,7 +141,7 @@ if target not in TARGETS:
     print(f"usage: {sys.argv[0]} <{'|'.join(TARGETS)}>"); sys.exit(2)
 print(f"platform-healthy [{target}] — {NOW:%Y-%m-%d %H:%M UTC} — metrics from {metrics.describe()}")
 try:
-    F = facts_from_grafana(TARGETS[target]["ksm"])
+    F = facts_from_metrics(TARGETS[target]["ksm"])
 except Exception as e:
     print(f"\nFACTS NOT ESTABLISHED — could not read the cluster: {e}"); sys.exit(2)
 

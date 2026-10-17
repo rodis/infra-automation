@@ -1,10 +1,9 @@
-{#- Every metric pipeline forwards here: VictoriaMetrics on the watcher VPS (alloy_vm_enabled), and
-    Grafana Cloud only if alloy_metrics_to_grafana — off since the cutover, 2026-10-08. One list, so a new
-    pipeline cannot forget the second sink. -#}
-{#- Every log pipeline forwards here, by the same reasoning: Grafana Cloud's Loki while
-    alloy_logs_to_grafana, VictoriaLogs when alloy_logs_to_victorialogs. -#}
-{%- set logs_sinks = ((['loki.write.grafana_cloud.receiver'] if alloy_logs_to_grafana | bool else []) + (['loki.write.victorialogs.receiver'] if alloy_logs_to_victorialogs | bool else [])) | join(', ') -%}
-{%- set metrics_sinks = ((['prometheus.remote_write.grafana_cloud.receiver'] if alloy_metrics_to_grafana | bool else []) + (['prometheus.remote_write.victoriametrics.receiver'] if alloy_vm_enabled | bool else [])) | join(', ') -%}
+{#- Every pipeline forwards to a LIST rather than naming a sink, so a new pipeline cannot forget
+    one. The list held Grafana Cloud as a second sink through the dual-write and the cutovers
+    (metrics 2026-10-08, logs 2026-10-10); it was emptied of Grafana on 2026-10-17 and the shape is
+    kept, because the next second sink will want it back. -#}
+{%- set logs_sinks = (['loki.write.victorialogs.receiver'] if alloy_logs_to_victorialogs | bool else []) | join(', ') -%}
+{%- set metrics_sinks = (['prometheus.remote_write.victoriametrics.receiver'] if alloy_vm_enabled | bool else []) | join(', ') -%}
 // Managed by playbooks/observability/install_alloy.yml — edits here are overwritten.
 //
 // Host metrics only. PostgreSQL metrics are deliberately absent: they need a dedicated read-only
@@ -90,35 +89,12 @@ prometheus.relabel "alloy_self_keep" {
   }
 }
 
-{% if alloy_metrics_to_grafana | bool %}
-prometheus.remote_write "grafana_cloud" {
-  endpoint {
-    url = "{{ alloy_remote_write_url }}"
-
-    basic_auth {
-      username = "{{ alloy_remote_write_user }}"
-      password = "{{ alloy_remote_write_token }}"
-    }
-
-    // Mimir rejects out-of-order samples outright rather than dropping them quietly, so a backlog
-    // after an outage can wedge the queue. Keep the buffer modest and let old samples go: for
-    // "is this host alive", recent truth beats complete history.
-    queue_config {
-      capacity          = 2500
-      max_shards        = 4
-      max_samples_per_send = 500
-    }
-
-  }
-}
-{% endif %}
-
 {% if alloy_vm_enabled | bool %}
 // ---------------------------------------------------------------------------------------------
-// SECOND SINK — VictoriaMetrics on the watcher VPS (trial, 2026-10-05; project self-hosted-metrics)
+// VictoriaMetrics on the watcher VPS (2026-10-05; project self-hosted-metrics)
 //
-// Same series as Grafana Cloud, so the two can be compared before Grafana Cloud's metrics are dropped.
-// vmauth routes this token to /api/v1/write only. TLS is pinned to the trial's self-signed certificate.
+// THE metrics sink since 2026-10-08; a second one alongside Grafana Cloud before that, carrying the
+// same series so the two could be compared. vmauth routes this token to /api/v1/write only. TLS is pinned to the trial's self-signed certificate.
 // VictoriaMetrics accepts out-of-order samples, unlike Mimir, so a backlog after an outage drains
 // rather than wedging; the queue is still kept modest — the box's memory cap is shared.
 // ---------------------------------------------------------------------------------------------
@@ -239,18 +215,6 @@ loki.process "journal" {
   }
 }
 
-{% if alloy_logs_to_grafana | bool %}
-loki.write "grafana_cloud" {
-  endpoint {
-    url = "{{ alloy_loki_url }}"
-
-    basic_auth {
-      username = "{{ alloy_loki_user }}"
-      password = "{{ alloy_loki_token }}"
-    }
-  }
-}
-{% endif %}
 {% if alloy_logs_to_victorialogs | bool %}
 
 // VictoriaLogs on the watcher VPS (2026-10-09). Loki's push format, through vmauth with the SAME

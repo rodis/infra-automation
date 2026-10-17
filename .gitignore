@@ -33,3 +33,9 @@ override.tf.json
 .terraformrc
 terraform.rc
 .pr-body.md
+
+# Python bytecode from running the checks locally (they are run with python3 <file>, which
+# writes __pycache__ beside them). Never belongs in the repo, and on 2026-10-17 a stale .pyc for a
+# DELETED module was briefly committed alongside its own removal.
+__pycache__/
+*.pyc

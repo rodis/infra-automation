@@ -1,20 +1,15 @@
 ---
-# METRICS TO GRAFANA CLOUD — OFF since the cutover (owner, 2026-10-08, project self-hosted-metrics):
-# VictoriaMetrics on the watcher VPS is the only metrics sink. Logs still go to Grafana Cloud's Loki
-# (below) until VictoriaLogs exists. Set true to send metrics to Grafana Cloud again.
-alloy_metrics_to_grafana: false
-# Supplied by the Spacelift `Observability` context; only the token is secret. Used only when
-# alloy_metrics_to_grafana is true.
-alloy_remote_write_url: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_URL') }}"
-alloy_remote_write_user: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_USER') }}"
-alloy_remote_write_token: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_TOKEN') }}"
+# METRICS go to VictoriaMetrics on the watcher VPS and nowhere else. Grafana Cloud was the sink
+# until the cutover (owner, 2026-10-08) and the switch `alloy_metrics_to_grafana` lingered, off,
+# until 2026-10-17 — along with alloy_remote_write_url/_user/_token. Removed with the rest of the
+# Grafana read and write paths; Grafana Cloud now watches the monitoring BOX instead of holding the
+# estate's metrics (task grafana-cloud-exit), and it is fed by a vmagent on that box, not from here.
 alloy_scrape_interval: 60s
 
-# SELF-HOSTED METRICS — TRIAL (2026-10-05, vault `tasks`, project self-hosted-metrics). A SECOND
-# remote_write, to VictoriaMetrics behind vmauth on the watcher VPS, alongside Grafana Cloud — which
-# stays the source of truth until the cutover. On only when the token is supplied: it is the
+# SELF-HOSTED METRICS (2026-10-05, project self-hosted-metrics). THE metrics sink since the cutover,
+# and a second one alongside Grafana Cloud before it. On only when the token is supplied: the
 # write-only Spacelift variable VM_WRITE_TOKEN_INFRA in the `observability` context, so both infra
-# observability stacks get it and nothing else does. Metrics only; logs stay on Grafana Cloud.
+# observability stacks get it and nothing else does. The same token carries logs to VictoriaLogs.
 alloy_vm_token: "{{ lookup('env', 'VM_WRITE_TOKEN_INFRA') }}"
 alloy_vm_enabled: "{{ alloy_vm_token | length > 0 }}"
 alloy_vm_url: "https://vps71884.dreamhostps.com:8427/api/v1/write"
@@ -22,22 +17,17 @@ alloy_vm_url: "https://vps71884.dreamhostps.com:8427/api/v1/write"
 # exactly this certificate, so a different server answering that name is refused.
 alloy_vm_ca_file: /etc/alloy/victoriametrics-ca.crt
 
-# LOGS. Loki is a different endpoint with a different instance id from Prometheus — same stack,
-# separate tenants. The token is shared only if the access policy behind it carries logs:write as
-# well as metrics:write; GRAFANA_LOKI_TOKEN overrides when they are separate policies.
+# LOGS go to VictoriaLogs on the watcher VPS and nowhere else. It takes LOKI'S PUSH FORMAT, which
+# is why every component below is still called loki.* — those are Alloy's own component names and
+# the wire protocol, not Grafana Cloud.
+#
+# Grafana Cloud's Loki was the store until the cutover (owner, 2026-10-10, task victorialogs),
+# which happened only after 11 hours of dual-write matched line for line per job and host
+# (116,089 vs 116,091) and the watcher had read from VictoriaLogs for 24 runs without a failed
+# query. `alloy_logs_to_grafana` and alloy_loki_url/_user/_token lingered, off, until 2026-10-17.
 alloy_ship_logs: true
-# LOGS TO GRAFANA CLOUD — OFF since the logs cutover (owner, 2026-10-10, task victorialogs):
-# VictoriaLogs on the watcher VPS is the only log store. Before it, 11 hours of dual-write matched
-# line for line per job and host (116,089 vs 116,091 lines), and the watcher had read logs from
-# VictoriaLogs for 24 runs without a failed query. VictoriaLogs takes Loki's push format through
-# vmauth with the same token and pinned certificate as the metrics. Set true to send logs to Grafana
-# Cloud again (the Loki settings below are still read only then).
-alloy_logs_to_grafana: false
 alloy_logs_to_victorialogs: "{{ alloy_vm_enabled }}"
 alloy_vl_url: "https://vps71884.dreamhostps.com:8427/insert/loki/api/v1/push"
-alloy_loki_url: "{{ lookup('env', 'GRAFANA_LOKI_URL') }}"
-alloy_loki_user: "{{ lookup('env', 'GRAFANA_LOKI_USER') }}"
-alloy_loki_token: "{{ lookup('env', 'GRAFANA_LOKI_TOKEN') or lookup('env', 'GRAFANA_REMOTE_WRITE_TOKEN') }}"
 
 # How far back to read on first start. This matters more than it looks: the PostgreSQL VM has been
 # up 20 weeks, and without a bound Alloy would ship its entire historical journal on the first run

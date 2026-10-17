@@ -8,52 +8,23 @@
   # that matters.
   - name: Refuse a configuration that ships metrics nowhere
     ansible.builtin.assert:
-      that: (alloy_metrics_to_grafana | bool) or (alloy_vm_enabled | bool)
+      that: alloy_vm_enabled | bool
       fail_msg: >-
-        No metrics sink: alloy_metrics_to_grafana is false and VM_WRITE_TOKEN_INFRA (VictoriaMetrics)
-        is not set. Check the `observability` context.
+        No metrics sink: VM_WRITE_TOKEN_INFRA (VictoriaMetrics) is not set. Check the
+        `observability` context. There is no second sink to fall back to since Grafana Cloud was
+        dropped on 2026-10-17.
       quiet: true
     run_once: true
 
   - name: Refuse a configuration that ships logs nowhere
     ansible.builtin.assert:
-      that: (alloy_logs_to_grafana | bool) or (alloy_logs_to_victorialogs | bool)
+      that: alloy_logs_to_victorialogs | bool
       fail_msg: >-
-        alloy_ship_logs is true but there is no log sink: alloy_logs_to_grafana is false and
-        VictoriaLogs is off (it needs VM_WRITE_TOKEN_INFRA). Check the `observability` context.
+        alloy_ship_logs is true but VictoriaLogs is off (it needs VM_WRITE_TOKEN_INFRA). Check the
+        `observability` context.
       quiet: true
     run_once: true
     when: alloy_ship_logs | bool
-
-  - name: Check the remote_write settings were supplied
-    when: alloy_metrics_to_grafana | bool
-    ansible.builtin.assert:
-      that:
-        - alloy_remote_write_url | length > 0
-        - alloy_remote_write_user | length > 0
-        - alloy_remote_write_token | length > 0
-      fail_msg: >-
-        GRAFANA_REMOTE_WRITE_URL, _USER and _TOKEN must all be set. They come from the Spacelift
-        `Observability` context — check the variable NAMES if the context is attached but this
-        still fails.
-      success_msg: "remote_write settings present"
-    run_once: true
-
-  - name: Check the log shipping settings were supplied
-    ansible.builtin.assert:
-      that:
-        - alloy_loki_url | length > 0
-        - alloy_loki_user | length > 0
-        - alloy_loki_token | length > 0
-      fail_msg: >-
-        alloy_ship_logs is true but the Loki settings are missing. GRAFANA_LOKI_URL and
-        GRAFANA_LOKI_USER go in the `Observability` context — note the Loki instance id is a
-        DIFFERENT number from the Prometheus one. The token falls back to
-        GRAFANA_REMOTE_WRITE_TOKEN, which only works if that access policy carries logs:write as
-        well as metrics:write; otherwise set GRAFANA_LOKI_TOKEN.
-      success_msg: "log shipping settings present"
-    run_once: true
-    when: (alloy_ship_logs | bool) and (alloy_logs_to_grafana | bool)
 
   - name: Check the VictoriaMetrics trial token, when it is supplied
     ansible.builtin.assert:

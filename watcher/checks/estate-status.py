@@ -19,20 +19,15 @@ Three rules it tries hard to honour, all of them learned the hard way in this re
 """
 import json, os, sys, time, urllib.error, urllib.parse, urllib.request
 
-from grafana_wake import wake
-import metrics   # where METRICS come from (Grafana Cloud or VictoriaMetrics)
-import logs      # where LOGS come from (Grafana Cloud's Loki or VictoriaLogs), 2026-10-09
+import metrics   # VictoriaMetrics, behind vmauth on the watcher VPS
+import logs      # VictoriaLogs, behind the same vmauth (2026-10-09)
 
-GRAFANA = (os.environ.get("GRAFANA_URL") or "").rstrip("/")
-TOKEN   = os.environ.get("GRAFANA_TOKEN") or ""
 AWX     = (os.environ.get("CONTROLLER_HOST") or "").rstrip("/")
 AWXTOK  = os.environ.get("CONTROLLER_OAUTH_TOKEN") or ""
 
-PROM = "/api/datasources/proxy/uid/grafanacloud-prom/api/v1"
-
 # TARGETS. One sweep per cluster: `estate-status.py` is south (the default, as it always was);
 # `estate-status.py production` is the production cluster (2026-09-28). Every cluster-level or
-# aggregate query is scoped to the target, because several clusters share one Grafana stack and an
+# aggregate query is scoped to the target, because several clusters share one metrics store and an
 # unscoped query returns all of them — a scalar() of that is whichever came first.
 #
 # expected: hosts that must be reporting. Hardcoded on purpose — the point is to notice ABSENCE, and
@@ -80,13 +75,6 @@ PG_HOST  = 'instance="k8s-south-postgresql"'   # south only
 
 findings = []          # (severity, text) -- severity in {"RED", "AMBER"}
 NODATA = object()
-
-
-def _get(path, params):
-    url = f"{GRAFANA}{path}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)
 
 
 def promq(expr):
@@ -194,8 +182,13 @@ def section(title):
 
 
 # ---------------------------------------------------------------- preflight --
-if not GRAFANA or not TOKEN:
-    sys.exit("GRAFANA_URL / GRAFANA_TOKEN not resolved - run me through agent/run.sh")
+# Gate on what this actually reads. Until 2026-10-17 it demanded GRAFANA_URL / GRAFANA_TOKEN, long
+# after it had stopped querying Grafana for anything — so an expired Grafana token would have
+# stopped the whole sweep with a message naming a system it no longer uses.
+for _mod, _name in ((metrics, "metrics"), (logs, "logs")):
+    _ok, _missing = _mod.configured()
+    if not _ok:
+        sys.exit(f"{_name}: {_missing} not resolved - run me through agent/run.sh")
 
 print("=" * 70)
 print(f"  ESTATE STATUS: {TARGET}  (read-only; mutates nothing)")
@@ -205,19 +198,17 @@ print("=" * 70)
 
 # ------------------------------------------------- 1. can we see at all? -----
 section("1. COLLECTORS  -- read this first; everything below depends on it")
-if wake(GRAFANA, TOKEN):
-    print("   grafana stack was asleep and has woken (free tier idles; not a fault)")
 targets = promq(f'up{{{HOST_SEL}}} or up{{{KSM_SEL}}}' + (' or up{job="awx"}' if 'awx' in T_['sections'] else ''))
 if isinstance(targets, tuple) and targets[0] == "ERROR":
-    print("   CANNOT REACH GRAFANA. Nothing below can be trusted.")
+    print("   CANNOT REACH VICTORIAMETRICS. Nothing below can be trusted.")
     print(f"   query failed: {targets[1]}")
     print("   That is itself the finding: the monitoring path is broken, or the")
     print("   credential is wrong. Check by hand before concluding the estate is fine.")
     sys.exit(2)
 if targets is NODATA:
-    # Grafana answered; nothing of this target's is in it. A different fact from an unreachable
-    # Grafana, and the message must say which, or the reader goes looking in the wrong place.
-    print(f"   NOTHING FROM {TARGET.upper()} IS REPORTING. Grafana answered, but no target of this")
+    # The store answered; nothing of this target's is in it. A different fact from an unreachable
+    # store, and the message must say which, or the reader goes looking in the wrong place.
+    print(f"   NOTHING FROM {TARGET.upper()} IS REPORTING. VictoriaMetrics answered, but no target of this")
     print("   cluster has any series: its collectors are not shipping, or were never installed.")
     print("   Nothing below can be graded.")
     sys.exit(2)
@@ -364,9 +355,10 @@ section("8. LOGS  -- graded on the last 5m; longer windows are context only")
 # pair, every deliberate change -- a restart, a fix that stopped an error -- reads as a fresh
 # problem for hours afterwards, which is exactly how a status report trains you to ignore it.
 #
-# Each query is DATA — stream matchers plus an optional line regex — rendered for whichever backend
-# LOGS_BACKEND names (logs.py), so the LogQL and LogsQL forms cannot drift apart. Compared on both
-# backends on 2026-10-09 before switching (task victorialogs).
+# Each query is DATA — stream matchers plus an optional line regex — rendered by logs.py rather than
+# written out at the call site. That existed so the LogQL and LogsQL forms could not drift while both
+# were live; they were compared on both backends on 2026-10-09 before switching (task victorialogs),
+# and only LogsQL remains.
 HOSTS = ("instance", "=~", T_["hosts"])
 PGI   = ("instance", "=", "k8s-south-postgresql")
 LOG_CHECKS = [
