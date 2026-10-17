@@ -294,6 +294,21 @@
         grafana_alerts: "{{ lookup('file', playbook_dir ~ '/alerts/management-plane.json') | from_json }}"
       when: grafana_apply_alerts | bool
 
+    # The file is the source of truth, and that has to hold when the file says "nothing". PUT with
+    # an empty `rules` array has unspecified behaviour -- the spec marks every AlertRuleGroup field
+    # optional and says nothing about emptiness -- so the empty case gets its own verb instead of a
+    # guess. 404 is accepted: a group that is already gone is the state we wanted.
+    - name: Retire the rule group when the file holds no rules
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/v1/provisioning/folder/{{ grafana_folder_uid }}/rule-groups/{{ grafana_rule_group }}"
+        method: DELETE
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        status_code: [200, 202, 204, 404]
+      changed_when: true
+      when:
+        - grafana_apply_alerts | bool
+        - grafana_alerts.rules | length == 0
+
     - name: Apply the alert rule group
       # PUT of a whole rule group, not POST per rule: the group becomes exactly what the file says,
       # so removing a rule here removes it in Grafana. A per-rule POST would only ever add.
@@ -341,7 +356,9 @@
         status_code: [200, 202]
       register: grafana_rules_applied
       changed_when: true
-      when: grafana_apply_alerts | bool
+      when:
+        - grafana_apply_alerts | bool
+        - grafana_alerts.rules | length > 0
 
     # Applying is not the same as evaluating. A rule that cannot run reports nothing, and nothing
     # is indistinguishable from healthy — the exact trap this alerting exists to close. So read the
@@ -378,6 +395,7 @@
          | rejectattr('health', 'equalto', 'ok') | list | length == 0)
       when:
         - grafana_apply_alerts | bool
+        - grafana_alerts.rules | length > 0
         - not ansible_check_mode
 
     - name: Report what is now watching
@@ -391,6 +409,7 @@
              | map(attribute='health') | list | join(', ') }}
       when:
         - grafana_apply_alerts | bool
+        - grafana_alerts.rules | length > 0
         - not ansible_check_mode
 
     - name: Check every rule is healthy, not merely present
@@ -406,6 +425,7 @@
         success_msg: "all rules present and evaluating"
       when:
         - grafana_apply_alerts | bool
+        - grafana_alerts.rules | length > 0
         - not ansible_check_mode
 
     # ------------------------------------------------------------------------------------------
