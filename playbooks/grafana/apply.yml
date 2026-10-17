@@ -52,6 +52,31 @@
     # one deploy at a time.
     grafana_apply_alerts: "{{ (lookup('env', 'GRAFANA_APPLY_ALERTS') | default('true', true)) | bool }}"
 
+    # Notifications are gated separately again, and for the same reason the alert gate exists: a
+    # failure in one must not mask the other.
+    #
+    # This block was added on 2026-10-17 after finding the estate had been silent for nine days.
+    # Four rules were applied, healthy and evaluating; eleven alert instances were active
+    # continuously from 2026-10-08T19:16:40Z; and the root notification policy routed to a receiver
+    # named `empty`. Nothing was ever delivered. The playbook had verified that rules EVALUATE and
+    # never that a notification ARRIVES, which is this repository's own recurring failure --
+    # grading the installer instead of the installed thing -- applied to its own alerting.
+    #
+    # So the contact point and the policy are code here, exactly like the rules, and the run proves
+    # delivery before it reports success.
+    grafana_apply_notifications: "{{ (lookup('env', 'GRAFANA_APPLY_NOTIFICATIONS') | default('true', true)) | bool }}"
+    grafana_contact_point: "telegram-infra"
+    # Chat and topic ids are NOT secrets (infra-objectives/dagu/README.md), so they are pinned here
+    # where they can be read and reviewed, for the same reason org id 1 is pinned above: a
+    # misconfigured id would deliver somewhere else just as happily as it delivers here.
+    # Group "Pinky and the Brain", forum topic "Infra" -- where Dagu already posts, so every
+    # unattended finding lands in one place.
+    telegram_chat_id: "-1003933432943"
+    telegram_topic_id: "2"
+    # The `Pinky Bot` token, from the Spacelift context -- never from agent-ops at run time. The
+    # agent may read alert STATE; it must not hold the path that defines where alerts go.
+    telegram_bot_token: "{{ lookup('env', 'TELEGRAM_BOT_TOKEN') }}"
+
   tasks:
 
     - name: Check the API settings were supplied
@@ -113,6 +138,124 @@
         status_code: [200]
       when: grafana_folder_lookup.status == 404
 
+    - name: Check the Telegram settings were supplied
+      ansible.builtin.assert:
+        that:
+          - telegram_bot_token | length > 0
+        fail_msg: >-
+          TELEGRAM_BOT_TOKEN must be set. It is the `token` field of the `Pinky Bot` item, added to
+          the Spacelift context `grafana-provisioning` as a WRITE-ONLY variable. Without it the
+          contact point cannot be written, and rules would go back to notifying nobody.
+      when: grafana_apply_notifications | bool
+
+    # Look first, then create -- the same shape as the folder above, and for the same reason: the
+    # provisioning API has one endpoint for create (POST, no uid in the path) and another for
+    # update (PUT /{uid}), and POSTing an existing uid is an error rather than an upsert.
+    - name: Look for the contact point
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/v1/provisioning/contact-points"
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        return_content: true
+      register: grafana_contact_points
+      changed_when: false
+      check_mode: false   # a read whose result chooses POST or PUT below
+      when: grafana_apply_notifications | bool
+
+    # `bottoken` is a SECURE setting: Grafana stores it encrypted and returns it redacted, so a
+    # read-compare-write would see a difference on every run and could never converge. The write is
+    # therefore unconditional, exactly like the rule-group PUT -- the file is the source of truth
+    # and the API call is idempotent by replacement rather than by comparison.
+    #
+    # no_log is NOT optional here. The body carries the bot token, and ansible.builtin.uri prints
+    # its body on failure. `postgres_users_no_log: false` put the AWX database password into a
+    # Spacelift run log on 2026-08-23, where it persists in run history; this is the same hazard in
+    # the same place.
+    - name: Create or update the Telegram contact point
+      ansible.builtin.uri:
+        # `| bool` on both, and it is load-bearing. Ansible templates contact_point_exists to the
+        # STRING "False", and a non-empty string is truthy in Jinja -- without the filter this
+        # always chooses PUT and 404s the first time the contact point does not exist yet. Same
+        # class of bug as `interval` being sent as a string to the rule-group endpoint, noted
+        # above: the value looks right and the type is wrong.
+        url: >-
+          {{ grafana_url }}/api/v1/provisioning/contact-points{{
+            ('/' ~ grafana_contact_point) if (contact_point_exists | bool) else '' }}
+        method: "{{ 'PUT' if (contact_point_exists | bool) else 'POST' }}"
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        body_format: json
+        body:
+          uid: "{{ grafana_contact_point }}"
+          name: "{{ grafana_contact_point }}"
+          type: telegram
+          disableResolveMessage: false
+          # Keys taken from GET /api/alert-notifiers on this Grafana, not from memory: `bottoken`
+          # and `chatid` are required, `message_thread_id` is how a forum topic is addressed.
+          settings:
+            bottoken: "{{ telegram_bot_token }}"
+            chatid: "{{ telegram_chat_id }}"
+            message_thread_id: "{{ telegram_topic_id }}"
+            parse_mode: HTML
+        # Every plausible status is accepted here and judged in the next task. This body carries a
+        # secret, so the task must be no_log -- and a no_log failure prints NOTHING, which in this
+        # playbook's own history is how five deploys produced five identical bare 400s naming no
+        # field. Splitting the call from the verdict buys a task that can speak.
+        status_code: [200, 202, 400, 401, 403, 404, 409]
+      vars:
+        contact_point_exists: >-
+          {{ (grafana_contact_points.json | default([]))
+             | selectattr('uid', 'defined')
+             | selectattr('uid', 'equalto', grafana_contact_point)
+             | list | length > 0 }}
+      register: grafana_contact_point_write
+      no_log: true
+      changed_when: true
+      when: grafana_apply_notifications | bool
+
+    - name: Check the contact point was written
+      ansible.builtin.assert:
+        that:
+          - grafana_contact_point_write.status in [200, 202]
+        fail_msg: >-
+          Writing the contact point failed with HTTP {{ grafana_contact_point_write.status }}:
+          {{ (grafana_contact_point_write.json.message | default('no message'))
+             | regex_replace('[0-9]{6,}:[A-Za-z0-9_-]{30,}', '<redacted>') }}.
+          A 401 or 403 means the Editor service account token is wrong or lacks
+          alert.provisioning:write; a 400 means the settings shape is wrong -- read
+          /api/alert-notifiers for the telegram option names rather than guessing at them.
+        success_msg: "contact point '{{ grafana_contact_point }}' written"
+      # Grafana does not echo SECURE settings back in an error, so the message is safe to print;
+      # the regex is belt and braces against a future version that does.
+      #
+      # `not ansible_check_mode` because the write above is skipped in check mode, leaving the
+      # registered result with no `.status` -- asserting on it would fail the PLAN rather than the
+      # run. Exactly the trap the rule read-back below documents, in the other direction.
+      when:
+        - grafana_apply_notifications | bool
+        - not ansible_check_mode
+
+    # The root route is the whole bug. Rules carry `severity` and `estate` labels already, so
+    # splitting critical from warning later is a change to this tree and not to any rule.
+    - name: Point the notification policy at the contact point
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/v1/provisioning/policies"
+        method: PUT
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        body_format: json
+        body:
+          receiver: "{{ grafana_contact_point }}"
+          group_by: ["grafana_folder", "alertname"]
+          group_wait: 30s
+          group_interval: 5m
+          # 24h, against Grafana's default of 4h, to match notify-gate.sh's `remind_after=86400`.
+          # Both post into the same Telegram topic, so they have to agree on cadence or the
+          # quieter one is drowned by the louder. The reasoning is notify-gate's own: an alert
+          # channel that repeats itself teaches you to stop reading it. The FIRST notification is
+          # what matters; a repeat is only a reminder the finding is still there.
+          repeat_interval: 24h
+        status_code: [200, 202]
+      changed_when: true
+      when: grafana_apply_notifications | bool
+
     - name: Find the dashboards in this repository
       ansible.builtin.find:
         paths: "{{ playbook_dir }}/dashboards"
@@ -149,11 +292,8 @@
     - name: Load the alert rule definitions
       ansible.builtin.set_fact:
         grafana_alerts: "{{ lookup('file', playbook_dir ~ '/alerts/management-plane.json') | from_json }}"
-
-    # PUT of a whole rule group, not POST per rule: the group becomes exactly what the file says,
-    # so removing a rule here removes it in Grafana. A per-rule POST would only ever add, and the
-    # file would slowly stop describing reality.
       when: grafana_apply_alerts | bool
+
     - name: Apply the alert rule group
       # PUT of a whole rule group, not POST per rule: the group becomes exactly what the file says,
       # so removing a rule here removes it in Grafana. A per-rule POST would only ever add.
@@ -266,4 +406,87 @@
         success_msg: "all rules present and evaluating"
       when:
         - grafana_apply_alerts | bool
+        - not ansible_check_mode
+
+    # ------------------------------------------------------------------------------------------
+    # Delivery. Everything above proves CONFIGURATION; none of it proves anyone is told.
+    #
+    # That distinction is not academic. On 2026-10-17 this playbook's own verification passed
+    # completely -- four rules present, health ok, evaluating every 60s -- while the estate had
+    # been unable to notify anybody for nine days. "Present and evaluating" was the strongest
+    # claim the run could make, and it was true, and it was worthless.
+    #
+    # Two independent proofs, because they fail for different reasons:
+    #   - the policy read-back catches a route pointing somewhere else (the actual 2026-10 bug);
+    #   - the Telegram send catches a bad token, chat id or topic id, none of which Grafana
+    #     validates when the contact point is written.
+    # ------------------------------------------------------------------------------------------
+
+    - name: Read the notification policy back
+      ansible.builtin.uri:
+        url: "{{ grafana_url }}/api/v1/provisioning/policies"
+        headers: { Authorization: "Bearer {{ grafana_token }}" }
+        return_content: true
+      register: grafana_policy_state
+      changed_when: false
+      # NOT check_mode: false. This verifies a write, and check mode deliberately does not perform
+      # the write -- forcing the read would look for something never created. Same distinction the
+      # rule read-back above documents.
+      when:
+        - grafana_apply_notifications | bool
+        - not ansible_check_mode
+
+    - name: Check that alerts now route somewhere real
+      ansible.builtin.assert:
+        that:
+          - grafana_policy_state.json.receiver == grafana_contact_point
+        fail_msg: >-
+          The root notification policy routes to '{{ grafana_policy_state.json.receiver }}',
+          not '{{ grafana_contact_point }}'. Alert rules will evaluate perfectly and tell nobody.
+          This is the exact state the estate was in from 2026-10-08 to 2026-10-17, when the root
+          route pointed at a receiver named 'empty'.
+        success_msg: "alerts route to '{{ grafana_contact_point }}'"
+      when:
+        - grafana_apply_notifications | bool
+        - not ansible_check_mode
+
+    # The token is in the URL -- Telegram has no header auth -- so this must be no_log, which also
+    # hides WHY it failed. Every plausible status is therefore accepted here and judged in the
+    # next task, which can speak freely: Telegram's error text names the problem
+    # ("chat not found", "message thread not found", "Unauthorized") and never echoes the token.
+    - name: Prove a message can actually be delivered to Telegram
+      ansible.builtin.uri:
+        url: "https://api.telegram.org/bot{{ telegram_bot_token }}/sendMessage"
+        method: POST
+        body_format: json
+        body:
+          chat_id: "{{ telegram_chat_id }}"
+          message_thread_id: "{{ telegram_topic_id | int }}"
+          text: >-
+            Grafana alerting provisioned from infra-automation. This is the delivery test; if you
+            can read it, the path that was silent from 2026-10-08 to 2026-10-17 is open again.
+        status_code: [200, 400, 401, 403, 404]
+      register: telegram_probe
+      no_log: true
+      changed_when: false
+      when:
+        - grafana_apply_notifications | bool
+        - not ansible_check_mode
+
+    - name: Check Telegram accepted the message
+      ansible.builtin.assert:
+        that:
+          - telegram_probe.status == 200
+        fail_msg: >-
+          Telegram refused the delivery test with HTTP {{ telegram_probe.status }}:
+          {{ telegram_probe.json.description | default('no description') }}.
+          A 401 means the bot token is wrong; "chat not found" means telegram_chat_id is wrong;
+          "message thread not found" means telegram_topic_id is wrong or the topic was deleted.
+          The contact point is written either way, so fix the value and re-run -- do not assume
+          alerting works because this playbook otherwise succeeded.
+        success_msg: >-
+          Telegram accepted the test message into chat {{ telegram_chat_id }} topic
+          {{ telegram_topic_id }} — alerting is delivering, not merely evaluating.
+      when:
+        - grafana_apply_notifications | bool
         - not ansible_check_mode
