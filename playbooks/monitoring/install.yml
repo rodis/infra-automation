@@ -103,10 +103,12 @@
     # which is the instinct the comment in vmagent-relabel.yml.j2 warns against, written by the
     # same hand that then did it. If a rule ever needs it, add the rule and the metric together.
     #
-    # VictoriaLogs' own vl_* families are deliberately absent: nothing had ever scraped that target,
-    # so their names were unverified and guessing would have added entries that match nothing. It is
-    # covered meanwhile by up{job="victoria-logs"} and the vm_* families it shares with
-    # VictoriaMetrics. Read the real names off the target now that it is scraped, then extend.
+    # VictoriaLogs' families were absent until 2026-10-17 because nothing had ever scraped that
+    # target, so their names were unverified and guessing would have added entries matching nothing.
+    # The first run that scraped it printed all 89; four of them are kept now. The cap metric is the
+    # one worth copying elsewhere: keeping BOTH the usage and the limit lets the rule be a ratio, so
+    # changing the cap cannot leave a rule grading against a number nobody updated. Same reasoning
+    # as postgres_exporter exporting pg_settings_max_connections rather than hardcoding 97.
     monitoring_vmagent_keep:
       - up
       - vm_app_uptime_seconds
@@ -119,6 +121,17 @@
       - vmagent_remotewrite_errors_total
       - vmagent_remotewrite_packets_dropped_total
       - process_resident_memory_bytes
+      # VictoriaLogs, added 2026-10-17 once the names were READ off the live target rather than
+      # guessed. Each is read by a rule in the monitoring-stack group and none is here for any
+      # other reason:
+      #   vl_rows_ingested_total          is log ingest flowing
+      #   vl_data_size_bytes              } as a RATIO against the cap, never a number typed into a
+      #   vl_max_disk_space_usage_bytes   } rule -- raise the cap and the rule re-scales itself
+      #   vl_storage_is_read_only         VictoriaLogs has stopped accepting writes, right now
+      - vl_rows_ingested_total
+      - vl_data_size_bytes
+      - vl_max_disk_space_usage_bytes
+      - vl_storage_is_read_only
 
     # LOGS (2026-10-09): VictoriaLogs replaces Grafana Cloud's Loki. Its own release line and repo
     # (VictoriaMetrics/VictoriaLogs); checksum computed from the download AND matched against the

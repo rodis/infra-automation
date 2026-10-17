@@ -492,6 +492,252 @@
           }
         }
       ]
+    },
+    {
+      "uid": "mon-logs-ingest-stalled",
+      "title": "VictoriaLogs is not ingesting",
+      "condition": "C",
+      "for": "30m",
+      "noDataState": "NoData",
+      "execErrState": "Alerting",
+      "labels": {
+        "severity": "warning",
+        "estate": "monitoring"
+      },
+      "annotations": {
+        "summary": "VictoriaLogs has accepted no log lines for an hour",
+        "description": "South's hosts ship journald and pod logs from every namespace, and kubelet and containerd alone never stop talking -- so an hour of nothing is a broken sender or a refused write, not a quiet estate. Warning rather than critical: losing logs costs the retrospective, which is what this estate uses them for, while losing metrics costs the alerting itself.",
+        "runbook": "Check vmauth_user_requests_total per sender first -- the same tokens carry logs and metrics, so metrics still arriving while logs do not points at the Alloy loki.write component rather than at the host. Then ~/monitoring/logs/victoria-logs.log."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 3600,
+            "to": 0
+          },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "expr": "sum(increase(vl_rows_ingested_total{box=\"vps71884.dreamhostps.com\"}[1h]))",
+            "instant": true,
+            "range": false,
+            "editorMode": "code",
+            "intervalMs": 1000,
+            "maxDataPoints": 43200,
+            "datasource": {
+              "type": "prometheus",
+              "uid": "grafanacloud-prom"
+            }
+          }
+        },
+        {
+          "refId": "C",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 0,
+            "to": 0
+          },
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "datasource": {
+              "type": "__expr__",
+              "uid": "__expr__"
+            },
+            "conditions": [
+              {
+                "type": "query",
+                "operator": {
+                  "type": "and"
+                },
+                "query": {
+                  "params": [
+                    "A"
+                  ]
+                },
+                "reducer": {
+                  "type": "last",
+                  "params": []
+                },
+                "evaluator": {
+                  "type": "lt",
+                  "params": [
+                    1
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uid": "mon-logs-near-disk-cap",
+      "title": "VictoriaLogs is near its disk cap",
+      "condition": "C",
+      "for": "30m",
+      "noDataState": "NoData",
+      "execErrState": "Alerting",
+      "labels": {
+        "severity": "warning",
+        "estate": "monitoring"
+      },
+      "annotations": {
+        "summary": "VictoriaLogs is using over 85% of its 20 GiB cap",
+        "description": "The cap is a SAFETY limit, not retention: past it VictoriaLogs drops the oldest days first so a log flood cannot fill the disk shared with VictoriaMetrics and the watcher. So this does not fire on a full disk -- it fires before history starts quietly disappearing, which nothing else would report. Measured volume (~15 MB/day from south) puts 180 days near 3 GB, so reaching 85% means something changed rather than grew.",
+        "runbook": "What got loud: LogsQL by stream over the last day. Raising the cap is a change to monitoring_vl_max_disk; SHORTENING retention deletes data and is the owner's call (policy monitoring-estate)."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 3600,
+            "to": 0
+          },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "expr": "sum(vl_data_size_bytes{box=\"vps71884.dreamhostps.com\"}) / max(vl_max_disk_space_usage_bytes{box=\"vps71884.dreamhostps.com\"})",
+            "instant": true,
+            "range": false,
+            "editorMode": "code",
+            "intervalMs": 1000,
+            "maxDataPoints": 43200,
+            "datasource": {
+              "type": "prometheus",
+              "uid": "grafanacloud-prom"
+            }
+          }
+        },
+        {
+          "refId": "C",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 0,
+            "to": 0
+          },
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "datasource": {
+              "type": "__expr__",
+              "uid": "__expr__"
+            },
+            "conditions": [
+              {
+                "type": "query",
+                "operator": {
+                  "type": "and"
+                },
+                "query": {
+                  "params": [
+                    "A"
+                  ]
+                },
+                "reducer": {
+                  "type": "last",
+                  "params": []
+                },
+                "evaluator": {
+                  "type": "gt",
+                  "params": [
+                    0.85
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uid": "mon-logs-read-only",
+      "title": "VictoriaLogs has stopped accepting writes",
+      "condition": "C",
+      "for": "5m",
+      "noDataState": "NoData",
+      "execErrState": "Alerting",
+      "labels": {
+        "severity": "critical",
+        "estate": "monitoring"
+      },
+      "annotations": {
+        "summary": "VictoriaLogs has flipped to read-only",
+        "description": "VictoriaLogs goes read-only when it runs out of usable disk, and then every log line the estate sends is refused. Distinct from the cap rule above, which warns while there is still room to act: by the time this fires, logs are already being lost and will stay lost -- there are no backups by the owner's decision.",
+        "runbook": "Free space on the box; check whether VictoriaMetrics' own data is what grew. ~/monitoring/logs/victoria-logs.log says why it flipped."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 3600,
+            "to": 0
+          },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "expr": "max(vl_storage_is_read_only{box=\"vps71884.dreamhostps.com\"})",
+            "instant": true,
+            "range": false,
+            "editorMode": "code",
+            "intervalMs": 1000,
+            "maxDataPoints": 43200,
+            "datasource": {
+              "type": "prometheus",
+              "uid": "grafanacloud-prom"
+            }
+          }
+        },
+        {
+          "refId": "C",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 0,
+            "to": 0
+          },
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "datasource": {
+              "type": "__expr__",
+              "uid": "__expr__"
+            },
+            "conditions": [
+              {
+                "type": "query",
+                "operator": {
+                  "type": "and"
+                },
+                "query": {
+                  "params": [
+                    "A"
+                  ]
+                },
+                "reducer": {
+                  "type": "last",
+                  "params": []
+                },
+                "evaluator": {
+                  "type": "gt",
+                  "params": [
+                    0
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
     }
   ]
 }

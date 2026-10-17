@@ -39,9 +39,9 @@ scrape_configs:
       password_file: {{ monitoring_home }}/config/vm-password
 
   # VictoriaLogs shares VictoriaMetrics' metrics library, so the same vm_* names describe it; `job`
-  # is what tells them apart. Its own vl_* families are deliberately NOT kept yet — nothing had ever
-  # scraped this target before, so their names were unverified, and a keep-list entry that matches
-  # nothing is silent. Read them off this target now that it is scraped, then add them.
+  # is what tells them apart. Its own vl_* families went into the keep-list on 2026-10-17, once this
+  # target had been scraped once and the names could be read rather than guessed — a keep-list entry
+  # that matches nothing ships nothing and reports no error, so the names had to be facts first.
   - job_name: victoria-logs
     static_configs:
       - targets: ["127.0.0.1:{{ monitoring_vl_port }}"]
