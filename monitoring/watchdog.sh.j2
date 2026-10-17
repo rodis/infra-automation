@@ -64,6 +64,41 @@ if ! pgrep -u "$(id -u)" -f "$B/[v]ictoria-logs-prod" >/dev/null; then
   note "started victoria-logs (pid $!)"
 fi
 
+# vmagent (2026-10-17): meta-monitoring. Scrapes this box's own components on loopback and ships a
+# keep-listed handful of series OUT to Grafana Cloud, which is the only thing watching this box —
+# the checks, the metrics store and the Telegram notifier all live here, so nothing on this machine
+# can report that this machine died.
+#
+# Rendered only when a Grafana remote-write credential was supplied at launch; without one this
+# block is absent and the stack is exactly what it was before.
+#
+# The bearer token is a FILE (-remoteWrite.basicAuth.passwordFile), not a flag value and not an
+# environment variable: `ps` shows command lines to every user on this shared box, which is why
+# VictoriaMetrics' own password takes the same route. The URL and the user (a numeric instance id)
+# are not secrets.
+#
+# -remoteWrite.tmpDataPath buffers on disk when Grafana Cloud is unreachable, capped so a long
+# outage cannot fill the disk VictoriaMetrics and the watcher share.
+{% if monitoring_vmagent_enabled %}
+if ! pgrep -u "$(id -u)" -f "$B/[v]magent-prod" >/dev/null; then
+  GOMEMLIMIT={{ monitoring_vmagent_gomemlimit }} nohup "$B/vmagent-prod" \
+    -promscrape.config="$H/config/vmagent.yml" \
+    -remoteWrite.url={{ monitoring_grafana_remote_write_url }} \
+    -remoteWrite.basicAuth.username={{ monitoring_grafana_remote_write_user }} \
+    -remoteWrite.basicAuth.passwordFile="$H/config/grafana-remote-write-token" \
+    -remoteWrite.urlRelabelConfig="$H/config/vmagent-relabel.yml" \
+    -remoteWrite.tmpDataPath="$H/data/vmagent" \
+    -remoteWrite.maxDiskUsagePerURL={{ monitoring_vmagent_max_disk }} \
+    -httpListenAddr=127.0.0.1:{{ monitoring_vmagent_port }} \
+    -memory.allowedBytes={{ monitoring_vmagent_cache_bytes }} \
+    >>"$L/vmagent.log" 2>&1 &
+  note "started vmagent (pid $!)"
+fi
+{% else %}
+# No Grafana remote-write credential was supplied at install time, so there is no vmagent and
+# NOTHING OUTSIDE THIS BOX IS WATCHING IT. That is a real gap, not a configuration preference.
+{% endif %}
+
 # vmauth: the ONLY process on this box that listens publicly. TLS, a bearer token per sender, each
 # token routed only to the write path. Its own /metrics and /health are moved to loopback with
 # -httpInternalListenAddr, so the public port serves nothing without a token.

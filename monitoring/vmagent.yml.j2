@@ -1,0 +1,74 @@
+# Rendered by playbooks/monitoring/install.yml from monitoring/vmagent.yml.j2 — edit the template.
+#
+# vmagent scrapes THIS BOX's own components and ships a small keep-listed subset outward to Grafana
+# Cloud. It is the only thing here that talks to the outside world on purpose.
+#
+# WHY IT SCRAPES THE COMPONENTS RATHER THAN QUERYING VICTORIAMETRICS
+#
+# Querying VictoriaMetrics would make every failure look the same: VictoriaMetrics down, the box
+# down, and the network gone all produce "no data" at the far end. Scraping each component directly
+# separates them. If VictoriaMetrics dies, vmagent keeps running and sends up{job="victoria-metrics"}=0
+# — a positive assertion that one thing is broken. Only the whole box going dark produces silence,
+# and silence is then unambiguous: it is the dead-man's switch firing, and nothing else.
+#
+# PASSWORDS ARE READ FROM FILES, NEVER WRITTEN HERE. VictoriaMetrics and VictoriaLogs each require
+# their own password on loopback (see install.yml), and those live in 600 files that only rods_brain
+# can read. `password_file` points at them, so this config holds no secret and can be 644-dull.
+#
+# The scrape interval is 60s, not the 15s used for the estate. These are liveness facts, the alert
+# rules that read them are minutes-scale, and every sample here costs Grafana Cloud series budget.
+
+global:
+  scrape_interval: 60s
+  scrape_timeout: 10s
+  external_labels:
+    # Stamped on everything leaving this box, so a series in Grafana Cloud is unambiguous about where
+    # it came from even though the rest of that stack is now empty.
+    box: {{ monitoring_hostname }}
+    role: monitoring
+
+scrape_configs:
+  # The metrics store itself. Its /metrics carries vm_rows_inserted_total (is ingest flowing),
+  # vm_free_disk_space_bytes (the shared disk) and vm_app_uptime_seconds (did it restart).
+  - job_name: victoria-metrics
+    static_configs:
+      - targets: ["127.0.0.1:{{ monitoring_vm_port }}"]
+        labels: {instance: "{{ monitoring_hostname }}"}
+    basic_auth:
+      username: vmauth
+      password_file: {{ monitoring_home }}/config/vm-password
+
+  # VictoriaLogs shares VictoriaMetrics' metrics library, so the same vm_* names describe it; `job`
+  # is what tells them apart. Its own vl_* families are deliberately NOT kept yet — nothing had ever
+  # scraped this target before, so their names were unverified, and a keep-list entry that matches
+  # nothing is silent. Read them off this target now that it is scraped, then add them.
+  - job_name: victoria-logs
+    static_configs:
+      - targets: ["127.0.0.1:{{ monitoring_vl_port }}"]
+        labels: {instance: "{{ monitoring_hostname }}"}
+    basic_auth:
+      username: vmauth
+      password_file: {{ monitoring_home }}/config/vl-password
+
+  # vmauth is the interesting one. It counts requests PER USER, and every sender in the estate is a
+  # user here — so a per-user rate falling to zero names which Alloy stopped shipping, which nothing
+  # inside a dead estate could ever tell us.
+  #
+  # Its internal listener is HTTPS because -tls applies to both listeners, and the certificate names
+  # the public hostname rather than 127.0.0.1, so it cannot verify against itself. Skipping
+  # verification on a loopback connection to a process owned by this same user is not a weakening:
+  # nothing outside the box is reachable on this path.
+  - job_name: vmauth
+    scheme: https
+    tls_config:
+      insecure_skip_verify: true
+    static_configs:
+      - targets: ["127.0.0.1:{{ monitoring_vmauth_internal_port }}"]
+        labels: {instance: "{{ monitoring_hostname }}"}
+
+  # vmagent scrapes itself, so a failure to deliver is itself delivered — until it cannot be, which
+  # is the no-data case the dead-man's-switch rule covers.
+  - job_name: vmagent
+    static_configs:
+      - targets: ["127.0.0.1:{{ monitoring_vmagent_port }}"]
+        labels: {instance: "{{ monitoring_hostname }}"}

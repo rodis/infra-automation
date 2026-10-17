@@ -1,0 +1,497 @@
+{
+  "interval": 60,
+  "rules": [
+    {
+      "uid": "mon-box-not-reporting",
+      "title": "Monitoring box not reporting",
+      "condition": "C",
+      "for": "10m",
+      "noDataState": "Alerting",
+      "execErrState": "Alerting",
+      "labels": {
+        "severity": "critical",
+        "estate": "monitoring"
+      },
+      "annotations": {
+        "summary": "vps71884 has sent no metrics for 10 minutes",
+        "description": "This is the dead-man's switch. VictoriaMetrics, VictoriaLogs, the hourly checks and the Telegram notifier all run on that one box, so when it dies everything goes quiet at once and the silence is indistinguishable from a healthy estate. This rule is the only thing that can tell you. It fires on NO DATA deliberately: absence IS the signal here, which is the opposite of every other rule.",
+        "runbook": "ssh rods_reader@vps71884.dreamhostps.com; check cron is running the watchdog (crontab -l as rods_brain is not readable by rods_reader -- check ~/monitoring/logs); if the box is gone, DreamHost panel."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 600,
+            "to": 0
+          },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "expr": "count(up{box=\"vps71884.dreamhostps.com\"})",
+            "instant": true,
+            "range": false,
+            "editorMode": "code",
+            "intervalMs": 1000,
+            "maxDataPoints": 43200,
+            "datasource": {
+              "type": "prometheus",
+              "uid": "grafanacloud-prom"
+            }
+          }
+        },
+        {
+          "refId": "C",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 0,
+            "to": 0
+          },
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "datasource": {
+              "type": "__expr__",
+              "uid": "__expr__"
+            },
+            "conditions": [
+              {
+                "type": "query",
+                "operator": {
+                  "type": "and"
+                },
+                "query": {
+                  "params": [
+                    "A"
+                  ]
+                },
+                "reducer": {
+                  "type": "last",
+                  "params": []
+                },
+                "evaluator": {
+                  "type": "lt",
+                  "params": [
+                    1
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uid": "mon-component-down",
+      "title": "A monitoring component is down",
+      "condition": "C",
+      "for": "10m",
+      "noDataState": "NoData",
+      "execErrState": "Alerting",
+      "labels": {
+        "severity": "critical",
+        "estate": "monitoring"
+      },
+      "annotations": {
+        "summary": "{{ $labels.job }} on vps71884 is not answering its scrape",
+        "description": "vmagent scrapes each component separately for exactly this reason: the box is alive (or this rule could not fire) and one component is not. A no-data rule could never tell these apart. victoria-metrics down means the estate's metrics are being refused; vmauth down means every sender is being refused.",
+        "runbook": "~/monitoring/logs/<component>.log on the box; the cron watchdog restarts it within 5 minutes, so a rule that stays firing means it is crash-looping, not merely stopped."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 600,
+            "to": 0
+          },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "expr": "min by (job) (up{box=\"vps71884.dreamhostps.com\"})",
+            "instant": true,
+            "range": false,
+            "editorMode": "code",
+            "intervalMs": 1000,
+            "maxDataPoints": 43200,
+            "datasource": {
+              "type": "prometheus",
+              "uid": "grafanacloud-prom"
+            }
+          }
+        },
+        {
+          "refId": "C",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 0,
+            "to": 0
+          },
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "datasource": {
+              "type": "__expr__",
+              "uid": "__expr__"
+            },
+            "conditions": [
+              {
+                "type": "query",
+                "operator": {
+                  "type": "and"
+                },
+                "query": {
+                  "params": [
+                    "A"
+                  ]
+                },
+                "reducer": {
+                  "type": "last",
+                  "params": []
+                },
+                "evaluator": {
+                  "type": "lt",
+                  "params": [
+                    1
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uid": "mon-ingest-stalled",
+      "title": "VictoriaMetrics is not ingesting",
+      "condition": "C",
+      "for": "15m",
+      "noDataState": "NoData",
+      "execErrState": "Alerting",
+      "labels": {
+        "severity": "critical",
+        "estate": "monitoring"
+      },
+      "annotations": {
+        "summary": "VictoriaMetrics accepted no rows for 15 minutes",
+        "description": "VictoriaMetrics is up and storing nothing, so every sender in the estate has stopped or is being refused. Distinct from the box being dark and from the process being down -- both of those have their own rule -- and it is the one that catches a vmauth misconfiguration or a token rotation that went wrong.",
+        "runbook": "Check vmauth_user_requests_total per user to see whether senders are arriving at all; then ~/monitoring/logs/vmauth.log and victoria-metrics.log."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 600,
+            "to": 0
+          },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "expr": "sum(rate(vm_rows_inserted_total{box=\"vps71884.dreamhostps.com\"}[10m]))",
+            "instant": true,
+            "range": false,
+            "editorMode": "code",
+            "intervalMs": 1000,
+            "maxDataPoints": 43200,
+            "datasource": {
+              "type": "prometheus",
+              "uid": "grafanacloud-prom"
+            }
+          }
+        },
+        {
+          "refId": "C",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 0,
+            "to": 0
+          },
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "datasource": {
+              "type": "__expr__",
+              "uid": "__expr__"
+            },
+            "conditions": [
+              {
+                "type": "query",
+                "operator": {
+                  "type": "and"
+                },
+                "query": {
+                  "params": [
+                    "A"
+                  ]
+                },
+                "reducer": {
+                  "type": "last",
+                  "params": []
+                },
+                "evaluator": {
+                  "type": "lt",
+                  "params": [
+                    0.001
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uid": "mon-sender-stopped",
+      "title": "A sender has stopped shipping",
+      "condition": "C",
+      "for": "30m",
+      "noDataState": "NoData",
+      "execErrState": "Alerting",
+      "labels": {
+        "severity": "warning",
+        "estate": "monitoring"
+      },
+      "annotations": {
+        "summary": "sender {{ $labels.username }} has not written for 30 minutes",
+        "description": "vmauth gives every sender its own bearer token, so this names WHICH Alloy stopped -- a thing nothing inside a dead estate could report about itself. A single host's collector dying is otherwise invisible: the other senders keep the ingest rate healthy and no whole-stack rule notices.",
+        "runbook": "On the named host: systemctl --user status alloy (or the Spacelift observability stack that manages it); check the host is up at all before assuming the collector."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 600,
+            "to": 0
+          },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "expr": "sum by (username) (increase(vmauth_user_requests_total{box=\"vps71884.dreamhostps.com\"}[30m]))",
+            "instant": true,
+            "range": false,
+            "editorMode": "code",
+            "intervalMs": 1000,
+            "maxDataPoints": 43200,
+            "datasource": {
+              "type": "prometheus",
+              "uid": "grafanacloud-prom"
+            }
+          }
+        },
+        {
+          "refId": "C",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 0,
+            "to": 0
+          },
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "datasource": {
+              "type": "__expr__",
+              "uid": "__expr__"
+            },
+            "conditions": [
+              {
+                "type": "query",
+                "operator": {
+                  "type": "and"
+                },
+                "query": {
+                  "params": [
+                    "A"
+                  ]
+                },
+                "reducer": {
+                  "type": "last",
+                  "params": []
+                },
+                "evaluator": {
+                  "type": "lt",
+                  "params": [
+                    1
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uid": "mon-disk-filling",
+      "title": "Monitoring box disk is filling",
+      "condition": "C",
+      "for": "30m",
+      "noDataState": "NoData",
+      "execErrState": "Alerting",
+      "labels": {
+        "severity": "warning",
+        "estate": "monitoring"
+      },
+      "annotations": {
+        "summary": "less than 10 GiB free on vps71884",
+        "description": "This disk is shared by VictoriaMetrics (180d retention), VictoriaLogs (180d, capped at 20 GiB) and the watcher. There are no backups by the owner's decision, so a full disk is lost history rather than a degraded service. 120 GB total.",
+        "runbook": "VictoriaLogs' own cap drops its oldest days first and should self-limit; if VictoriaMetrics is the growth, retention is the owner's call -- shortening it DELETES data (policy monitoring-estate)."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 600,
+            "to": 0
+          },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "expr": "min(vm_free_disk_space_bytes{box=\"vps71884.dreamhostps.com\"}) / 1024 / 1024 / 1024",
+            "instant": true,
+            "range": false,
+            "editorMode": "code",
+            "intervalMs": 1000,
+            "maxDataPoints": 43200,
+            "datasource": {
+              "type": "prometheus",
+              "uid": "grafanacloud-prom"
+            }
+          }
+        },
+        {
+          "refId": "C",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 0,
+            "to": 0
+          },
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "datasource": {
+              "type": "__expr__",
+              "uid": "__expr__"
+            },
+            "conditions": [
+              {
+                "type": "query",
+                "operator": {
+                  "type": "and"
+                },
+                "query": {
+                  "params": [
+                    "A"
+                  ]
+                },
+                "reducer": {
+                  "type": "last",
+                  "params": []
+                },
+                "evaluator": {
+                  "type": "lt",
+                  "params": [
+                    10
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uid": "mon-remote-write-failing",
+      "title": "vmagent cannot deliver to Grafana Cloud",
+      "condition": "C",
+      "for": "20m",
+      "noDataState": "NoData",
+      "execErrState": "Alerting",
+      "labels": {
+        "severity": "warning",
+        "estate": "monitoring"
+      },
+      "annotations": {
+        "summary": "vmagent is erroring on its way out to Grafana Cloud",
+        "description": "This rule can only fire while delivery still partly works, which is its limit and worth knowing: total failure presents as the dead-man's switch instead. It catches the slow version -- an expiring token, a rate limit, a series cap -- early enough to fix before the box goes blind.",
+        "runbook": "~/monitoring/logs/vmagent.log on the box. A 401 means the Cloud Access Policy token in AWX credential [13] expired; a 429 means the free tier's limits."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 600,
+            "to": 0
+          },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "expr": "sum(rate(vmagent_remotewrite_errors_total{box=\"vps71884.dreamhostps.com\"}[10m]))",
+            "instant": true,
+            "range": false,
+            "editorMode": "code",
+            "intervalMs": 1000,
+            "maxDataPoints": 43200,
+            "datasource": {
+              "type": "prometheus",
+              "uid": "grafanacloud-prom"
+            }
+          }
+        },
+        {
+          "refId": "C",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 0,
+            "to": 0
+          },
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "datasource": {
+              "type": "__expr__",
+              "uid": "__expr__"
+            },
+            "conditions": [
+              {
+                "type": "query",
+                "operator": {
+                  "type": "and"
+                },
+                "query": {
+                  "params": [
+                    "A"
+                  ]
+                },
+                "reducer": {
+                  "type": "last",
+                  "params": []
+                },
+                "evaluator": {
+                  "type": "gt",
+                  "params": [
+                    0
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

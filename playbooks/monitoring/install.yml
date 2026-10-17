@@ -55,6 +55,62 @@
     monitoring_vm_max_memory_per_query: 256MiB
     monitoring_vmauth_gomemlimit: 128MiB
 
+    # ---- Meta-monitoring: vmagent ships this box's own health OUT to Grafana Cloud (2026-10-17) ----
+    #
+    # The monitoring stack, the checks that read it and the Telegram notifier all run on this one
+    # box, so nothing here can report that this box died — silence and health look identical. Grafana
+    # Cloud is the only thing outside both the estate and this VPS, and its alerting engine was
+    # measured to keep evaluating while its stack idles, so a no-data rule there is a real
+    # dead-man's switch. Task vault: grafana-cloud-exit.
+    #
+    # ENABLED BY THE CREDENTIAL, not by a flag. Attach "Grafana Cloud: Push" at launch and vmagent
+    # is installed and supervised; launch without it and this is exactly the stack it was before.
+    # That keeps the credential the single thing that decides, rather than a variable that can
+    # disagree with one.
+    monitoring_grafana_remote_write_url: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_URL') }}"
+    monitoring_grafana_remote_write_user: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_USER') }}"
+    monitoring_grafana_remote_write_token: "{{ lookup('env', 'GRAFANA_REMOTE_WRITE_TOKEN') }}"
+    monitoring_vmagent_enabled: "{{ (monitoring_grafana_remote_write_url | length > 0) and (monitoring_grafana_remote_write_token | length > 0) }}"
+    monitoring_vmagent_port: 8429          # loopback only
+    monitoring_vmagent_gomemlimit: 192MiB
+    monitoring_vmagent_cache_bytes: 64MiB
+    # Buffer while Grafana Cloud is unreachable, capped so an outage cannot fill the disk this
+    # shares with VictoriaMetrics, VictoriaLogs and the watcher.
+    monitoring_vmagent_max_disk: 512MiB
+
+    # THE SERIES BUDGET, and the single source of truth for it: this list renders the keep-list
+    # regex in vmagent-relabel.yml.j2 AND is asserted present on a live scrape target below. A
+    # keep-list that matches nothing ships nothing and says nothing, so the list and its check must
+    # not be able to drift apart.
+    #
+    # Every entry answers a question a rule asks:
+    #   up                                  is each component alive (and, by its absence, the box)
+    #   vm_app_uptime_seconds               did something restart
+    #   vm_free_disk_space_bytes            the shared disk
+    #   vm_rows_inserted_total              is ingest flowing
+    #   vm_data_size_bytes                  how fast it is growing
+    #   vmauth_user_*                       PER SENDER — which Alloy stopped shipping
+    #   vmagent_remotewrite_*               can this path itself deliver
+    #   process_resident_memory_bytes       the 4 GiB cgroup cap is shared and kills rather than swaps
+    #
+    # VictoriaLogs' own vl_* families are deliberately absent: nothing had ever scraped that target,
+    # so their names were unverified and guessing would have added entries that match nothing. It is
+    # covered meanwhile by up{job="victoria-logs"} and the vm_* families it shares with
+    # VictoriaMetrics. Read the real names off the target now that it is scraped, then extend.
+    monitoring_vmagent_keep:
+      - up
+      - vm_app_uptime_seconds
+      - vm_free_disk_space_bytes
+      - vm_rows_inserted_total
+      - vm_data_size_bytes
+      - vmauth_user_requests_total
+      - vmauth_user_request_errors_total
+      - vmauth_unauthorized_user_requests_total
+      - vmagent_remotewrite_blocks_sent_total
+      - vmagent_remotewrite_errors_total
+      - vmagent_remotewrite_packets_dropped_total
+      - process_resident_memory_bytes
+
     # LOGS (2026-10-09): VictoriaLogs replaces Grafana Cloud's Loki. Its own release line and repo
     # (VictoriaMetrics/VictoriaLogs); checksum computed from the download AND matched against the
     # published *_checksums.txt, 2026-10-09. Senders push Loki's format to /insert/loki/api/v1/push
@@ -120,6 +176,15 @@
         {{ monitoring_home }}/watchdog.sh
       changed_when: true
 
+    # Last: it only reads the others, so nothing waits on it and a restart here costs nothing but a
+    # scrape interval. Its on-disk buffer survives the stop, so no sample is lost.
+    - name: Restart vmagent
+      ansible.builtin.shell: |
+        pkill -u "$(id -u)" -f "{{ monitoring_bin }}/[v]magent-prod" || true
+        for i in $(seq 1 30); do pgrep -u "$(id -u)" -f "{{ monitoring_bin }}/[v]magent-prod" >/dev/null || break; sleep 1; done
+        {{ monitoring_home }}/watchdog.sh
+      changed_when: true
+
   tasks:
     # ---- Refuse what would be unsafe ----
     - name: Refuse to run as the watcher's user
@@ -177,6 +242,7 @@
         - "{{ monitoring_home }}/data/victoria-metrics"
         - "{{ monitoring_home }}/downloads/vl-{{ monitoring_vl_version }}"
         - "{{ monitoring_home }}/data/victoria-logs"
+        - "{{ monitoring_home }}/data/vmagent"
 
     # ---- Binaries ----
     - name: Download VictoriaMetrics {{ monitoring_vm_version }}
@@ -200,6 +266,7 @@
       loop:
         - {file: "victoria-metrics-linux-amd64-{{ monitoring_vm_version }}.tar.gz", binary: victoria-metrics-prod}
         - {file: "vmutils-linux-amd64-{{ monitoring_vm_version }}.tar.gz", binary: vmauth-prod}
+        - {file: "vmutils-linux-amd64-{{ monitoring_vm_version }}.tar.gz", binary: vmagent-prod}
       loop_control: {label: "{{ item.binary }}"}
 
     # One task per binary, so a new vmauth restarts only vmauth.
@@ -218,6 +285,17 @@
         remote_src: true
         mode: "0755"
       notify: Restart vmauth
+
+    # From the SAME vmutils archive as vmauth, so it is the same pinned version and the same verified
+    # checksum — no new download and no new supply-chain surface for the meta-monitor.
+    - name: Install vmagent into ~/bin
+      ansible.builtin.copy:
+        src: "{{ monitoring_home }}/downloads/{{ monitoring_vm_version }}/vmagent-prod"
+        dest: "{{ monitoring_bin }}/vmagent-prod"
+        remote_src: true
+        mode: "0755"
+      when: monitoring_vmagent_enabled | bool
+      notify: Restart vmagent
 
     - name: Download VictoriaLogs {{ monitoring_vl_version }}
       ansible.builtin.get_url:
@@ -329,6 +407,44 @@
         argv: ["{{ monitoring_bin }}/vmauth-prod", "-auth.config={{ monitoring_home }}/config/vmauth.yml", "-dryRun"]
       changed_when: false
 
+    # ---- vmagent's configuration (only when a Grafana credential was supplied) ----
+    # The token goes to a 600 FILE rather than a flag or an environment variable: `ps` shows command
+    # lines to every user on this shared box, which is why VictoriaMetrics' own password takes the
+    # same route. no_log because the content is the secret.
+    - name: Grafana Cloud's write token, as a file only rods_brain can read
+      ansible.builtin.copy:
+        content: "{{ monitoring_grafana_remote_write_token }}"
+        dest: "{{ monitoring_home }}/config/grafana-remote-write-token"
+        mode: "0600"
+      no_log: true
+      when: monitoring_vmagent_enabled | bool
+      notify: Restart vmagent
+
+    - name: vmagent scrape configuration
+      ansible.builtin.template:
+        src: "{{ monitoring_src }}/vmagent.yml.j2"
+        dest: "{{ monitoring_home }}/config/vmagent.yml"
+        mode: "0600"
+      when: monitoring_vmagent_enabled | bool
+      notify: Restart vmagent
+
+    - name: vmagent keep-list (the series budget)
+      ansible.builtin.template:
+        src: "{{ monitoring_src }}/vmagent-relabel.yml.j2"
+        dest: "{{ monitoring_home }}/config/vmagent-relabel.yml"
+        mode: "0600"
+      when: monitoring_vmagent_enabled | bool
+      notify: Restart vmagent
+
+    - name: vmagent accepts its configuration
+      ansible.builtin.command:
+        argv:
+          - "{{ monitoring_bin }}/vmagent-prod"
+          - "-promscrape.config={{ monitoring_home }}/config/vmagent.yml"
+          - "-promscrape.config.dryRun"
+      changed_when: false
+      when: monitoring_vmagent_enabled | bool
+
     - name: Watchdog
       ansible.builtin.template:
         src: "{{ monitoring_src }}/watchdog.sh.j2"
@@ -338,6 +454,7 @@
         - Restart victoria-metrics
         - Restart vmauth
         - Restart victoria-logs
+        - Restart vmagent
 
     # ---- The agent's read access: logs and the public certificate, nothing else ----
     - name: Let {{ monitoring_reader }} traverse to the logs and the certificate
@@ -374,8 +491,8 @@
 
     - name: Refuse an unknown restart target
       ansible.builtin.assert:
-        that: (monitoring_restart | difference(['vmauth', 'victoria-metrics', 'victoria-logs'])) | length == 0
-        fail_msg: "monitoring_restart takes 'vmauth', 'victoria-metrics' and/or 'victoria-logs', got {{ monitoring_restart }}"
+        that: (monitoring_restart | difference(['vmauth', 'victoria-metrics', 'victoria-logs', 'vmagent'])) | length == 0
+        fail_msg: "monitoring_restart takes 'vmauth', 'victoria-metrics', 'victoria-logs' and/or 'vmagent', got {{ monitoring_restart }}"
         quiet: true
 
     - name: Restart requested — vmauth
@@ -395,6 +512,12 @@
       when: "'victoria-logs' in monitoring_restart"
       changed_when: true
       notify: Restart victoria-logs
+
+    - name: Restart requested — vmagent
+      ansible.builtin.debug: {msg: "restart requested: vmagent"}
+      when: "'vmagent' in monitoring_restart"
+      changed_when: true
+      notify: Restart vmagent
 
     - name: Apply pending restarts
       ansible.builtin.meta: flush_handlers
@@ -453,13 +576,15 @@
     - name: Exactly one public listener of ours, and it is vmauth on its port
       vars:
         local_re: '^LISTEN\s+\d+\s+\d+\s+'
-        ours: 'users:\(\("(victoria-metric|victoria-logs-p|vmauth-prod)"'
+        ours: 'users:\(\("(victoria-metric|victoria-logs-p|vmauth-prod|vmagent-prod)"'
       ansible.builtin.assert:
         that:
           - monitoring_listen.stdout_lines | select('search', local_re ~ '127\.0\.0\.1:' ~ monitoring_vm_port ~ '\s') | list | length == 1
           - monitoring_listen.stdout_lines | select('search', local_re ~ '127\.0\.0\.1:' ~ monitoring_vmauth_internal_port ~ '\s') | list | length == 1
           - monitoring_listen.stdout_lines | select('search', local_re ~ '127\.0\.0\.1:' ~ monitoring_vl_port ~ '\s') | list | length == 1
           - monitoring_listen.stdout_lines | select('search', local_re ~ '0\.0\.0\.0:' ~ monitoring_vmauth_port ~ '\s') | list | length == 1
+          # vmagent reaches OUT; nothing must reach in to it.
+          - (not (monitoring_vmagent_enabled | bool)) or (monitoring_listen.stdout_lines | select('search', local_re ~ '127\.0\.0\.1:' ~ monitoring_vmagent_port ~ '\s') | list | length == 1)
           # every listener of ours whose LOCAL address is a wildcard must be vmauth's public port
           - >-
             monitoring_listen.stdout_lines
@@ -571,6 +696,157 @@
       changed_when: false
       no_log: true
 
+    # ---- The meta-monitor, graded on what it actually does ----
+    #
+    # Three separate things can be wrong here and each is silent on its own: vmagent not running, a
+    # scrape target refusing it, or a keep-list that matches nothing and ships an empty stream. The
+    # third is the nastiest — it looks exactly like a healthy pipeline with a quiet estate — so it
+    # gets its own check against the live targets rather than a reading of the config file.
+
+    - name: vmagent is alive
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ monitoring_vmagent_port }}/-/healthy"
+        status_code: [200]
+      register: monitoring_vmagent_health
+      retries: 12
+      delay: 5
+      until: monitoring_vmagent_health.status == 200
+      when: monitoring_vmagent_enabled | bool
+
+    - name: Read vmagent's view of its scrape targets
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ monitoring_vmagent_port }}/api/v1/targets"
+        return_content: true
+      register: monitoring_vmagent_targets
+      retries: 12
+      delay: 10
+      until:
+        - monitoring_vmagent_targets.json.data.activeTargets | default([]) | length == 4
+        - monitoring_vmagent_targets.json.data.activeTargets | default([]) | rejectattr('health', 'equalto', 'up') | list | length == 0
+      when: monitoring_vmagent_enabled | bool
+
+    - name: Every component is being scraped
+      ansible.builtin.assert:
+        that:
+          - monitoring_vmagent_targets.json.data.activeTargets | map(attribute='labels.job') | sort
+            == ['victoria-logs', 'victoria-metrics', 'vmagent', 'vmauth']
+        fail_msg: >-
+          vmagent is not scraping all four components. Scraping each one directly is what separates
+          "VictoriaMetrics is down" from "the box is gone" at the far end; with a target missing,
+          both would arrive as silence.
+          Targets: {{ monitoring_vmagent_targets.json.data.activeTargets
+                      | map(attribute='labels.job') | list }}
+        success_msg: "vmagent is scraping all four components"
+      when: monitoring_vmagent_enabled | bool
+
+    # The three targets that between them expose every family in the keep-list. Metrics are not
+    # secret; no_log is here because the request carries VictoriaMetrics' password in a header.
+    - name: Read what the targets actually expose
+      ansible.builtin.uri:
+        url: "{{ item.url }}"
+        headers: "{{ item.headers | default({}) }}"
+        validate_certs: "{{ item.validate | default(true) }}"
+        return_content: true
+      register: monitoring_scraped
+      loop:
+        - url: "http://127.0.0.1:{{ monitoring_vm_port }}/metrics"
+          headers: {Authorization: "Basic {{ monitoring_vm_basic_auth }}"}
+        - url: "https://127.0.0.1:{{ monitoring_vmauth_internal_port }}/metrics"
+          validate: false
+        - url: "http://127.0.0.1:{{ monitoring_vmagent_port }}/metrics"
+        # Read purely to LEARN from: no keep-list name comes from VictoriaLogs yet, because nothing
+        # had ever scraped this target and its vl_* names were therefore unverified. The report
+        # below prints them so the follow-up can add the right ones instead of guessing.
+        - url: "http://127.0.0.1:{{ monitoring_vl_port }}/metrics"
+          headers: {Authorization: "Basic {{ monitoring_vl_basic_auth }}"}
+      loop_control: {label: "{{ item.url | regex_replace('^(https?://[^/]+).*', '\\1') }}"}
+      no_log: true
+      changed_when: false
+      when: monitoring_vmagent_enabled | bool
+
+    # set_fact, not a `vars:` entry. A var templated from a list can arrive as the STRING
+    # "['up', 'vm_...']", which would turn the membership test below into SUBSTRING matching and
+    # make `missing | length == 0` measure the length of the text "[]" rather than an empty list.
+    # set_fact preserves the real list. Same class of bug as a Jinja-templated boolean arriving as
+    # the truthy string "False" — the value looks right and the type is wrong.
+    - name: Collect the metric family names the targets actually expose
+      ansible.builtin.set_fact:
+        # Line-initial identifiers across all three payloads. "# HELP" / "# TYPE" lines start with
+        # '#', so they are skipped.
+        monitoring_exposed_families: >-
+          {{ monitoring_scraped.results | map(attribute='content') | join('\n')
+             | regex_findall('(?m)^([a-zA-Z_:][a-zA-Z0-9_:]*)') | unique | sort }}
+      when: monitoring_vmagent_enabled | bool
+
+    - name: Every name in the keep-list exists on a target
+      vars:
+        # `up` is synthesised BY vmagent per scrape and appears on no target's /metrics, so the
+        # targets check above is what proves it, not this.
+        missing: "{{ monitoring_vmagent_keep | difference(['up']) | difference(monitoring_exposed_families) }}"
+      ansible.builtin.assert:
+        that:
+          - monitoring_vmagent_keep | difference(['up']) | difference(monitoring_exposed_families) | length == 0
+        fail_msg: >-
+          These keep-list names are on no scrape target: {{ missing }}.
+          A keep-list entry that matches nothing ships nothing and reports no error, so the far end
+          would show a working pipeline and a permanently silent metric. Fix the name in
+          monitoring_vmagent_keep, or drop it.
+        success_msg: >-
+          all {{ monitoring_vmagent_keep | length }} keep-list families exist on a target
+          ({{ monitoring_exposed_families | length }} families exposed in total)
+      when: monitoring_vmagent_enabled | bool
+
+    # Ground truth for the follow-up, printed rather than guessed at: VictoriaLogs' own families are
+    # not in the keep-list yet precisely because nobody had ever read them off a live target.
+    - name: VictoriaLogs' own metric families, for the follow-up that adds a log-ingest rule
+      ansible.builtin.debug:
+        msg: >-
+          vl_* families now visible ({{ monitoring_exposed_families
+            | select('match', '^vl_') | list | length }}):
+          {{ monitoring_exposed_families | select('match', '^vl_') | list | join(', ') }}
+      when: monitoring_vmagent_enabled | bool
+
+    # Shipping is not the same as arriving, and this can only prove the first half from here: that
+    # vmagent has delivered blocks and is not erroring. Whether Grafana Cloud stored them is checked
+    # against Grafana Cloud, which this box holds no read token for, and deliberately so.
+    - name: vmagent is delivering to Grafana Cloud
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ monitoring_vmagent_port }}/metrics"
+        return_content: true
+      register: monitoring_vmagent_rw
+      retries: 18
+      delay: 10
+      until: >-
+        (monitoring_vmagent_rw.content
+         | regex_findall('(?m)^vmagent_remotewrite_blocks_sent_total\\{[^}]*\\}\\s+(\\d+)')
+         | map('int') | sum) > 0
+      changed_when: false
+      when: monitoring_vmagent_enabled | bool
+
+    - name: Count what is leaving, and what it cost
+      vars:
+        sent: >-
+          {{ (monitoring_vmagent_rw.content
+              | regex_findall('(?m)^vmagent_remotewrite_blocks_sent_total\\{[^}]*\\}\\s+(\\d+)')
+              | map('int') | sum) }}
+        errors: >-
+          {{ (monitoring_vmagent_rw.content
+              | regex_findall('(?m)^vmagent_remotewrite_errors_total\\{[^}]*\\}\\s+(\\d+)')
+              | map('int') | sum) }}
+      ansible.builtin.debug:
+        msg: >-
+          vmagent -> Grafana Cloud: {{ sent }} block(s) sent, {{ errors }} error(s),
+          {{ monitoring_vmagent_keep | length }} metric families kept.
+      when: monitoring_vmagent_enabled | bool
+
+    - name: Say plainly when nothing is watching this box
+      ansible.builtin.debug:
+        msg: >-
+          NO vmagent — no Grafana Cloud credential was supplied, so nothing outside this box is
+          watching it. The stack, the checks that read it and the Telegram notifier all run here,
+          so a failure of this machine would be silent. Attach "Grafana Cloud: Push" at launch.
+      when: not (monitoring_vmagent_enabled | bool)
+
     - name: Read the certificate senders must pin
       ansible.builtin.command:
         argv: [openssl, x509, -in, "{{ monitoring_home }}/tls/vmauth.crt", -noout, -fingerprint, -sha256, -enddate]
@@ -586,3 +862,4 @@
           - "VictoriaMetrics and VictoriaLogs require their passwords on loopback: no local user can read or write either without vmauth"
           - "certificate to pin: {{ monitoring_cert.stdout_lines | join(' | ') }}"
           - "public certificate readable by {{ monitoring_reader }} at {{ monitoring_home }}/tls/vmauth.crt"
+          - "meta-monitoring: {{ 'vmagent -> Grafana Cloud, ' ~ (monitoring_vmagent_keep | length) ~ ' metric families from 4 local targets' if (monitoring_vmagent_enabled | bool) else 'NONE — nothing outside this box is watching it' }}"

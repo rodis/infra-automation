@@ -1,0 +1,21 @@
+# Rendered by playbooks/monitoring/install.yml from monitoring/vmagent-relabel.yml.j2.
+#
+# The keep-list applied to everything leaving for Grafana Cloud. This file is the series budget.
+#
+# Without it the four targets would ship a few thousand families — VictoriaMetrics' own /metrics is
+# over a thousand on its own — into a free tier capped at 10,000 active series, which is the cap we
+# left Grafana Cloud to escape in the first place. Keeping it tiny is what makes it defensible to
+# keep the account at all.
+#
+# A keep-list is ALSO a silence risk, and that is the thing to be careful about: a name misspelt
+# matches nothing, ships nothing, and reports no error — the empty-host-pattern trap wearing a
+# different hat. So the names live in `monitoring_vmagent_keep` in install.yml, which renders them
+# here AND asserts every one of them is actually present on a scrape target before calling the run
+# a success. One list, used twice, so the check cannot drift from the thing it checks.
+#
+# Written as ONE line on purpose: a YAML folded scalar (>-) joins its lines with SPACES, which would
+# turn this into `up| vm_app_uptime_seconds| ...` and match nothing at all. Quietly.
+
+- action: keep
+  source_labels: [__name__]
+  regex: "{{ monitoring_vmagent_keep | join('|') }}"
