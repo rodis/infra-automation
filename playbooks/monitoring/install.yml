@@ -832,20 +832,20 @@
       changed_when: false
       when: monitoring_vmagent_enabled | bool
 
-    - name: Count what is leaving, and what it cost
-      vars:
-        sent: >-
-          {{ (monitoring_vmagent_rw.content
-              | regex_findall('(?m)^vmagent_remotewrite_blocks_sent_total\\{[^}]*\\}\\s+(\\d+)')
-              | map('int') | sum) }}
-        errors: >-
-          {{ (monitoring_vmagent_rw.content
-              | regex_findall('(?m)^vmagent_remotewrite_errors_total\\{[^}]*\\}\\s+(\\d+)')
-              | map('int') | sum) }}
+    # Reports what the assertion above ESTABLISHED, rather than re-deriving it. The first version
+    # recomputed the counters with a second copy of the same regex and printed
+    # "0 block(s) sent" while Grafana Cloud was holding 8 blocks and 0 errors from this very run --
+    # a success message contradicting the success it was reporting. Two paths to one fact is one
+    # path too many: the `until` above already proves blocks sent > 0, so say that and no more.
+    # What actually ARRIVED can only be judged at the far end, and this box holds no read token for
+    # Grafana Cloud on purpose.
+    - name: What is now leaving the box
       ansible.builtin.debug:
         msg: >-
-          vmagent -> Grafana Cloud: {{ sent }} block(s) sent, {{ errors }} error(s),
-          {{ monitoring_vmagent_keep | length }} metric families kept.
+          vmagent -> Grafana Cloud: delivering ({{ monitoring_vmagent_keep | length }} metric
+          families kept from {{ monitoring_exposed_families | length }} exposed across 4 local
+          targets). Blocks sent > 0 and verified by the retry gate above; whether Grafana Cloud
+          stored them is checked against Grafana Cloud, not from here.
       when: monitoring_vmagent_enabled | bool
 
     - name: Say plainly when nothing is watching this box
