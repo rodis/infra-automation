@@ -357,16 +357,35 @@
       register: watcher_ls
       changed_when: false
 
+    # The clock to compare against must be read HERE, beside the listing, and on the host whose
+    # clock Dagu schedules by.
+    #
+    # It used to be ansible_date_time.iso8601, which gather_facts captures at the START of the play
+    # — so the play's own duration was silently added to every interval it measured. Job 5331
+    # (2026-10-17) gathered facts at ~18:59 and reached the assertion at ~19:05, which pushed the
+    # hourly DAGs at :01, :02 and :03 past the 61-minute bound and failed a deploy that had
+    # installed everything correctly. The DAGs were on exactly the schedule they were supposed to
+    # be on; the measurement was stale, and only near the top of an hour does that show.
+    - name: Read the host's clock, now, for the comparison below
+      ansible.builtin.command:
+        argv: [date, -u, "+%Y-%m-%dT%H:%M:%SZ"]
+      register: watcher_now
+      changed_when: false
+
     # Not just "has a next-run time": the next run must fall within the next 61 minutes, since every
     # check is hourly. A merely-present time passed on 2026-09-28 while Dagu still held the old daily
     # schedules — it had not reloaded the changed DAGs. A stale schedule looks exactly like a valid one.
+    #
+    # 3660 is 60 minutes plus a minute of slack. An hourly DAG is never more than 60 minutes away
+    # from a correctly-read "now", so the slack covers the gap between the two commands above and
+    # nothing else — it is not there to absorb a wrong schedule.
     - name: Assert every check DAG is scheduled, on its current schedule
       ansible.builtin.assert:
         that:
           - watcher_ls.stdout is search(item.name ~ '\s+\d{4}-\d{2}-\d{2}T')
           - >-
             ((watcher_ls.stdout | regex_search(item.name ~ '\s+(\S+)', '\\1') | first | to_datetime('%Y-%m-%dT%H:%M:%SZ')) -
-             (ansible_date_time.iso8601 | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).total_seconds() < 3660
+             (watcher_now.stdout | trim | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).total_seconds() < 3660
         fail_msg: "{{ item.name }}'s next run is not within the hour — Dagu may hold a stale schedule:\n{{ watcher_ls.stdout }}"
         quiet: true
       loop: "{{ watcher_checks }}"
