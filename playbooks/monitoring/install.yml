@@ -93,6 +93,16 @@
     #   vmagent_remotewrite_*               can this path itself deliver
     #   process_resident_memory_bytes       the 4 GiB cgroup cap is shared and kills rather than swaps
     #
+    # Dropped 2026-10-17 after the check below failed on it: vmauth_unauthorized_user_requests_total
+    # is on no target. Two readings, and only one of them matters. It may be a wrong name, or it may
+    # be a counter VictoriaMetrics creates lazily on first use — this box has had no unauthorized
+    # request, so an un-instantiated counter looks identical to a typo from here, and the check
+    # cannot tell them apart. That is a real limit of presence-checking.
+    #
+    # Either way it goes, because NO RULE READS IT. It was added "because it might be useful",
+    # which is the instinct the comment in vmagent-relabel.yml.j2 warns against, written by the
+    # same hand that then did it. If a rule ever needs it, add the rule and the metric together.
+    #
     # VictoriaLogs' own vl_* families are deliberately absent: nothing had ever scraped that target,
     # so their names were unverified and guessing would have added entries that match nothing. It is
     # covered meanwhile by up{job="victoria-logs"} and the vm_* families it shares with
@@ -105,7 +115,6 @@
       - vm_data_size_bytes
       - vmauth_user_requests_total
       - vmauth_user_request_errors_total
-      - vmauth_unauthorized_user_requests_total
       - vmagent_remotewrite_blocks_sent_total
       - vmagent_remotewrite_errors_total
       - vmagent_remotewrite_packets_dropped_total
