@@ -260,7 +260,7 @@
       },
       "annotations": {
         "summary": "sender {{ $labels.username }} has not written for 30 minutes",
-        "description": "vmauth gives every sender its own bearer token, so this names WHICH Alloy stopped -- a thing nothing inside a dead estate could report about itself. A single host's collector dying is otherwise invisible: the other senders keep the ingest rate healthy and no whole-stack rule notices.",
+        "description": "vmauth gives every sender its own bearer token, so this names WHICH Alloy stopped -- a thing nothing inside a dead estate could report about itself. A single host's collector dying is otherwise invisible: the other senders keep the ingest rate healthy and no whole-stack rule notices.\n\nRestricted to writer-* on 2026-10-18, because the first version matched READERS too and fired overnight on reader-agent -- the agent's own query token, idle because nobody was querying. An idle reader is not a finding; vmauth names users writer-<x> and reader-<x>, and only writers ship. The readers now have their own rule, which is about something else entirely.",
         "runbook": "On the named host: systemctl --user status alloy (or the Spacelift observability stack that manages it); check the host is up at all before assuming the collector."
       },
       "data": [
@@ -274,7 +274,7 @@
           "datasourceUid": "grafanacloud-prom",
           "model": {
             "refId": "A",
-            "expr": "sum by (username) (increase(vmauth_user_requests_total{box=\"vps71884.dreamhostps.com\"}[30m]))",
+            "expr": "sum by (username) (increase(vmauth_user_requests_total{box=\"vps71884.dreamhostps.com\",username=~\"writer-.*\"}[30m]))",
             "instant": true,
             "range": false,
             "editorMode": "code",
@@ -731,6 +731,88 @@
                   "type": "gt",
                   "params": [
                     0
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uid": "mon-checks-not-running",
+      "title": "The watcher's checks have stopped running",
+      "condition": "C",
+      "for": "30m",
+      "noDataState": "NoData",
+      "execErrState": "Alerting",
+      "labels": {
+        "severity": "critical",
+        "estate": "monitoring"
+      },
+      "annotations": {
+        "summary": "no query from the watcher's checks in 2 hours",
+        "description": "The hourly checks read VictoriaMetrics through vmauth with their own token, so their request rate IS a heartbeat -- if Dagu is dead, the box is wedged, or the checks are crashing before their first query, this goes to zero. No separate ping to build and nothing extra to keep alive, which is the appeal: a heartbeat that is a side effect of the real work cannot rot while the work carries on.\n\nDistinct from the box being dark, which the dead-man's switch covers: this fires while the box is alive and answering, and the thing that reads it has stopped. Window is 2h for hourly checks, so one missed run is tolerated and two are not.",
+        "runbook": "Dagu is loopback-only on the VPS; reach its UI through an SSH tunnel as rods_pinky, or re-run AWX [69] General: Watcher: Install, which asserts every DAG is scheduled."
+      },
+      "data": [
+        {
+          "refId": "A",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 7200,
+            "to": 0
+          },
+          "datasourceUid": "grafanacloud-prom",
+          "model": {
+            "refId": "A",
+            "expr": "sum(increase(vmauth_user_requests_total{box=\"vps71884.dreamhostps.com\",username=\"reader-watcher\"}[2h]))",
+            "instant": true,
+            "range": false,
+            "editorMode": "code",
+            "intervalMs": 1000,
+            "maxDataPoints": 43200,
+            "datasource": {
+              "type": "prometheus",
+              "uid": "grafanacloud-prom"
+            }
+          }
+        },
+        {
+          "refId": "C",
+          "queryType": "",
+          "relativeTimeRange": {
+            "from": 0,
+            "to": 0
+          },
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "datasource": {
+              "type": "__expr__",
+              "uid": "__expr__"
+            },
+            "conditions": [
+              {
+                "type": "query",
+                "operator": {
+                  "type": "and"
+                },
+                "query": {
+                  "params": [
+                    "A"
+                  ]
+                },
+                "reducer": {
+                  "type": "last",
+                  "params": []
+                },
+                "evaluator": {
+                  "type": "lt",
+                  "params": [
+                    1
                   ]
                 }
               }
